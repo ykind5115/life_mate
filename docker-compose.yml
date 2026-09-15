@@ -1,0 +1,61 @@
+services:
+  postgres:
+    image: pgvector/pgvector:pg18
+    container_name: lifemate-postgres
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
+      POSTGRES_DB: ${POSTGRES_DB}
+      # 时区与编码固定下来，避免跨环境差异
+      TZ: Asia/Shanghai
+      POSTGRES_INITDB_ARGS: "--encoding=UTF8 --locale=C"
+    ports:
+      # 只绑本机回环，不对局域网暴露
+      - "127.0.0.1:5432:5432"
+    volumes:
+      - lifemate-pgdata:/var/lib/postgresql/data
+      - ./docker/postgres/init:/docker-entrypoint-initdb.d:ro
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER} -d ${POSTGRES_DB}"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 20s
+
+  embedding:
+    # ⚠️ 镜像标签必须匹配 GPU 计算能力，否则启动即失败：
+    #      RTX 40 系（Ada Lovelace, sm_89） → 89-1.9   ← 当前使用
+    #      RTX 30 系（Ampere,  sm_86）      → 86-1.9
+    #      A100 / A30（Ampere, sm_80）      → 1.9
+    #      H100（Hopper, sm_90）            → hopper-1.9
+    #      无独显 / 排查用                    → cpu-1.9
+    # 依据：https://github.com/huggingface/text-embeddings-inference README「Docker Images」
+    image: ghcr.io/huggingface/text-embeddings-inference:89-1.9
+    container_name: lifemate-embedding
+    restart: unless-stopped
+    # bge-m3：XLM-RoBERTa 架构，1024 维，8192 上下文
+    # 需要国内镜像时在 environment 中加 HF_ENDPOINT: https://hf-mirror.com
+    command: ["--model-id", "BAAI/bge-m3", "--port", "80", "--max-client-batch-size", "32"]
+    ports:
+      - "127.0.0.1:8080:80"
+    volumes:
+      # 模型权重缓存（约 2.3 GB），避免每次重启重新下载
+      - lifemate-hf-cache:/data
+    environment:
+      HF_HOME: /data
+      TZ: Asia/Shanghai
+      # 强制 FP16：bge-m3 显存占用约 3.2 GB，8G 卡余量充足
+      # 不设置时 TEI 可能用 FP32，显存翻倍
+      DTYPE: float16
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: 1
+              capabilities: [gpu]
+
+volumes:
+  lifemate-pgdata:
+  lifemate-hf-cache:

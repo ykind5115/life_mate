@@ -1,0 +1,23 @@
+# 环境变量（含数据库密码，绝不提交）
+.env
+
+# 备份文件（含私密数据的明文，绝不提交）
+backups/
+*.dump
+*.7z
+
+# 依赖与构建产物
+node_modules/
+dist/
+build/
+*.tsbuildinfo
+
+# 日志
+*.log
+logs/
+
+# 编辑器与系统
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
