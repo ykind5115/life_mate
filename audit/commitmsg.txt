@@ -1,0 +1,25 @@
+docs(audit): 新增设计契约审计报告，实测复现 4 处约束缺陷
+
+审计对象为文档中已固化的「准代码」契约（SQL DDL、约束、状态转移
+流程伪代码、Agent Loop 伪代码、Zod schema、检索公式），因为仓库
+当前尚无应用代码。
+
+关键发现（4 处严重，其中 3 处已实测复现）：
+
+F-01 extraction_runs 幂等键包含 end_sequence，而该值每次触发都变，
+     无法阻止范围重叠的重复抽取，与 P0-6 的设计目的相悖
+
+F-02/F-03/F-04 同一错误模式：外键 ON DELETE SET NULL 触发 UPDATE，
+     进而重新校验 CHECK 约束并违约，导致：
+       - 物理删除记忆必定失败（违背 §24.4 的承诺）
+       - 删除目标时 goal_projection 来源无法清理
+       - 删除会话时整个 DELETE 被回滚
+
+实测方式：SQLite 执行 audit/constraint-test.sql，逐组隔离复现。
+三处均命中 CHECK constraint failed 且语句被回滚；A3/C1 两个对照组
+证实修正方案有效。CHECK 与 SET NULL 的语义由 SQL 标准规定，
+PostgreSQL 行为一致，但仍需在 PG 上复跑确认。
+
+另记录 9 项一致性与可维护性问题（Agent Loop 丢弃上轮工具结果、
+API 允许绕过 Goal 实体直接创建目标记忆、附录 A 与正文重复 DDL、
+model 字段格式不统一等）。
