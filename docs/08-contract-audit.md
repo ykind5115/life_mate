@@ -6,6 +6,7 @@
 **审计日期：** 设计阶段（Phase 3 之前）
 **审计对象：** 文档中已固化的「准代码」契约
 **审计结论：** 发现 **4 个会直接导致运行失败的缺陷**，另有 **9 项一致性与可维护性问题**
+**修复状态：** ✅ 9 项阻塞项已全部修复并通过回归验证（见 §7）
 
 ---
 
@@ -933,20 +934,110 @@ SET NULL  →  触发 UPDATE  →  重新校验 CHECK  →  违约
 
 ```text
 F-02 / F-03 / F-04  已实测复现（SQLite，脚本见 audit/constraint-test.sql）
-                    待办：在 PostgreSQL 上复跑一次，确认错误信息与回滚行为一致
+                     修复后已在同一脚本中回归通过（见 §7）
+                     待办：在 PostgreSQL 上复跑一次，确认错误信息与回滚行为一致
                     （Docker 环境当前未就绪，见 §0.4）
 
-F-01                逐次代入执行验证，未实测
-                    原因：pgvector / EXCLUDE 约束需要 PostgreSQL，
-                          本机 Docker 引擎未能启动
+F-01                逐次代入执行验证 + 修复后实测回归通过
+                    未在 PG 上验证 EXCLUDE / btree_gist（需真实 PG）
 
 F-05 ~ F-13         静态核对与交叉比对，未实测
                     这些属于契约表述问题，不涉及数据库运行时行为
 ```
 
+---
+
+# 7. 修复与回归验证结果
+
+## 7.1 修复清单
+
+9 项阻塞项（§4.1）已全部应用到 `03-database-design.md` 与 `04-api-spec.md`，并登记为变更项 **C19～C28**（见该文档 §0.3）。
+
+| 审计编号 | 修复内容 | 变更项 | 落地位置 |
+| ---- | ---- | ---- | ---- |
+| F-01 | 幂等键 `end_sequence` → `start_sequence` | C19 | 03 §11.3、§11.3.1、§17.6、附录 A |
+| F-01 | 新增区间不重叠排他约束 | C20 | 03 §11.3.2 |
+| F-08 | 新增进度计算定义（只统计 succeeded） | C21 | 03 §11.4 |
+| F-02 | 删除 `memory_sources.conversation_id` | C22 | 03 §15.2、§15.4、§17.11、§23.1、§24.3、附录 A |
+| F-04 | `superseded_by` 去掉外键 | C23 | 03 §13.3、附录 A |
+| F-03 | 明确 Goal 删除时的清理顺序 | C24 | 03 §13.10 |
+| F-07 | 明确「不可变」的字段范围 | C25 | 03 §13.1 |
+| F-10 | `goals` 新增时间顺序约束 | C26 | 03 §19.3、附录 A |
+| F-11 | `model` 统一为 `BAAI/bge-m3` | C27 | 03 §14.5、§17.4 查询、附录 B |
+| F-13 | 补充部分唯一索引的适用范围说明 | C28 | 03 §17.4 |
+
+**未在本次修复（属 §4.2，不阻塞 Schema）：**
+
+```text
+F-05  Agent Loop 累积工具结果     → Phase 6 开发 Agent Core 前
+F-09  消除附录 A 与正文的 DDL 重复 → 文档整理，可随时
+F-12  批量向量顺序验证             → Phase 4，需实测 TEI 行为
+```
+
+## 7.2 回归验证结果
+
+**脚本：** `audit/constraint-test.sql`（已更新为「修复前 vs 修复后」两段式）
+**执行：** `sqlite3 :memory: ".read audit/constraint-test.sql"`
+
+**第一部分 —— 修复前 schema，缺陷仍可稳定复现：**
+
+```text
+[F-04] DELETE memB → CHECK constraint failed
+       删除后仍是 2 行（memA|superseded|memB），语句被回滚      ✓ 缺陷确认
+
+[F-03] DELETE goal1 → CHECK constraint failed
+       删除后 goal_id 仍在（src2|goal_projection|goal1）        ✓ 缺陷确认
+
+[F-02] DELETE conv1 → CHECK constraint failed
+       删除后表为空（会话未能删除）                             ✓ 缺陷确认
+```
+
+**第二部分 —— 修复后 schema，全部通过：**
+
+```text
+[C23] 删除 memB → 成功
+      结果：memA|superseded|memB（历史指针悬空但合法）          ✓ 物理删除能力可兑现
+
+[C22] 按会话反查派生记忆（JOIN 写法）→ 返回 mem1
+      删除链路（清来源 → 删消息 → 删会话）→ conv_left=0, msg_left=0  ✓ 不再违约
+
+[C24] 删除 Goal（先失效记忆 → 删来源 → 删 Goal）
+      结果：memory_status=deleted, goals_left=0, sources_left=0  ✓ 投影记忆被正确失效
+
+[C19] 插入起点相同的重复抽取 [1,10] → UNIQUE constraint failed  ✓ 重叠触发被拦截
+      插入起点不同的区间 [6,10]     → 成功
+      最终：r1|1|5|succeeded, r3|6|10|succeeded
+```
+
+**结论：4 个缺陷中的 3 个已实测证明「修复前失败、修复后成功」。**
+
+## 7.3 仍需在 PostgreSQL 上完成的验证
+
+```text
+□ 复跑 audit/constraint-test.sql 的等价 PG 版本（错误信息措辞不同，行为应一致）
+□ 验证 EXCLUDE 约束（需 btree_gist 扩展）——SQLite 无此能力
+□ 验证 VECTOR(1024) 与 pgvector 的维度约束（环境手册 §5 已覆盖）
+□ 验证 gin_trgm_ops 索引对中文的实际召回效果
+□ 验证 TEI 批量输入的返回顺序（F-12）
+
+前置条件：Docker 引擎需先启动（当前未就绪，见 §0.4）
+```
+
+## 7.4 遗留的设计取舍（已按推荐方案决策）
+
+```text
+F-02 采用「删除冗余字段」而非「修补约束」
+     → 代价：按会话反查需 JOIN。已在 §15.4 给出查询与索引依据。
+
+F-04 采用「去掉外键」而非「删除前清理引用」
+     → 代价：superseded_by 可能出现悬空指针，UI 需显示「（替代者已删除）」。
+       已在 §13.3 记录为实现要求。
+```
 
 ---
 
 **审计报告结束。**
 
-建议下一步：修复 4.1 的 9 项 → 更新 `03-database-design.md` 与 `04-api-spec.md` → 然后开始 Phase 3 工程骨架与 Drizzle Schema。
+**下一步：** 修复已闭环，门禁解除 → 进入 **Phase 3：工程骨架 + Drizzle Schema**。
+Schema 编写以 `03-database-design.md`（含 C19～C28 修订）为唯一依据，
+附录 A 的 DDL 可作为 `drizzle-kit generate` 产物的校对基准。

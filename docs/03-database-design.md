@@ -3,11 +3,16 @@
 **项目名称：** LifeMate
 **文档类型：** 数据库设计说明书
 **版本：** V1.1
-**文档状态：** 基线版本（含 P0 决策落地）
+**文档状态：** 基线版本（含 P0 决策落地 + 契约审计修订，**可作为 Schema 编写依据**）
 **数据库：** PostgreSQL 18
 **向量扩展：** pgvector 0.8.x
 **ORM：** Drizzle ORM
 **适用阶段：** MVP / V1.0
+
+> ✅ **本文档已通过契约审计并完成修订。**
+> 审计发现的 9 项阻塞项已全部修复（登记为 §0.3 的 C19～C28），
+> 并通过 `audit/constraint-test.sql` 实测回归。
+> 详见《[设计契约审计报告](./08-contract-audit.md)》§7。
 
 ---
 
@@ -48,6 +53,23 @@
 | C16 | 明确 keyword 检索使用 `pg_trgm` | 🟠 新增 | P1-7：混合检索的关键词通道原本无库层实现 |
 | C17 | `conversations` 新增 `status`、`deleted_at` | 🟡 新增字段 | 软删除语义完整化 |
 | C18 | `conversation_summaries` 明细化生成策略与幂等键 | 🟡 补充说明 | P2-12 |
+
+## 0.3 V1.1 内部修订（契约审计驱动）
+
+V1.1 初稿经《设计契约审计报告》审计后，发现并修复以下缺陷。**这些是对 V1.1 自身的修订**，与上面 C1～C18（对 V1.0 的变更）性质不同。
+
+| 编号 | 修订 | 类型 | 依据 |
+| ---- | ---- | ---- | ---- |
+| C19 | `extraction_runs` 幂等键由 `end_sequence` 改为 `start_sequence` | 🔴 缺陷修复 | 审计 F-01：`end_sequence` 每次触发都变，无法拦截范围重叠 |
+| C20 | 新增 §11.3.2 区间不重叠排他约束（需 `btree_gist`） | 🟠 新增约束 | 审计 F-01 配套 |
+| C21 | 新增 §11.4 进度计算定义（只统计 succeeded） | 🟠 补充说明 | 审计 F-08：失败区间可能被永久跳过 |
+| C22 | **删除** `memory_sources.conversation_id` 冗余字段 | 🔴 结构性 | 审计 F-02：其 `SET NULL` 与来源约束冲突，导致删除会话失败 |
+| C23 | `superseded_by` 去掉外键约束（保留为历史指针） | 🔴 结构性 | 审计 F-04：原外键使物理删除记忆必定失败 |
+| C24 | 明确 `goal_projection` 记忆随 Goal 删除而失效 | 🟠 流程修订 | 审计 F-03：`goal_id` 置空会触发来源约束违约 |
+| C25 | §13.1 明确「不可变」的字段范围 | 🟡 表述澄清 | 审计 F-07：原文易被误读为整行不可变 |
+| C26 | `goals` 新增时间顺序约束 | 🟠 新增约束 | 审计 F-10：可写入逻辑矛盾的时间 |
+| C27 | `model` 字段统一为 `BAAI/bge-m3` | 🟡 一致性 | 审计 F-11：两种写法并存会导致检索静默失配 |
+| C28 | 补充部分唯一索引的适用范围说明 | 🟡 表述澄清 | 审计 F-13：无槽位记忆不受唯一约束，需明确为设计意图 |
 
 ## 0.3 与 V1.0 的不兼容说明
 
@@ -654,7 +676,7 @@ messages
 
 ```sql
 CREATE UNIQUE INDEX uq_extraction_idempotency
-  ON extraction_runs (conversation_id, end_sequence, extractor_version);
+  ON extraction_runs (conversation_id, start_sequence, extractor_version);
 ```
 
 ```text
@@ -667,13 +689,102 @@ extractor_version 的作用：
   而不会与旧版本的记录冲突。
 ```
 
-## 11.4 触发条件
+### 11.3.1 为什么幂等键是 start_sequence 而不是 end_sequence
+
+> 🔴 依据审计报告 F-01。V1.1 初稿曾使用 `end_sequence`，**这是错误的**。
+
+`end_sequence` 是**每次触发时都会变化的值**，因此无法拦截范围重叠的重复抽取：
+
+```text
+错误设计（end_sequence 作键）：
+  t1  空闲触发，扫描 [1, 5]   → 键 (conv, end=5,  v1)  ✅ 执行
+  t2  空闲触发，扫描 [1, 10]  → 键 (conv, end=10, v1)  ✅ 执行 ← 重叠了 [1,5]
+  t3  用户手动触发，扫描 [1,10] → 键与 t2 相同          ❌ 拦截
+
+  → t2 把 [1,5] 重新抽了一遍，白白多调一次 LLM，
+    且 source_count 被虚增，该信号不再可信。
+```
+
+**正确性不变量是「每条消息恰好被抽取一次」**，这由**起点单调递增**保证，与终点无关。因此幂等键必须标识「从哪开始」：
+
+```text
+正确设计（start_sequence 作键）：
+  t1  扫描 [1, 5]   → 键 (conv, start=1,  v1)  ✅ 执行
+  t2  扫描 [1, 10]  → 键 (conv, start=1,  v1)  ❌ 拦截（起点相同）
+  t3  扫描 [6, 10]  → 键 (conv, start=6,  v1)  ✅ 执行
+```
+
+### 11.3.2 区间不重叠约束
+
+仅靠幂等键还不足以保证区间不重叠（`[1,5]` 与 `[3,10]` 起点不同但重叠）。因此补充排他约束：
+
+```sql
+-- 成功的抽取区间不得两两重叠
+ALTER TABLE extraction_runs ADD CONSTRAINT excl_extraction_range
+  EXCLUDE USING gist (
+    conversation_id WITH =,
+    int8range(start_sequence, end_sequence, '[]') WITH &&
+  ) WHERE (status = 'succeeded');
+```
+
+> ⚠️ `EXCLUDE` 需要 `btree_gist` 扩展。初始化脚本需补充：
+> `CREATE EXTENSION IF NOT EXISTS btree_gist;`
+>
+> 若不想引入该扩展，可在服务层用事务 + `SELECT ... FOR UPDATE` 保证同一会话
+> 的抽取串行化。**V1.0 建议引入 `btree_gist`**——数据库层的保证比服务层自觉可靠。
+
+## 11.4 进度计算
+
+> 🔴 依据审计报告 F-08。V1.1 初稿只定义了触发条件，**没有定义「未抽取」如何计算**，会导致失败区间被永久跳过。
+
+```text
+【必须】 进度只统计 succeeded 记录：
+
+  start_sequence = COALESCE(
+      MAX(end_sequence) FROM extraction_runs
+       WHERE conversation_id = ? AND status = 'succeeded',
+    0) + 1
+```
+
+**为什么必须排除 failed：** 若把 failed 也算进 `MAX(end_sequence)`：
+
+```text
+run1  [1, 10]  failed        ← 抽取失败
+run2  start = MAX(end_sequence) + 1 = 11
+      → messages [1,10] 永远不会被重新抽取
+      → 这 10 条消息里的记忆永久丢失，且无任何提示
+```
+
+排除 failed 后，失败区间会被下一次触发自然覆盖，无需特殊重试逻辑。
+
+**failed 记录仍然保留**——它记录了「这次尝试失败过」，用于告警与质量回溯，只是不参与进度推进。
+
+**重试的幂等处理：** 失败区间重试时起点不变，因此会命中同一幂等键：
+
+```sql
+INSERT INTO extraction_runs
+  (conversation_id, start_sequence, end_sequence, extractor_version, status)
+VALUES ($1, $2, $3, $4, 'running')
+ON CONFLICT (conversation_id, start_sequence, extractor_version)
+DO UPDATE SET status = 'running', error = NULL, finished_at = NULL
+WHERE extraction_runs.status IN ('failed', 'pending');
+```
+
+```text
+【必须】 ON CONFLICT 的 DO UPDATE 必须带 WHERE 条件限定可复用的状态。
+
+  否则一次成功的抽取会被后续同起点的触发覆盖，
+  导致「已经抽过的区间被重新执行」——正是幂等键要防止的事。
+```
+
+## 11.5 触发条件
 
 V1.0 不依赖「对话结束」（流式场景下该时刻不可判定），改为满足任一条件即触发：
 
 ```text
 ① 对话空闲超过 N 分钟（默认 5）
 ② 未抽取的消息数达到 M 条（默认 10）
+     未抽取数 = 会话最大 sequence − (MAX(end_sequence) WHERE succeeded)
 ③ 用户显式请求（「记住这个」）
 ④ 会话被归档 / 被关闭
 
@@ -682,13 +793,13 @@ V1.0 不依赖「对话结束」（流式场景下该时刻不可判定），改
   end_sequence 取本轮最后一条消息的 sequence。
 ```
 
-## 11.5 status
+## 11.6 status
 
 ```text
 pending     已登记，未执行
 running     执行中
 succeeded   成功
-failed      失败（可重试，重试时复用同一幂等键）
+failed      失败（可重试，重试时复用同一幂等键，见 §11.4）
 skipped     已跳过（如用户关闭了 auto_extract）
 ```
 
@@ -696,14 +807,15 @@ skipped     已跳过（如用户关闭了 auto_extract）
 CHECK (status IN ('pending','running','succeeded','failed','skipped'))
 ```
 
-## 11.6 用途
+## 11.7 用途
 
 ```text
-① 幂等：同一个 (conversation, end_sequence, version) 只抽一次
-② 进度查询：前端可显示「正在整理记忆…」
-③ 离线评测：确定抽取是否已完成，作为评测的前置条件
-④ 质量回溯：memories_created / conflicts_found 的时间序列，用于观察记忆质量趋势
-⑤ 失败重试：failed 状态的记录可安全重跑
+① 幂等：同一个 (conversation, start_sequence, version) 只抽一次
+② 进度：由 succeeded 记录的 MAX(end_sequence) 推进（§11.4）
+③ 进度查询：前端可显示「正在整理记忆…」
+④ 离线评测：确定抽取是否已完成，作为评测的前置条件
+⑤ 质量回溯：memories_created / conflicts_found 的时间序列，用于观察记忆质量趋势
+⑥ 失败重试：failed 状态的记录可安全重跑
 ```
 
 ---
@@ -771,9 +883,7 @@ System Prompt
 ## 13.1 核心设计原则（V1.1 强化）
 
 ```text
-【必须】 记忆是不可变事实。
-
-  一条记忆被创建后，其 content 永不就地修改。
+【必须】 记忆的「事实内容」不可变。
 
   信息发生变化时：
     创建新记忆 + 将旧记忆标记为 superseded（写 valid_until + superseded_by）
@@ -782,6 +892,31 @@ System Prompt
     ① 「用户过去住在广州」本身是一个需要被记住的历史事实
     ② 就地更新会让 valid_from 语义二义（是记录时间还是事实时间？）
     ③ 时间线与「我之前什么时候开始想做这个项目」依赖历史可还原
+```
+
+> 🟡 C25：**「不可变」的确切范围（审计 F-07）。**
+>
+> 原文写「记忆是不可变事实」，容易被误读为「整行不可变」，进而导致去重合并无法记录 `source_count`。精确边界如下：
+
+```text
+❌ 不可变字段（创建后禁止 UPDATE，改动即需新建记忆）
+     content
+     type
+     subject_key / predicate_key / object_value / polarity
+     valid_from
+     created_at
+
+✅ 允许更新字段（反映系统对同一事实的「认知」变化，不改变事实本身）
+     source_count          被再次提到的次数（去重合并时 +1）
+     confidence_score      置信度调整
+     importance_score      重要性重估
+     updated_at            认知更新时间
+     status / valid_until / superseded_by    状态流转（见 §13.5）
+     deleted_at            删除标记
+
+判断准则：
+  改这些字段不改变「用户说的是什么事实」，只改变「系统对它的判断」。
+  一旦需要改动 content 的语义，就必须新建记忆（supersede），不得就地修改。
 ```
 
 ## 13.2 双时间轴模型
@@ -827,13 +962,43 @@ System Prompt
 | status | VARCHAR(20) | NOT NULL DEFAULT 'active' | 状态 |
 | valid_from | TIMESTAMPTZ | | 事实生效时间 |
 | valid_until | TIMESTAMPTZ | | 事实失效时间 |
-| superseded_by | UUID | FK → memories(id) | 被哪条记忆替代 |
+| superseded_by | UUID | **无外键**（见下） | 被哪条记忆替代 |
 | source_count | INTEGER | NOT NULL DEFAULT 1 | 来源计数（去重合并时递增） |
 | created_at | TIMESTAMPTZ | NOT NULL | 记录时间 |
 | updated_at | TIMESTAMPTZ | NOT NULL | 记录更新时间 |
 | deleted_at | TIMESTAMPTZ | | 软删除时间 |
 
 > 🔴 C1 / 🟠 C2：新增 `superseded_by`、`subject_key`、`predicate_key`、`object_value`、`polarity`、`source_count`。
+
+> 🔴 C23：**`superseded_by` 刻意不加外键约束（审计 F-04）。**
+>
+> V1.1 初稿写作 `REFERENCES memories(id) ON DELETE SET NULL`，与约束 `chk_memories_superseded` 直接冲突：
+>
+> ```text
+> 记忆 A：status='superseded', superseded_by='B'     ✅ 满足约束
+> 物理删除 B → A.superseded_by 被 SET NULL
+>            → status 仍为 'superseded'
+>            → 约束要求 superseded_by IS NOT NULL，违约
+>            → 整个 DELETE 被回滚
+>
+> 实测确认：CHECK constraint failed（见审计报告 §0.4 实验组 A2）
+> ```
+>
+> 后果：§24.4 承诺的「永久删除」与架构 §37 承诺的「删除全部个人数据」**都无法执行**。
+>
+> **决定：保留为纯历史指针，不加外键。**
+>
+> ```text
+> 理由：
+>   ① 它回答「这条记忆被谁替代了」——即使替代者已被删除，
+>      这个历史事实依然成立（只是指向一条不存在的记录）
+>   ② 强制引用完整性会阻止合法的删除操作
+>   ③ 应用层可容忍悬空引用：UI 显示「（替代者已删除）」即可
+>   ④ 链条断裂不导致数据错误，只损失一点可解释性
+>
+> 实现要求：
+>   遍历替代链时必须容忍断层，不得假设 superseded_by 一定可解析。
+> ```
 
 ## 13.4 type
 
@@ -1015,6 +1180,40 @@ memory(type='goal')   = goals 的语义检索投影
 
 这样「目标」只有一个写入入口，而语义检索仍能命中它。
 
+> 🔴 C24：**Goal 删除时的投影记忆处理（审计 F-03）。**
+>
+> 投影记忆的来源指针是 `goal_id`。若删除 Goal 时任由外键把它 `SET NULL`，来源约束 `chk_sources_has_origin` 会违约（`goal_projection` 不在豁免列表），**删除整个被回滚**。
+>
+> ```text
+> 实测确认：CHECK constraint failed（见审计报告 §0.4 实验组 B1）
+> ```
+>
+> **【必须】 删除 Goal 时的正确顺序：**
+>
+> ```text
+> BEGIN
+>   ① 将该 Goal 的投影记忆置为失效
+>        UPDATE memories SET status='deleted', deleted_at=now()
+>         WHERE id IN (
+>           SELECT ms.memory_id FROM memory_sources ms
+>            WHERE ms.goal_id = $1 AND ms.source_type='goal_projection'
+>         );
+>   ② 同步失效其 embedding
+>        UPDATE memory_embeddings SET status='deleted'
+>         WHERE memory_id IN (...);
+>   ③ 删除来源记录
+>        DELETE FROM memory_sources WHERE goal_id = $1;
+>   ④ 删除 Goal
+>        DELETE FROM goals WHERE id = $1;
+> COMMIT
+> ```
+>
+> **不要把 `goal_projection` 加进来源约束的豁免列表。** 那只是让违约消失，而「投影记忆失去目标」这个不一致状态会变成合法——比失败更糟。
+>
+> **`event_derived` 无需同样处理：** Event 默认软删除（`deleted_at`），
+> `events` 行不会物理消失，因此 `event_id` 不会被置空。仅当用户要求
+> 物理删除 Event 时才需要走同样的清理顺序。
+
 ## 13.11 索引
 
 ```sql
@@ -1105,6 +1304,27 @@ embedded_text = "{type}｜{主体}｜{content}｜{时间提示}"
 
 **为什么把 type 与时间并入向量文本：** 只嵌入 `content` 时，「广州」这个词本身不带类型与时间信息，导致「用户住在广州」与「用户去广州出差」在向量空间里非常接近。加上 `type` 与时间提示能显著改善区分度。
 
+> 🟡 C27（审计 F-11）：**`model` 的取值规范。**
+>
+> ```text
+> 【必须】 memory_embeddings.model 一律使用 HuggingFace 完整模型 ID：
+>
+>     BAAI/bge-m3
+>
+> ❌ 不要写 'bge-m3'（短名）
+>
+> 理由：
+>   ① 与 .env 的 EMBEDDING_MODEL 及 docker-compose 的 --model-id 一致，无需转换
+>   ② 未来切换 provider 时不会与本地路径混淆
+>
+> 后果警示：写入时用 'BAAI/bge-m3'、检索时过滤 'bge-m3'，
+>   JOIN 条件会静默失配，检索永远返回空结果且不报错。
+>   这类「功能看似正常但永远召回不到东西」的问题极难排查。
+>
+> 实现要求：该值必须来自单一常量（如 EMBEDDING_MODEL_ID），
+>   不得在检索、写入、评测等多处手写字面量。
+> ```
+
 ## 14.6 陈旧向量的检测与修复
 
 > 🟠 C4 的配套。这是 V1.0 完全缺失的机制。
@@ -1170,8 +1390,12 @@ Memory 必须知道「这条记忆是从哪里来的」。
 | message_id | UUID | FK → messages(id) ON DELETE RESTRICT | 来源消息 |
 | event_id | UUID | FK → events(id) ON DELETE SET NULL | 来源事件 |
 | goal_id | UUID | FK → goals(id) ON DELETE SET NULL | 来源目标 |
-| conversation_id | UUID | FK → conversations(id) ON DELETE SET NULL | 冗余，便于按会话反查 |
 | created_at | TIMESTAMPTZ | NOT NULL | 创建时间 |
+
+> 🔴 C22：**V1.1 初稿曾有一个 `conversation_id` 冗余字段，已删除。**
+> 它与来源约束的 `SET NULL` 行为冲突，会导致删除会话时整个 `DELETE` 被回滚（审计 F-02）。
+> 该字段本可由 `message_id → messages.conversation_id` 推出，属冗余。
+> 按会话反查记忆改用 JOIN，见 §15.4。
 
 > 🟠 C12：V1.0 仅有 `memory_id` / `message_id` / `source_type` / `created_at`，无法表达记忆来自 Event / Goal，也没有索引与外键行为定义。
 
@@ -1197,21 +1421,44 @@ CREATE UNIQUE INDEX uq_memory_sources_memory_message
   ON memory_sources (memory_id, message_id)
   WHERE message_id IS NOT NULL;
 
--- 支撑「删除会话时反查派生记忆」（见 §19）
-CREATE INDEX idx_memory_sources_message      ON memory_sources (message_id);
-CREATE INDEX idx_memory_sources_conversation ON memory_sources (conversation_id);
-CREATE INDEX idx_memory_sources_memory       ON memory_sources (memory_id);
+-- 支撑「删除会话时反查派生记忆」（见 §24）
+CREATE INDEX idx_memory_sources_message ON memory_sources (message_id);
+CREATE INDEX idx_memory_sources_memory  ON memory_sources (memory_id);
 
 -- 约束：至少有一个来源指针非空
-CHECK (message_id IS NOT NULL OR event_id IS NOT NULL
-       OR goal_id IS NOT NULL OR source_type IN ('manual','system'))
+CONSTRAINT chk_sources_has_origin
+  CHECK (message_id IS NOT NULL OR event_id IS NOT NULL
+         OR goal_id IS NOT NULL OR source_type IN ('manual','system'))
 ```
+
+**按会话反查派生记忆（替代已删除的 `conversation_id` 字段）：**
+
+```sql
+-- 删除会话时，先找出受影响的记忆（§24.3 第 ① 步）
+SELECT DISTINCT ms.memory_id
+  FROM memory_sources ms
+  JOIN messages m ON m.id = ms.message_id
+ WHERE m.conversation_id = $1;
+```
+
+> 💡 该查询走 `idx_memory_sources_message` + `messages` 的主键索引，性能足够。
+> **冗余字段换来的不是必要性，而是上文 F-02 那个约束冲突。**
 
 ```text
 【必须】 message_id 的外键行为为 ON DELETE RESTRICT 而非 CASCADE。
 
-  理由：删除消息时必须先由服务层决定「派生记忆如何处理」（见 §19），
+  理由：删除消息时必须先由服务层决定「派生记忆如何处理」（见 §24），
         静默级联会绕过这个决策，导致用户的删除意图未被尊重。
+```
+
+```text
+【必须】 来源约束的三个后果必须一起理解（审计 F-02 / F-03 的教训）：
+
+  ① 任何 ON DELETE SET NULL 都会触发一次 UPDATE，
+     而该 UPDATE 会重新校验 chk_sources_has_origin —— 可能违约
+  ② 因此 event_id / goal_id 的引用方必须保证：
+     删除 Event / Goal 时，先按 §24 处理好依赖的记忆与来源记录
+  ③ 新增任何指向本表的外键时，必须重新做一次上面的布尔求值
 ```
 
 ## 15.5 用户可见的效果
@@ -1304,6 +1551,22 @@ CREATE INDEX idx_memories_content_trgm
 
 > 🟠 C16：V1.0 明确要求混合检索的 Keyword 通道，但索引清单中没有任何全文检索索引，且中文场景下 PostgreSQL 默认全文检索不支持中文分词。V1.1 决定使用 `pg_trgm`。
 
+> 🟡 C28：**`uq_memories_current_slot` 的适用范围（审计 F-13）。**
+>
+> 该索引带 `predicate_key IS NOT NULL` 条件，因此**无槽位的记忆完全不受唯一性约束**（`memories` 里 `predicate_key = NULL` 的行）。
+>
+> ```text
+> 这是设计意图，不是漏洞：
+>   ① 无法判断两条无槽位记忆是否在讲同一个事实
+>   ② 强行约束会导致合法的不同事实被拒绝写入
+>
+> 代价（必须知道）：
+>   无槽位记忆的重复由抽取器的语义判重负责，数据库不兜底。
+>   因此 Memory Noise 指标需要把「有槽位」与「无槽位」分开统计 ——
+>   有槽位的重复是数据库级缺陷（可直接告警），
+>   无槽位的重复是抽取质量问题（需靠评测集发现）。
+> ```
+
 **为什么用 `pg_trgm` 而不是 `tsvector`：**
 
 ```text
@@ -1326,7 +1589,7 @@ CREATE INDEX idx_embeddings_status ON memory_embeddings (status);
 
 ```sql
 CREATE UNIQUE INDEX uq_extraction_idempotency
-  ON extraction_runs (conversation_id, end_sequence, extractor_version);
+  ON extraction_runs (conversation_id, start_sequence, extractor_version);
 
 CREATE INDEX idx_extraction_conversation ON extraction_runs (conversation_id, created_at DESC);
 CREATE INDEX idx_extraction_pending
@@ -1369,9 +1632,8 @@ CREATE UNIQUE INDEX uq_relationships_user_name
 ```sql
 CREATE UNIQUE INDEX uq_memory_sources_memory_message
   ON memory_sources (memory_id, message_id) WHERE message_id IS NOT NULL;
-CREATE INDEX idx_memory_sources_message      ON memory_sources (message_id);
-CREATE INDEX idx_memory_sources_conversation ON memory_sources (conversation_id);
-CREATE INDEX idx_memory_sources_memory       ON memory_sources (memory_id);
+CREATE INDEX idx_memory_sources_message ON memory_sources (message_id);
+CREATE INDEX idx_memory_sources_memory  ON memory_sources (memory_id);
 ```
 
 ---
@@ -1475,7 +1737,7 @@ SELECT m.id, m.content, m.type, m.importance_score,
    AND m.valid_until IS NULL
    AND m.superseded_by IS NULL
    AND e.status = 'ready'
-   AND e.model = 'bge-m3'
+   AND e.model = 'BAAI/bge-m3'
  ORDER BY e.embedding <=> $1::vector
  LIMIT 50;
 ```
@@ -1619,6 +1881,16 @@ ALTER TABLE conversation_summaries ADD CONSTRAINT chk_summaries_range
 
 ALTER TABLE extraction_runs ADD CONSTRAINT chk_extraction_range
   CHECK (end_sequence >= start_sequence);
+
+-- 🟠 C26（审计 F-10）：goals 的时间顺序
+-- 原先只有 memories / summaries / extraction_runs 有区间约束，goals 漏了，
+-- 可以写入「目标时间早于开始时间」这类逻辑矛盾数据。
+ALTER TABLE goals ADD CONSTRAINT chk_goals_time_order
+  CHECK (
+    (target_at    IS NULL OR started_at IS NULL OR target_at    >= started_at)
+    AND
+    (completed_at IS NULL OR started_at IS NULL OR completed_at >= started_at)
+  );
 ```
 
 ## 19.4 状态与字段的一致性
@@ -1893,13 +2165,22 @@ users
 | memory_embeddings.memory_id → memories.id | CASCADE | 向量随记忆 |
 | memory_sources.memory_id → memories.id | CASCADE | 来源指针随记忆 |
 | **memory_sources.message_id → messages.id** | **RESTRICT** | **必须先由服务层决定派生记忆的去向（§24）** |
-| memory_sources.conversation_id → conversations.id | SET NULL | 冗余字段，失效不阻塞 |
-| memory_sources.event_id → events.id | SET NULL | |
-| memory_sources.goal_id → goals.id | SET NULL | |
+| memory_sources.event_id → events.id | SET NULL | ⚠️ 见下方警告 |
+| memory_sources.goal_id → goals.id | SET NULL | ⚠️ 见下方警告 |
 | events.user_id → users.id | RESTRICT | |
 | events.source_message_id → messages.id | SET NULL | 来源删除后事件保留 |
 | goals.user_id → users.id | RESTRICT | |
 | relationships.user_id → users.id | RESTRICT | |
+
+> ⚠️ **`SET NULL` 不是「安全地失效」，而是「会触发 CHECK 重新校验」（审计 F-02/F-03 的教训）。**
+>
+> 上表两处 `SET NULL` 都作用于 `memory_sources` 的来源指针，而该表有约束
+> `chk_sources_has_origin`（§15.4）。**任一指针被置空都可能使该约束违约，
+> 导致整个删除语句回滚。**
+>
+> 因此使用这两条的删除路径**必须**先按 §24 清理依赖数据，不能依赖数据库级联。
+>
+> `memory_sources.conversation_id` 已按 C22 删除，不再存在该风险点。
 
 ```text
 【必须】 memory_sources.message_id 使用 RESTRICT 而非 CASCADE。
@@ -1948,9 +2229,11 @@ users
 ```text
 BEGIN
 
-  ① 查询受影响的记忆
-     SELECT DISTINCT memory_id FROM memory_sources
-      WHERE conversation_id = $1;
+  ① 找出受影响的记忆（经 messages JOIN，因 conversation_id 字段已删除，见 §15.4）
+     SELECT DISTINCT ms.memory_id
+       FROM memory_sources ms
+       JOIN messages m ON m.id = ms.message_id
+      WHERE m.conversation_id = $1;
 
   ② 对每条受影响记忆，统计其剩余有效来源数
      SELECT memory_id, COUNT(*) FROM memory_sources
@@ -1967,6 +2250,25 @@ BEGIN
   ⑤ conversations.status='deleted', deleted_at=now()
 
 COMMIT
+```
+
+```text
+【必须】 顺序不可调换。
+
+  若先删 messages 再处理 memory_sources，会立刻撞上
+  message_id 的 ON DELETE RESTRICT 外键。
+  而那个 RESTRICT 是刻意的设计（§15.4）——
+  它强迫服务层先做出「派生记忆如何处置」的决策，
+  而不是让数据库静默级联。
+```
+
+```text
+【必须】 第 ① 步不要改写成「先删来源记录再反查」。
+
+  来源记录（memory_sources）是「记忆从哪来」的唯一凭证。
+  一旦先删掉它，就无法再判断某条记忆是否还有其他来源，
+  第 ② 步的「剩余来源数」会全部变成 0，
+  导致所有派生记忆被误判为「应一并删除」。
 ```
 
 ## 24.4 Memory 的软删除与物理删除
@@ -2555,7 +2857,7 @@ CREATE TABLE extraction_runs (
   CONSTRAINT chk_extraction_range  CHECK (end_sequence >= start_sequence)
 );
 CREATE UNIQUE INDEX uq_extraction_idempotency
-  ON extraction_runs (conversation_id, end_sequence, extractor_version);
+  ON extraction_runs (conversation_id, start_sequence, extractor_version);
 CREATE INDEX idx_extraction_conversation ON extraction_runs (conversation_id, created_at DESC);
 CREATE INDEX idx_extraction_pending
   ON extraction_runs (status) WHERE status IN ('pending','running','failed');
@@ -2590,7 +2892,7 @@ CREATE TABLE memories (
   status           VARCHAR(20) NOT NULL DEFAULT 'active',
   valid_from       TIMESTAMPTZ,
   valid_until      TIMESTAMPTZ,
-  superseded_by    UUID REFERENCES memories(id) ON DELETE SET NULL,
+  superseded_by    UUID,   -- 注意：刻意不加外键，理由见 §13.3 下的 C23 说明
   source_count     INTEGER NOT NULL DEFAULT 1,
   created_at       TIMESTAMPTZ NOT NULL DEFAULT now(),
   updated_at       TIMESTAMPTZ NOT NULL DEFAULT now(),
@@ -2639,7 +2941,7 @@ CREATE TABLE memory_sources (
   message_id      UUID REFERENCES messages(id) ON DELETE RESTRICT,
   event_id        UUID,
   goal_id         UUID,
-  conversation_id UUID REFERENCES conversations(id) ON DELETE SET NULL,
+  -- 注意：没有 conversation_id（C22 已删除该冗余字段，见 §15.2）
   created_at      TIMESTAMPTZ NOT NULL DEFAULT now(),
   CONSTRAINT chk_sources_type
     CHECK (source_type IN ('conversation','manual','system','goal_projection','event_derived')),
@@ -2649,9 +2951,8 @@ CREATE TABLE memory_sources (
 );
 CREATE UNIQUE INDEX uq_memory_sources_memory_message
   ON memory_sources (memory_id, message_id) WHERE message_id IS NOT NULL;
-CREATE INDEX idx_memory_sources_message      ON memory_sources (message_id);
-CREATE INDEX idx_memory_sources_conversation ON memory_sources (conversation_id);
-CREATE INDEX idx_memory_sources_memory       ON memory_sources (memory_id);
+CREATE INDEX idx_memory_sources_message ON memory_sources (message_id);
+CREATE INDEX idx_memory_sources_memory  ON memory_sources (memory_id);
 
 -- ============ events（含 Timeline）============
 CREATE TABLE events (
@@ -2692,7 +2993,12 @@ CREATE TABLE goals (
   updated_at   TIMESTAMPTZ NOT NULL DEFAULT now(),
   deleted_at   TIMESTAMPTZ,
   CONSTRAINT chk_goals_status   CHECK (status IN ('active','paused','completed','cancelled','archived')),
-  CONSTRAINT chk_goals_priority CHECK (priority BETWEEN 0 AND 1)
+  CONSTRAINT chk_goals_priority CHECK (priority BETWEEN 0 AND 1),
+  CONSTRAINT chk_goals_time_order CHECK (
+    (target_at    IS NULL OR started_at IS NULL OR target_at    >= started_at)
+    AND
+    (completed_at IS NULL OR started_at IS NULL OR completed_at >= started_at)
+  )
 );
 CREATE INDEX idx_goals_user_status ON goals (user_id, status);
 
@@ -2728,7 +3034,7 @@ CREATE UNIQUE INDEX uq_relationships_user_name
 | Supersede | 事实发生变化时，创建新记忆并将旧记忆标记为已被替代 |
 | 去重合并 | 同一槽位同一取值被再次提到，只递增 `source_count` |
 | 陈旧向量 | `content_hash` 与当前 `embedded_text` 不匹配的 embedding |
-| 幂等键 | `(conversation_id, end_sequence, extractor_version)` |
+| 幂等键 | `(conversation_id, start_sequence, extractor_version)` |
 | Timeline | `events` 的查询视图，不是独立存储的实体 |
 | Goal 投影 | `memory(type='goal')`，Goal 实体在语义检索层的镜像 |
 

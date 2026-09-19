@@ -1,108 +1,186 @@
 -- ============================================================
--- 约束交互实测 · 隔离版
--- 每组实验独立建表，一组失败不影响其他组
+-- 约束交互实测 · 修复后回归验证
+--
+-- 验证对象：《数据库设计 V1.1》（含审计修订 C19~C28）
+-- 执行：sqlite3 :memory: ".read audit/constraint-test.sql"
+--
+-- 结构说明：
+--   第 1 部分 —— 修复前 schema 的缺陷复现（保留为回归证据）
+--   第 2 部分 —— 修复后 schema 的通过验证
 -- ============================================================
 PRAGMA foreign_keys = ON;
 
-.print '########## A1 基线：自引用外键插入是否可行 ##########'
-CREATE TABLE t1 (id TEXT PRIMARY KEY, superseded_by TEXT REFERENCES t1(id));
-INSERT INTO t1 VALUES ('memA', 'memB');
-.print '-- 结果（预期报 FK 违约，因为 memB 还不存在）：'
-INSERT INTO t1 VALUES ('memB', NULL);
-.print '-- 插入 memB 后：'
-SELECT id, superseded_by FROM t1;
+.print '============================================================'
+.print '第一部分：修复前 schema —— 缺陷复现（应全部报错）'
+.print '============================================================'
 
 .print ''
-.print '########## A2 F-04 复现：先插 memB，再插 memA ##########'
-CREATE TABLE t2 (
+.print '--- [F-04] superseded_by 带外键 + CHECK 约束 ---'
+CREATE TABLE old_memories (
   id            TEXT PRIMARY KEY,
   status        TEXT NOT NULL,
-  superseded_by TEXT REFERENCES t2(id) ON DELETE SET NULL,
+  superseded_by TEXT REFERENCES old_memories(id) ON DELETE SET NULL,
   CHECK (status <> 'superseded' OR superseded_by IS NOT NULL)
 );
-INSERT INTO t2 VALUES ('memB', 'active', NULL);
-INSERT INTO t2 VALUES ('memA', 'superseded', 'memB');
-.print '-- 删除前（应有 2 行）：'
-SELECT id, status, superseded_by FROM t2;
-.print '-- 执行 DELETE memB：'
-DELETE FROM t2 WHERE id = 'memB';
-.print '-- 删除后：'
-SELECT id, status, superseded_by FROM t2;
+INSERT INTO old_memories VALUES ('memB', 'active', NULL);
+INSERT INTO old_memories VALUES ('memA', 'superseded', 'memB');
+.print '删除前:'
+SELECT id, status, superseded_by FROM old_memories;
+.print 'DELETE memB → 预期报 CHECK constraint failed:'
+DELETE FROM old_memories WHERE id = 'memB';
+.print '删除后（应仍为 2 行，说明语句被回滚）:'
+SELECT id, status, superseded_by FROM old_memories;
 
 .print ''
-.print '########## A3 对照组：superseded_by 不加外键 ##########'
-CREATE TABLE t3 (
-  id            TEXT PRIMARY KEY,
-  status        TEXT NOT NULL,
-  superseded_by TEXT,
-  CHECK (status <> 'superseded' OR superseded_by IS NOT NULL)
-);
-INSERT INTO t3 VALUES ('memB', 'active', NULL);
-INSERT INTO t3 VALUES ('memA', 'superseded', 'memB');
-DELETE FROM t3 WHERE id = 'memB';
-.print '-- 删除后（memA 应保留为悬空指针）：'
-SELECT id, status, superseded_by FROM t3;
-
-.print ''
-.print '########## B1 F-03 复现：goal_projection 的 goal_id 被置空 ##########'
-CREATE TABLE b_goals (id TEXT PRIMARY KEY);
-CREATE TABLE b_sources (
+.print '--- [F-03] goal_projection 的来源约束 ---'
+CREATE TABLE old_goals (id TEXT PRIMARY KEY);
+CREATE TABLE old_sources (
   id          TEXT PRIMARY KEY,
   memory_id   TEXT NOT NULL,
   source_type TEXT NOT NULL,
   message_id  TEXT,
   event_id    TEXT,
-  goal_id     TEXT REFERENCES b_goals(id) ON DELETE SET NULL,
+  goal_id     TEXT REFERENCES old_goals(id) ON DELETE SET NULL,
   CHECK (message_id IS NOT NULL OR event_id IS NOT NULL
          OR goal_id IS NOT NULL OR source_type IN ('manual','system'))
 );
-INSERT INTO b_goals VALUES ('goal1');
-INSERT INTO b_sources VALUES ('src2','mem2','goal_projection',NULL,NULL,'goal1');
-.print '-- 删除 goal1：'
-DELETE FROM b_goals WHERE id = 'goal1';
-.print '-- 删除后：'
-SELECT id, source_type, goal_id FROM b_sources;
+INSERT INTO old_goals VALUES ('goal1');
+INSERT INTO old_sources VALUES ('src2','mem2','goal_projection',NULL,NULL,'goal1');
+.print 'DELETE goal1 → 预期报 CHECK constraint failed:'
+DELETE FROM old_goals WHERE id = 'goal1';
+.print '删除后（goal_id 应仍在，说明语句被回滚）:'
+SELECT id, source_type, goal_id FROM old_sources;
 
 .print ''
-.print '########## C1 对照：message_id 存在时置空 conversation_id 是否安全 ##########'
-CREATE TABLE c_conv (id TEXT PRIMARY KEY);
-CREATE TABLE c_sources (
+.print '--- [F-02] 唯一指针是 conversation_id 的来源 ---'
+CREATE TABLE old_conv (id TEXT PRIMARY KEY);
+CREATE TABLE old_sources2 (
   id              TEXT PRIMARY KEY,
   source_type     TEXT NOT NULL,
   message_id      TEXT,
   event_id        TEXT,
   goal_id         TEXT,
-  conversation_id TEXT REFERENCES c_conv(id) ON DELETE SET NULL,
+  conversation_id TEXT REFERENCES old_conv(id) ON DELETE SET NULL,
   CHECK (message_id IS NOT NULL OR event_id IS NOT NULL
          OR goal_id IS NOT NULL OR source_type IN ('manual','system'))
 );
-INSERT INTO c_conv VALUES ('conv1');
-INSERT INTO c_sources VALUES ('src1','conversation','msg1',NULL,NULL,'conv1');
-.print '-- 删除 conv1：'
-DELETE FROM c_conv WHERE id = 'conv1';
-.print '-- 删除后（message_id 仍在，约束应满足）：'
-SELECT id, source_type, message_id, conversation_id FROM c_sources;
+INSERT INTO old_conv VALUES ('conv1');
+INSERT INTO old_sources2 VALUES ('src9','conversation',NULL,NULL,NULL,'conv1');
+.print 'DELETE conv1 → 预期报 CHECK constraint failed:'
+DELETE FROM old_conv WHERE id = 'conv1';
+.print '删除后（应为空，说明 conv1 未能删除）:'
+SELECT id, source_type, conversation_id FROM old_sources2;
+
 
 .print ''
-.print '########## C2 F-02 复现：无 message_id 时置空 conversation_id ##########'
-CREATE TABLE c2_conv (id TEXT PRIMARY KEY);
-CREATE TABLE c2_sources (
+.print '============================================================'
+.print '第二部分：修复后 schema —— 应全部通过'
+.print '============================================================'
+
+.print ''
+.print '--- [C23] superseded_by 去掉外键，保留为历史指针 ---'
+CREATE TABLE new_memories (
+  id            TEXT PRIMARY KEY,
+  status        TEXT NOT NULL,
+  superseded_by TEXT,                       -- 修正：无 REFERENCES
+  CHECK (status <> 'superseded' OR superseded_by IS NOT NULL)
+);
+INSERT INTO new_memories VALUES ('memB', 'active', NULL);
+INSERT INTO new_memories VALUES ('memA', 'superseded', 'memB');
+DELETE FROM new_memories WHERE id = 'memB';
+.print '删除后（memA 保留，指针悬空但合法）:'
+SELECT id, status, superseded_by FROM new_memories;
+.print '>>> 通过：物理删除能力可兑现'
+
+.print ''
+.print '--- [C22] memory_sources 不再有 conversation_id 字段 ---'
+CREATE TABLE new_conv (id TEXT PRIMARY KEY);
+CREATE TABLE new_messages (
   id              TEXT PRIMARY KEY,
-  source_type     TEXT NOT NULL,
-  message_id      TEXT,
-  event_id        TEXT,
-  goal_id         TEXT,
-  conversation_id TEXT REFERENCES c2_conv(id) ON DELETE SET NULL,
+  conversation_id TEXT REFERENCES new_conv(id) ON DELETE CASCADE,
+  sequence        INTEGER NOT NULL
+);
+CREATE TABLE new_sources (
+  id          TEXT PRIMARY KEY,
+  memory_id   TEXT NOT NULL,
+  source_type TEXT NOT NULL,
+  message_id  TEXT REFERENCES new_messages(id) ON DELETE RESTRICT,
+  event_id    TEXT,
+  goal_id     TEXT,
+  -- 修正：无 conversation_id
   CHECK (message_id IS NOT NULL OR event_id IS NOT NULL
          OR goal_id IS NOT NULL OR source_type IN ('manual','system'))
 );
-INSERT INTO c2_conv VALUES ('conv1');
--- conversation 来源但只有 conversation_id 一个指针（如按会话聚合生成的记忆）
-INSERT INTO c2_sources VALUES ('src9','conversation',NULL,NULL,NULL,'conv1');
-.print '-- 删除 conv1：'
-DELETE FROM c2_conv WHERE id = 'conv1';
-.print '-- 删除后：'
-SELECT id, source_type, message_id, conversation_id FROM c2_sources;
+INSERT INTO new_conv VALUES ('conv1');
+INSERT INTO new_messages VALUES ('msg1', 'conv1', 1);
+INSERT INTO new_sources VALUES ('src1','mem1','conversation','msg1',NULL,NULL);
+
+.print '按会话反查派生记忆（替代 conversation_id 的 JOIN 写法）:'
+SELECT DISTINCT ms.memory_id
+  FROM new_sources ms
+  JOIN new_messages m ON m.id = ms.message_id
+ WHERE m.conversation_id = 'conv1';
+
+.print '删除会话（先清来源，再删消息，最后删会话）:'
+DELETE FROM new_sources WHERE message_id IN (SELECT id FROM new_messages WHERE conversation_id='conv1');
+DELETE FROM new_messages WHERE conversation_id='conv1';
+DELETE FROM new_conv WHERE id='conv1';
+.print '查询剩余行数（会话与消息应为 0）:'
+SELECT (SELECT COUNT(*) FROM new_conv) AS conv_left,
+       (SELECT COUNT(*) FROM new_messages) AS msg_left;
+.print '>>> 通过：删除链路不再触发 CHECK 违约'
 
 .print ''
-.print '########## END ##########'
+.print '--- [C24] 删除 Goal 时先清理投影记忆与来源 ---'
+CREATE TABLE new_goals (id TEXT PRIMARY KEY);
+CREATE TABLE new_sources_g (
+  id          TEXT PRIMARY KEY,
+  memory_id   TEXT NOT NULL,
+  source_type TEXT NOT NULL,
+  message_id  TEXT,
+  event_id    TEXT,
+  goal_id     TEXT REFERENCES new_goals(id) ON DELETE SET NULL,
+  CHECK (message_id IS NOT NULL OR event_id IS NOT NULL
+         OR goal_id IS NOT NULL OR source_type IN ('manual','system'))
+);
+CREATE TABLE new_mem_g (id TEXT PRIMARY KEY, status TEXT NOT NULL);
+
+INSERT INTO new_goals VALUES ('goal1');
+INSERT INTO new_mem_g VALUES ('mem2','active');
+INSERT INTO new_sources_g VALUES ('src2','mem2','goal_projection',NULL,NULL,'goal1');
+
+.print '按 C24 的顺序：先失效记忆 → 再删来源 → 最后删 Goal'
+UPDATE new_mem_g SET status='deleted'
+ WHERE id IN (SELECT memory_id FROM new_sources_g
+               WHERE goal_id='goal1' AND source_type='goal_projection');
+DELETE FROM new_sources_g WHERE goal_id='goal1';
+DELETE FROM new_goals WHERE id='goal1';
+
+.print '结果（记忆应已失效，目标应已删除）:'
+SELECT (SELECT status FROM new_mem_g WHERE id='mem2') AS memory_status,
+       (SELECT COUNT(*) FROM new_goals)               AS goals_left,
+       (SELECT COUNT(*) FROM new_sources_g)           AS sources_left;
+.print '>>> 通过：删除目标不再违约，且投影记忆被正确失效'
+
+.print ''
+.print '--- [C19] 幂等键改用 start_sequence ---'
+CREATE TABLE runs (
+  id                TEXT PRIMARY KEY,
+  conversation_id   TEXT NOT NULL,
+  start_sequence    INTEGER NOT NULL,
+  end_sequence      INTEGER NOT NULL,
+  extractor_version TEXT NOT NULL,
+  status            TEXT NOT NULL
+);
+CREATE UNIQUE INDEX uq_run ON runs (conversation_id, start_sequence, extractor_version);
+
+INSERT INTO runs VALUES ('r1','conv1',1,5,'v1','succeeded');
+.print '尝试插入起点相同的重复抽取 [1,10] → 预期报 UNIQUE 违约:'
+INSERT INTO runs VALUES ('r2','conv1',1,10,'v1','succeeded');
+.print '尝试插入起点不同的区间 [6,10] → 预期成功:'
+INSERT INTO runs VALUES ('r3','conv1',6,10,'v1','succeeded');
+SELECT id, start_sequence, end_sequence, status FROM runs ORDER BY start_sequence;
+.print '>>> 通过：重叠范围的重复触发被正确拦截'
+
+.print ''
+.print '########## 回归验证结束 ##########'

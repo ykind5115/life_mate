@@ -1090,18 +1090,51 @@ Database
 例如：
 
 ```typescript
+// 用户可手工创建的记忆类型
+// ⚠️ 刻意不含 goal 与 event —— 它们有专用端点，见下方说明
 const createMemorySchema = z.object({
   type: z.enum([
     "fact",
     "preference",
-    "event",
-    "goal",
     "relationship",
     "state"
   ]),
   content: z.string().min(1).max(5000)
 });
 ```
+
+> 🟠 **为什么 `goal` 与 `event` 不在可创建列表里**（审计 F-06）
+>
+> 《数据库设计 V1.1》§13.10 明确规定：
+>
+> ```text
+> 【必须】
+>   ② 抽取器不得直接创建 type='goal' 的记忆
+>   ③ 用户不可直接新建 type='goal' 的记忆（必须通过 Goal 实体）
+> ```
+>
+> 若此处允许 `type: "goal"`，则 `POST /api/v1/memories` 可以绕过 `goals` 表，
+> 造成同一个目标有两处真相：
+>
+> ```text
+> ① goals 表里没有这条目标
+> ② Goal 的生命周期状态机（active/paused/completed...）对它不生效
+> ③ Timeline 与 Life Review 聚合时出现不一致
+> ```
+>
+> **正确路径：**
+>
+> ```text
+> 目标      POST /api/v1/goals     → GoalService 写入 goals
+>                                  → 同步生成 memory(type='goal') 投影
+> 事件      POST /api/v1/events    → 写入 events
+>                                  → 必要时派生 memory(type='event')
+>
+> 记忆      POST /api/v1/memories  → 仅限 fact / preference / relationship / state
+> ```
+>
+> 同理，`memory.type` 的完整枚举（含 `goal` / `event`）**只应出现在读接口的响应中**，
+> 不出现在写接口的入参校验里。
 
 Fastify Controller：
 
