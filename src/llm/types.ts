@@ -28,6 +28,16 @@ export interface LLMToolCall {
 export interface LLMTokenUsage {
   inputTokens: number;
   outputTokens: number;
+  /**
+   * 其中用于**推理（思维链）**的 token 数。
+   *
+   * ⚠️ 推理模型（如 deepseek-flash / deepseek-v4-pro）会先产出思维链再给回答，
+   *    两者的 token 都算进 outputTokens。若不单独记账，
+   *    「回答很短却花了大量 token」会显得无法解释，成本核算也会失真。
+   *
+   * 非推理模型该值为 0。
+   */
+  reasoningTokens: number;
 }
 
 export interface LLMGenerateResult {
@@ -41,6 +51,11 @@ export interface LLMGenerateResult {
    * 不能把截断的半句话当作完整回答。
    */
   finishReason: 'stop' | 'tool_calls' | 'length' | 'content_filter' | 'unknown';
+  /**
+   * 思维链原文（推理模型才有）。仅供调试与可观测性，
+   * **不得注入对话历史或展示给用户**（它面向模型自用，措辞不适合用户阅读）。
+   */
+  reasoningContent?: string;
 }
 
 export type LLMStreamChunk =

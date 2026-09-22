@@ -110,7 +110,7 @@ export async function runAgent(options: RunAgentOptions): Promise<RunAgentResult
   const deadline = Date.now() + limits.LOOP_TIMEOUT_MS;
   const agentRunId = `run_${Date.now().toString(36)}`;
 
-  const usage: LLMTokenUsage = { inputTokens: 0, outputTokens: 0 };
+  const usage: LLMTokenUsage = { inputTokens: 0, outputTokens: 0, reasoningTokens: 0 };
   let iterations = 0;
   let toolCallsExecuted = 0;
   let lastModel = options.model ?? options.provider.defaultModel;

@@ -46,7 +46,16 @@ const envSchema = z.object({
   // ⚠️ 密钥只来自环境变量，永不写进代码或示例（架构 §37 / docs/03 §29）
   LLM_PROVIDER: z.enum(['deepseek', 'openai-compatible']).default('deepseek'),
   LLM_BASE_URL: z.string().url().default('https://api.deepseek.com'),
-  LLM_MODEL: z.string().default('deepseek-chat'),
+  /**
+   * ⚠️ 用真实模型名，不用别名（2026-09-22 实测）。
+   *
+   * 该账号 /models 返回的是 deepseek-flash 与 deepseek-v4-pro，
+   * 而 'deepseek-chat' 是别名、会被路由到 deepseek-flash ——
+   * 表现为「请求 deepseek-chat、返回 model=deepseek-flash」。
+   * 用别名会让日志与用量核算里的模型归属不准，因此用真实名。
+   * 更换模型前先查 /models 确认可用列表。
+   */
+  LLM_MODEL: z.string().default('deepseek-flash'),
   LLM_API_KEY: z.string().min(1, 'LLM_API_KEY 不能为空'),
   LLM_TIMEOUT_MS: z.coerce.number().int().positive().default(120_000),
   /** 单轮对话输入 token 预算（docs/01 §12.4 的非功能目标） */

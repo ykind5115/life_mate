@@ -29,10 +29,20 @@ export interface OpenAICompatibleConfig {
 interface RawChatResponse {
   model?: string;
   choices?: {
-    message?: { content?: string | null; tool_calls?: RawToolCall[] };
+    message?: {
+      content?: string | null;
+      tool_calls?: RawToolCall[];
+      /** 推理模型的思维链。deepseek-flash / deepseek-v4-pro 会返回 */
+      reasoning_content?: string | null;
+    };
     finish_reason?: string;
   }[];
-  usage?: { prompt_tokens?: number; completion_tokens?: number };
+  usage?: {
+    prompt_tokens?: number;
+    completion_tokens?: number;
+    /** 推理模型：其中用于思维链的 token 数 */
+    completion_tokens_details?: { reasoning_tokens?: number };
+  };
   error?: { message?: string; code?: string; type?: string };
 }
 
@@ -66,12 +76,23 @@ export class OpenAICompatibleProvider implements LLMProvider {
       });
     }
 
+    const content = choice.message?.content ?? '';
+    const toolCalls = mapToolCalls(choice.message?.tool_calls);
+    const finishReason = mapFinishReason(choice.finish_reason);
+    const usage = mapUsage(json.usage);
+    const reasoningContent = choice.message?.reasoning_content ?? undefined;
+
+    assertNotEmptyAnswer({ content, toolCalls, finishReason, usage });
+
     return {
-      content: choice.message?.content ?? '',
-      toolCalls: mapToolCalls(choice.message?.tool_calls),
-      usage: mapUsage(json.usage),
+      content,
+      toolCalls,
+      usage,
       model: json.model ?? input.model ?? this.defaultModel,
-      finishReason: mapFinishReason(choice.finish_reason),
+      finishReason,
+      ...(reasoningContent !== undefined && reasoningContent !== ''
+        ? { reasoningContent }
+        : {}),
     };
   }
 
@@ -95,7 +116,8 @@ export class OpenAICompatibleProvider implements LLMProvider {
     let content = '';
     let model = input.model ?? this.defaultModel;
     let finishReason: LLMGenerateResult['finishReason'] = 'unknown';
-    let usage: LLMTokenUsage = { inputTokens: 0, outputTokens: 0 };
+    let usage: LLMTokenUsage = { inputTokens: 0, outputTokens: 0, reasoningTokens: 0 };
+    let reasoningContent = '';
     const toolCallAcc = new Map<number, { id: string; name: string; args: string }>();
 
     try {
@@ -106,6 +128,7 @@ export class OpenAICompatibleProvider implements LLMProvider {
           choices?: {
             delta?: {
               content?: string | null;
+              reasoning_content?: string | null;
               tool_calls?: { index?: number; id?: string; function?: { name?: string; arguments?: string } }[];
             };
             finish_reason?: string | null;
@@ -140,6 +163,12 @@ export class OpenAICompatibleProvider implements LLMProvider {
         if (delta?.content) {
           content += delta.content;
           yield { type: 'token', content: delta.content };
+        }
+
+        // 推理模型的思维链增量：累积但不作为 token 块产出 ——
+        // 它面向模型自用，不应进入用户可见的输出流
+        if (delta?.reasoning_content) {
+          reasoningContent += delta.reasoning_content;
         }
 
         if (delta?.tool_calls) {
@@ -186,6 +215,7 @@ export class OpenAICompatibleProvider implements LLMProvider {
       usage,
       model,
       finishReason,
+      ...(reasoningContent !== '' ? { reasoningContent } : {}),
     };
 
     yield { type: 'done', result };
@@ -306,7 +336,59 @@ function mapUsage(u: RawChatResponse['usage']): LLMTokenUsage {
   return {
     inputTokens: u?.prompt_tokens ?? 0,
     outputTokens: u?.completion_tokens ?? 0,
+    reasoningTokens: u?.completion_tokens_details?.reasoning_tokens ?? 0,
   };
+}
+
+/**
+ * 守卫：非流式返回「既没有回答也没有工具调用」时必须报错，
+ * 而不是把它当成空字符串的成功结果。
+ *
+ * 为什么需要（2026-09-22 实测踩到）：
+ *   推理模型（deepseek-flash / deepseek-v4-pro）会先产出思维链，
+ *   而 max_tokens 同时约束思维链与最终回答。预算不足时会出现：
+ *     content = ""      finish_reason = "length"
+ *     completion_tokens_details.reasoning_tokens == completion_tokens
+ *   即 token 全花在思考上、一个字都没答。
+ *
+ *   若静默返回空串，上层只会看到「模型没说话」，
+ *   必须靠猜才能定位；明确报错并给出可操作的建议才有意义。
+ */
+function assertNotEmptyAnswer(params: {
+  content: string;
+  toolCalls: LLMToolCall[];
+  finishReason: LLMGenerateResult['finishReason'];
+  usage: LLMTokenUsage;
+}): void {
+  const { content, toolCalls, finishReason, usage } = params;
+
+  // 有内容、或有工具调用，都是正常结果
+  if (content !== '' || toolCalls.length > 0) return;
+
+  const spentOnReasoning =
+    usage.reasoningTokens > 0 && usage.reasoningTokens >= usage.outputTokens;
+
+  if (finishReason === 'length' && spentOnReasoning) {
+    throw new LLMError(
+      `模型把全部输出预算用于推理，未产生回答` +
+        `（推理 token ${usage.reasoningTokens} / 输出上限 ${usage.outputTokens}）。` +
+        `请提高 maxOutputTokens 后重试`,
+      { retryable: true }
+    );
+  }
+
+  if (finishReason === 'length') {
+    throw new LLMError('模型输出被长度上限截断，且未产生任何内容。请提高 maxOutputTokens', {
+      retryable: true,
+    });
+  }
+
+  if (finishReason === 'content_filter') {
+    throw new LLMError('模型因内容策略未产生回答', { retryable: false });
+  }
+
+  // 其余情况：模型确实返回了空回答。属于异常，明确报错而不是静默
+  throw new LLMError('模型返回了空回答且没有工具调用', { retryable: true });
 }
 
 function mapFinishReason(r: string | null | undefined): LLMGenerateResult['finishReason'] {

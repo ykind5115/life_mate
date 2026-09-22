@@ -49,7 +49,7 @@ function result(partial: Partial<LLMGenerateResult>): LLMGenerateResult {
   return {
     content: '',
     toolCalls: [],
-    usage: { inputTokens: 1, outputTokens: 1 },
+    usage: { inputTokens: 1, outputTokens: 1, reasoningTokens: 0 },
     model: 'scripted-model',
     finishReason: 'stop',
     ...partial,
@@ -317,12 +317,12 @@ test('usage 在多轮之间累加，便于成本核算', async () => {
   const provider = new ScriptedProvider([
     result({
       toolCalls: [{ id: 'u1', name: 'echo', arguments: '{}' }],
-      usage: { inputTokens: 10, outputTokens: 5 },
+      usage: { inputTokens: 10, outputTokens: 5, reasoningTokens: 0 },
       finishReason: 'tool_calls',
     }),
     result({
       content: '完成',
-      usage: { inputTokens: 20, outputTokens: 8 },
+      usage: { inputTokens: 20, outputTokens: 8, reasoningTokens: 0 },
       finishReason: 'stop',
     }),
   ]);
@@ -333,5 +333,5 @@ test('usage 在多轮之间累加，便于成本核算', async () => {
     tools: [echoTool],
   });
 
-  assert.deepEqual(res.usage, { inputTokens: 30, outputTokens: 13 });
+  assert.deepEqual(res.usage, { inputTokens: 30, outputTokens: 13, reasoningTokens: 0 });
 });

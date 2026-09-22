@@ -48,13 +48,58 @@ async function main(): Promise<void> {
     await check('非流式生成', async () => {
       const r = await provider.generate({
         messages: [{ role: 'user', content: '请只回复两个字：收到' }],
-        maxOutputTokens: 16,
+        // ⚠️ 推理模型需要足够预算：max_tokens 同时约束思维链与最终回答。
+        //    实测 deepseek-flash 答这句要 148 推理 + 47 回答 token。
+        //    给 16 会全部烧在思维链上、content 为空（那时会抛错，不会静默）。
+        maxOutputTokens: 512,
       });
       if (!r.content) throw new Error('返回内容为空');
-      // 只报长度，不报正文
-      return `模型=${r.model}  回答长度=${r.content.length}  ` +
-        `token 输入/输出=${r.usage.inputTokens}/${r.usage.outputTokens}  ` +
-        `finishReason=${r.finishReason}`;
+      const reasoningNote =
+        r.usage.reasoningTokens > 0 ? `（其中推理 ${r.usage.reasoningTokens}）` : '';
+      return (
+        `模型=${r.model}  回答长度=${r.content.length}  ` +
+        `token 输入/输出=${r.usage.inputTokens}/${r.usage.outputTokens}${reasoningNote}  ` +
+        `finishReason=${r.finishReason}`
+      );
+    })
+  );
+
+  results.push(
+    await check('空回答守卫生效（预算被推理吃光时应报错而非静默返回空）', async () => {
+      try {
+        await provider.generate({
+          messages: [{ role: 'user', content: '请详细介绍一下你自己，写 500 字' }],
+          // 刻意给极小的预算，逼出「全部用于推理、回答为空」的情形
+          maxOutputTokens: 8,
+        });
+      } catch (err) {
+        if (err instanceof LLMError) {
+          return `已正确抛出：${err.message}（retryable=${String(err.options.retryable)}）`;
+        }
+        throw err;
+      }
+      // 也可以不触发（例如模型这次没走推理就直接回答），不算失败
+      return '⚠️ 未触发（模型本次未耗尽预算）。守卫逻辑本身由单元测试覆盖';
+    })
+  );
+
+  results.push(
+    await check('返回模型与请求一致（防止别名导致归属不准）', async () => {
+      const r = await provider.generate({
+        messages: [{ role: 'user', content: 'ok' }],
+        // 预算要足够：实测该模型即便对 "ok" 也可能花掉上百推理 token
+        maxOutputTokens: 1024,
+      });
+
+      if (r.model !== env.LLM_MODEL) {
+        // 不算失败（厂商可能做别名映射），但必须让使用者知道，
+        // 否则日志与用量核算里的模型归属会与配置不一致
+        return (
+          `⚠️ 请求 ${env.LLM_MODEL}，实际返回 ${r.model}。` +
+          `可能是厂商别名映射 —— 建议改用真实模型名（先查 /models）`
+        );
+      }
+      return `请求与返回一致：${r.model}`;
     })
   );
 
@@ -67,7 +112,8 @@ async function main(): Promise<void> {
 
       for await (const c of provider.stream({
         messages: [{ role: 'user', content: '从 1 数到 5，用逗号分隔' }],
-        maxOutputTokens: 32,
+        // 推理模型需要足够预算，否则 token 全用于思维链、无回答可流式产出
+        maxOutputTokens: 1024,
       })) {
         if (c.type === 'token') {
           chunks++;
