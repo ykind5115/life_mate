@@ -5,7 +5,8 @@
 **版本：** V1.0
 **适用对象：** 项目负责人自行操作
 **目标环境：** Windows 11 + RTX 4070 Laptop 8G + Docker Desktop
-**预计耗时：** 首次约 60～90 分钟（含镜像与模型下载）
+**预计耗时：** 首次约 40～70 分钟（主要是 TEI 镜像约 8.16 GB 的拉取；
+**模型不下载** —— 使用宿主机本地权重，见 §6.1）
 
 ---
 
@@ -885,9 +886,25 @@ curl.exe http://127.0.0.1:8080/health
 curl.exe http://127.0.0.1:8080/info
 ```
 
-✅ 期望：返回 JSON，包含 `"model_id":"BAAI/bge-m3"`，且存在 `max_input_length` 字段。
+✅ 期望：返回 JSON，包含 `model_id` 与 `max_input_length` 字段。
 
-> 📌 `max_input_length` 的具体数值由模型配置决定（本文档不写死），这里**只要求该字段存在**。真正的硬性门槛是 [§7.3](#73-生成一个向量并检查维度关键) 的 **1024 维**检查，不是这个字段的值。
+> 📌 **`model_id` 的值取决于模型来源**（本机实测）：
+>
+> ```text
+> 用本地权重（当前配置）    → "/data/models/bge-m3"（容器内路径）
+> 用 HuggingFace 仓库名     → "BAAI/bge-m3"
+> ```
+>
+> 因此本节**只要求该字段存在**，不校验其具体值。
+> 真正的硬性门槛是 [§7.3](#73-生成一个向量并检查维度关键) 的 **1024 维**检查，
+> 以及 §10.5.3 的语义相似度自检。
+>
+> ⚠️ 注意区分两个同名概念：
+> `memory_embeddings.model` 列的值必须是 `BAAI/bge-m3`（见 §8.2 的说明），
+> 而这里 `/info` 返回的 `model_id` 是 TEI 的加载来源，两者不是一回事。
+
+> 📌 `max_input_length` 的具体数值由模型配置决定（本文档不写死）。本机实测为 `8192`。
+
 
 ## 7.3 生成一个向量并检查维度（关键）
 
@@ -913,8 +930,10 @@ $resp = Invoke-RestMethod -Uri "http://127.0.0.1:8080/embed" `
 curl.exe http://127.0.0.1:8080/info
 ```
 
-- 若 `model_id` 不是 `BAAI/bge-m3` → 检查 `docker-compose.yml` 的 `--model-id` 参数
-- 若 `model_id` 正确但维度不对 → 说明**我们 Q4 的决策需要重新评估**，暂停后续步骤，回到《数据库设计 V1.1》§4.2 修订
+- 若 `model_id` 不是 `/data/models/bge-m3` → bind mount 未生效，
+  或 `--model-id` 被改动了。见 §10.5
+- 若维度不是 1024 → 说明**我们 Q4 的决策需要重新评估**，暂停后续步骤，
+  回到《数据库设计 V1.1》§4.2 修订
 
 > 🔴 **这个数字必须确认。** 它是《数据库设计 V1.1》中 `VECTOR(1024)` 的唯一依据。如果实际不是 1024，整份 Schema 都要改。
 
@@ -1362,7 +1381,8 @@ docker compose logs --tail 100 embedding
 | `CUDA error` / `no CUDA-capable device` | GPU 未穿透 | 回到 [§1.5](#15-确认容器内可访问-gpu关键验证) |
 | `no kernel image is available for execution on the device` | **镜像计算能力与显卡不匹配** | 见下方 §10.3.1，这是 8.9 显卡最容易踩的坑 |
 | `OutOfMemoryError` / `CUDA out of memory` | 显存不足 | 见 §10.4 |
-| `Connection error` / `timeout` 下载模型 | 网络无法访问 HuggingFace | 见 §10.5 |
+| `could not find model` / 模型目录为空 | bind mount 未生效或路径错误 | 见 §10.5 |
+| `Connection error` / 反复重试下载 | bind mount 失效导致回退到联网下载 | 见 §10.5 |
 | `permission denied` 写 `/data` | 卷权限 / 卷内容坏了 | 停服务 → 确认真实卷名 → 删卷重建，见下方 §10.3.2 |
 | `Address already in use` | 8080 被占 | 见 §10.1 |
 
@@ -1414,9 +1434,11 @@ docker compose logs -f embedding
 
 ```powershell
 # 临时验证用，确认后应改回 GPU 镜像
+# 注意 --model-id 要指向挂载后的容器内路径，否则会去 HuggingFace 下载
 docker run --rm -p 8080:80 `
+  -v "D:/workspace/RAG_system/rag_qa/models/bge-m3:/data/models/bge-m3:ro" `
   ghcr.io/huggingface/text-embeddings-inference:cpu-1.9 `
-  --model-id BAAI/bge-m3
+  --model-id /data/models/bge-m3 --pooling cls
 ```
 
 > ⚠️ CPU 模式下单条推理约 100～300 ms，**不要用它做正式环境**，仅用于隔离问题。
@@ -1483,31 +1505,126 @@ docker compose restart embedding
 
 可选：把 Windows 桌面上的 GPU 加速关掉（浏览器 → 设置 → 系统 → 关闭硬件加速）。
 
-## 10.5 模型下载失败
+## 10.5 模型加载失败 / 回退到联网下载
 
-**症状：** 日志停在 `Downloading ...` 或反复 `Connection error`。
+> **本节已按当前配置重写。** V1.0 使用宿主机本地权重（bind mount），
+> **正常情况下不应该出现任何下载行为**。若出现下载日志，说明挂载失败。
+
+### 10.5.1 症状 A：出现下载日志（挂载未生效）
+
+```text
+Downloading model.safetensors ...
+Downloading tokenizer.json ...
+```
+
+**含义：** TEI 没有在 `/data/models/bge-m3` 找到模型，回退到把 `--model-id`
+当作 HuggingFace 仓库名去下载。**根因一定是 bind mount 没生效**，与网络无关。
 
 **排查：**
 
 ```powershell
-# 测试能否访问 HuggingFace
-curl.exe -I https://huggingface.co
+# 1) 确认 .env 里的路径真实存在
+cd D:\workspace\LifeMate
+$dir = (Select-String -Path .env -Pattern '^BGE_M3_MODEL_DIR=').Line -replace '^BGE_M3_MODEL_DIR=',''
+"配置路径: $dir"
+"路径存在: $(Test-Path $dir)"
+
+# 2) 确认 compose 真的把该路径解析出来了（不是空值）
+docker compose config | Select-String "source:.*bge-m3"
+
+# 3) 确认容器内能看到模型文件
+docker compose exec embedding ls -la /data/models/bge-m3
 ```
 
-**处理（三选一）：**
+✅ 期望：第 1 步输出 `True`；第 2 步输出宿主机路径；第 3 步列出 4 个文件
+（`config.json` / `model.safetensors` / `tokenizer.json` / `tokenizer_config.json`）。
+
+❌ 常见原因：
+
+| 现象 | 原因 | 处理 |
+| ---- | ---- | ---- |
+| 第 1 步 `False` | `.env` 的路径写错 | 改成正确路径。注意用正斜杠 `/` 或双反斜杠 `\\` |
+| 第 2 步输出为空或报错 | `.env` 缺 `BGE_M3_MODEL_DIR` | compose 用了 `:?` 语法，缺失时会直接报错。补上该变量 |
+| 第 3 步目录为空 | Docker Desktop 未共享该盘符 | Settings → Resources → File Sharing，勾选对应盘符 |
+| 第 3 步「No such file」 | 路径拼写不符 | 逐段核对 |
+
+> 💡 **换机器时最容易踩这个**：两台机器的模型路径不同
+> （家里 `D:/workspace/...`，公司 `E:/workspace/...`），
+> `.env` 不随仓库提交，因此新机器上必须重新设置 `BGE_M3_MODEL_DIR`。
+
+### 10.5.2 症状 B：模型目录存在但加载失败
 
 ```text
-① 配置国内镜像（推荐）
-     在 docker-compose.yml 的 embedding 服务 environment 中加：
-       HF_ENDPOINT: https://hf-mirror.com
-
-② 使用代理
-     在 Docker Desktop → Settings → Resources → Proxies 中配置
-
-③ 手动下载后挂载
-     在宿主机下载 BAAI/bge-m3 全部文件到某个目录，
-     然后把该目录挂载到容器内对应位置
+Error: Could not find config.json
+Error: unable to load model
 ```
+
+**排查模型文件是否完整：**
+
+```powershell
+$dir = (Select-String -Path .env -Pattern '^BGE_M3_MODEL_DIR=').Line -replace '^BGE_M3_MODEL_DIR=',''
+Get-ChildItem $dir | Select-Object Name, Length
+```
+
+✅ 必需 4 个文件（合计约 2.13 GB）：
+
+```text
+config.json                约 773 字节    架构 xlm-roberta，hidden_size=1024
+model.safetensors          约 2.27 GB     权重
+tokenizer.json             约 17 MB
+tokenizer_config.json      约 396 字节
+```
+
+❌ 若缺 `model.safetensors` 或大小明显不对，说明权重下载不完整，需重新获取。
+
+### 10.5.3 症状 C：`Could not find a Sentence Transformers config`
+
+**这条 WARN 是预期内的，不是错误。**
+
+本地权重来自非 Sentence-Transformers 的下载方式，缺少 `1_Pooling/config.json`。
+TEI 无法据此推断池化方式，已用 `--pooling cls` 显式补偿（见 §6.1.2）。
+
+只要日志中同时出现下面三行，服务就是正常的：
+
+```text
+dtype: Some(Float16)
+pooling: Some(Cls)
+Starting FlashBert model on Cuda(...)
+```
+
+验证方式（比看日志更直接）：
+
+```powershell
+# 语义相似度自检：相同句子应≈1.0000，无关句子应明显更低
+$b = @{ inputs = "用户正在学习 TypeScript" } | ConvertTo-Json -Compress
+$r1 = (Invoke-RestMethod -Uri "http://127.0.0.1:8080/embed" -Method Post -ContentType "application/json" -Body $b)[0]
+$b2 = @{ inputs = "用户在学 TypeScript" } | ConvertTo-Json -Compress
+$r2 = (Invoke-RestMethod -Uri "http://127.0.0.1:8080/embed" -Method Post -ContentType "application/json" -Body $b2)[0]
+$b3 = @{ inputs = "今天中午吃了个鸡腿" } | ConvertTo-Json -Compress
+$r3 = (Invoke-RestMethod -Uri "http://127.0.0.1:8080/embed" -Method Post -ContentType "application/json" -Body $b3)[0]
+
+function Cos($a,$b){ $d=0.0;$na=0.0;$nb=0.0; for($i=0;$i -lt $a.Count;$i++){$d+=$a[$i]*$b[$i];$na+=$a[$i]*$a[$i];$nb+=$b[$i]*$b[$i]}; $d/([Math]::Sqrt($na)*[Math]::Sqrt($nb)) }
+"近义改写: {0:N4}  (本机实测 0.9730)" -f (Cos $r1 $r2)
+"无关句子: {0:N4}  (本机实测 0.7362)" -f (Cos $r1 $r3)
+```
+
+✅ 期望：近义明显高于无关（本机实测 0.9730 / 0.7362）。
+
+> ⚠️ **选负例要注意**：中文上 bge-m3 的区分度比英文窄。
+> 若两句都以「用户」开头（如「用户正在学习 TypeScript」对
+> 「用户吃了个鸡腿」），相似度仍会有 0.7 以上，容易被误判为模型有问题。
+> 规范基线见 §7.4。
+
+### 10.5.4 完整验证入口
+
+以上三项都通过后，跑完整链路验证：
+
+```powershell
+pnpm e2e:check
+```
+
+✅ 期望：6/6 通过（写入记忆 → 向量化 → 入库 → 语义检索 → 软删除 →
+supersede → 关键词通道），全程事务回滚不留数据。
 
 ## 10.6 时区不正确
 
@@ -1917,13 +2034,20 @@ Remove-Item "backups/lifemate-$date.dump"
 
 ```text
 □ docker compose up -d embedding 成功
-□ /health 返回 OK
-□ /info 返回 model_id = BAAI/bge-m3
+□ .env 的 BGE_M3_MODEL_DIR 指向真实存在的模型目录（约 2.13 GB / 4 个文件）
+□ /health 可访问
+□ /info 返回 model_id = /data/models/bge-m3（本地权重，非仓库名）
+□ 日志出现 dtype=Float16 / pooling=Cls / on Cuda 三行
+□ 日志**没有** Downloading（有则说明 bind mount 失效，见 §10.5.1）
 □ 向量维度为 1024                                              ← 关键
-□ 相关文本相似度明显高于无关文本（差距 > 0.2）
+□ 近义文本相似度明显高于无关文本（本机基线 0.9730 / 0.7362）     ← 关键
 □ 单次推理延迟 约 10～50 ms（丢弃首次预热后取平均，证明 GPU 生效）  ← 关键
 □ nvidia-smi 显示显存占用约 3.2 GB，且占用进程名为 text-embeddings-（不是 python）
+□ pnpm e2e:check 6/6 通过（端到端链路）
 ```
+
+> 📌 `Could not find a Sentence Transformers config` 的 WARN 是预期内的，
+> 不是缺陷。原因与补偿方式见 §6.1.2。
 
 ## 12.5 端到端
 
