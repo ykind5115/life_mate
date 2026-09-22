@@ -21,10 +21,10 @@
  *      extraction_runs          §11
  *      conversation_summaries   §12
  *
- * ⬜ 第二批（记忆链）
- *      memories                 §13   含 conflict 状态（C35）
- *      memory_embeddings        §14   VECTOR(1024)，含 content_hash
- *      memory_sources           §15   无 conversation_id（C22）
+ * ✅ 第二批（记忆链）
+ *      memories                 §13   不可变事实 + 双时间轴 + conflict 状态（C35）
+ *      memory_embeddings        §14   VECTOR(1024)、content_hash、陈旧检测
+ *      memory_sources           §15   无 conversation_id（C22）、RESTRICT 外键
  *
  * ⬜ 第三批（人生数据）
  *      events                   §20   含 category CHECK（C37）
@@ -42,3 +42,8 @@ export * from './conversations.js';
 export * from './messages.js';
 export * from './extraction-runs.js';
 export * from './conversation-summaries.js';
+
+// ---------- 第二批：记忆链 ----------
+export * from './memories.js';
+export * from './memory-embeddings.js';
+export * from './memory-sources.js';
