@@ -38,6 +38,19 @@ const envSchema = z.object({
   EMBEDDING_BASE_URL: z.string().url().default('http://127.0.0.1:8080'),
   EMBEDDING_MODEL: z.string().default(EMBEDDING_MODEL_ID),
   EMBEDDING_DIM: z.coerce.number().int().positive().default(EMBEDDING_DIM),
+  /** 单次请求超时（ms）。本地 GPU 推理，正常在 50ms 内，留足余量 */
+  EMBEDDING_TIMEOUT_MS: z.coerce.number().int().positive().default(10_000),
+
+  // ---------- LLM Provider（对话模型）----------
+  // 决策：V1.0 使用 DeepSeek
+  // ⚠️ 密钥只来自环境变量，永不写进代码或示例（架构 §37 / docs/03 §29）
+  LLM_PROVIDER: z.enum(['deepseek', 'openai-compatible']).default('deepseek'),
+  LLM_BASE_URL: z.string().url().default('https://api.deepseek.com'),
+  LLM_MODEL: z.string().default('deepseek-chat'),
+  LLM_API_KEY: z.string().min(1, 'LLM_API_KEY 不能为空'),
+  LLM_TIMEOUT_MS: z.coerce.number().int().positive().default(120_000),
+  /** 单轮对话输入 token 预算（docs/01 §12.4 的非功能目标） */
+  LLM_MAX_INPUT_TOKENS: z.coerce.number().int().positive().default(8_000),
 
   // ---------- 日志 ----------
   // docs/03 §29.1：日志禁止记录消息正文与记忆内容
