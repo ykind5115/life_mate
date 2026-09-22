@@ -47,9 +47,9 @@
 | C10 | 新增 `extraction_runs` 表 | 🟠 新增表 | P0-6：抽取幂等键，无此表则必然重复记忆 |
 | C11 | `messages` 明确 `sequence` 分配方式与唯一约束 | 🟠 新增约束 | P1-3：原设计存在并发竞态 |
 | C12 | `memory_sources` 补充索引、唯一约束与外键行为 | 🟠 新增约束 | P1-6：删除级联与来源查询缺少索引支撑 |
-| C13 | 新增第 17 节「约束设计」 | 🟠 新增章节 | P1-8：原文档只有字段类型，无任何 CHECK / NOT NULL |
-| C14 | 新增第 18 节「检索过滤条件」 | 🟠 新增章节 | P1-2：软删除必须从所有召回路径排除 |
-| C15 | 新增第 19 节「删除与级联策略」 | 🟠 新增章节 | P1-1：原文档「可以根据删除策略进行级联」未定义 |
+| C13 | 新增 §19「约束设计」 | 🟠 新增章节 | P1-8：原文档只有字段类型，无任何 CHECK / NOT NULL |
+| C14 | 新增 §18.3「检索过滤条件」 | 🟠 新增章节 | P1-2：软删除必须从所有召回路径排除 |
+| C15 | 新增 §24「删除与级联策略」 | 🟠 新增章节 | P1-1：原文档「可以根据删除策略进行级联」未定义 |
 | C16 | 明确 keyword 检索使用 `pg_trgm` | 🟠 新增 | P1-7：混合检索的关键词通道原本无库层实现 |
 | C17 | `conversations` 新增 `status`、`deleted_at` | 🟡 新增字段 | 软删除语义完整化 |
 | C18 | `conversation_summaries` 明细化生成策略与幂等键 | 🟡 补充说明 | P2-12 |
@@ -57,6 +57,8 @@
 ## 0.3 V1.1 内部修订（契约审计驱动）
 
 V1.1 初稿经《设计契约审计报告》审计后，发现并修复以下缺陷。**这些是对 V1.1 自身的修订**，与上面 C1～C18（对 V1.0 的变更）性质不同。
+
+C19～C28 来自《设计契约审计报告》；C29～C32 来自其后的文档一致性复查（附录 A 与正文脱钩、删除流程自锁）。
 
 | 编号 | 修订 | 类型 | 依据 |
 | ---- | ---- | ---- | ---- |
@@ -70,8 +72,13 @@ V1.1 初稿经《设计契约审计报告》审计后，发现并修复以下缺
 | C26 | `goals` 新增时间顺序约束 | 🟠 新增约束 | 审计 F-10：可写入逻辑矛盾的时间 |
 | C27 | `model` 字段统一为 `BAAI/bge-m3` | 🟡 一致性 | 审计 F-11：两种写法并存会导致检索静默失配 |
 | C28 | 补充部分唯一索引的适用范围说明 | 🟡 表述澄清 | 审计 F-13：无槽位记忆不受唯一约束，需明确为设计意图 |
+| C29 | 明确 `messages` / `conversation_summaries` 为**物理删除**（原文写「软删除」，但两表均无 `deleted_at`） | 🟡 表述澄清 | §24.2 与 §10.2 / §12.2 冲突，且与 §24.1 的删除意图冲突 |
+| C30 | §24.3 步骤③补全：**无剩余来源**的派生记忆同样必须删除来源行 | 🔴 缺陷修复 | 与审计 F-02 同类：遗留的 `memory_sources` 行使步骤④被 `RESTRICT` 阻塞、整个事务回滚 |
+| C31 | 附录 A 补 `memory_sources.event_id` / `goal_id` 外键（因建表顺序，用后置 `ALTER TABLE`） | 🔴 缺陷修复 | §15.2 / §23.1 承诺的 `ON DELETE SET NULL` 在附录 A 缺失，按附录 A 实现会留下悬空指针 |
+| C32 | 附录 A 补 `excl_extraction_range` 排他约束与 `btree_gist` 扩展 | 🔴 缺陷修复 | C20 只落在正文；附录 A 缺失，且缺扩展时该约束无法创建 |
+| C33 | §19 约束清单补全：补 `chk_relationships_status` / `chk_sources_has_origin`，NOT NULL 清单与附录 A 逐列对齐 | 🟡 表述澄清 | §19 自称「列出全部 CHECK / NOT NULL / UNIQUE」，但与附录 A 不一致（漏 `users` 整表、误列 `relationships.relation_type`） |
 
-## 0.3 与 V1.0 的不兼容说明
+## 0.4 与 V1.0 的不兼容说明
 
 ```text
 ⚠ 本版本不向后兼容 V1.0 的表结构。
@@ -727,8 +734,15 @@ ALTER TABLE extraction_runs ADD CONSTRAINT excl_extraction_range
   ) WHERE (status = 'succeeded');
 ```
 
-> ⚠️ `EXCLUDE` 需要 `btree_gist` 扩展。初始化脚本需补充：
-> `CREATE EXTENSION IF NOT EXISTS btree_gist;`
+> ⚠️ `EXCLUDE` 需要 `btree_gist` 扩展：`conversation_id` 的等值部分需要 `uuid`
+> 的 GiST 操作符类。缺失时该约束无法创建，报
+> `data type uuid has no default operator class for access method "gist"`。
+>
+> **落地点（两处都要，缺一不可）：**
+>
+> ① 空库初始化 —— `devops/postgres/init/01-extensions.sql`（已包含该扩展）；
+> ② 已有数据的库 —— 写进 Migration：`CREATE EXTENSION IF NOT EXISTS btree_gist;`。
+>    init 脚本只在数据卷为空时执行，**改 init 脚本对已有库不生效**。
 >
 > 若不想引入该扩展，可在服务层用事务 + `SELECT ... FOR UPDATE` 保证同一会话
 > 的抽取串行化。**V1.0 建议引入 `btree_gist`**——数据库层的保证比服务层自觉可靠。
@@ -1855,6 +1869,11 @@ ALTER TABLE goals              ADD CONSTRAINT chk_goals_status
   CHECK (status IN ('active','paused','completed','cancelled','archived'));
 ALTER TABLE memory_sources     ADD CONSTRAINT chk_sources_type
   CHECK (source_type IN ('conversation','manual','system','goal_projection','event_derived'));
+
+-- 🟡 C33：relationships 的 status 原先只写在 §22 的字段说明里，
+-- 附录 A 已有 CHECK，但本节清单漏列 —— 清单不全会让实现者以为该表无需约束。
+ALTER TABLE relationships      ADD CONSTRAINT chk_relationships_status
+  CHECK (status IN ('active','ended','archived'));
 ```
 
 ## 19.2 取值范围
@@ -1909,23 +1928,40 @@ ALTER TABLE conversations ADD CONSTRAINT chk_conversations_deleted
 
 ## 19.5 必填字段
 
-```text
-NOT NULL 字段清单（按表）：
+```sql
+-- 🟡 C33：来源完整性约束。附录 A 已内联定义，此处补齐清单。
+-- 含义：一条来源记录至少要有一个来源指针，否则它无法被追溯。
+ALTER TABLE memory_sources ADD CONSTRAINT chk_sources_has_origin
+  CHECK (message_id IS NOT NULL OR event_id IS NOT NULL
+         OR goal_id IS NOT NULL OR source_type IN ('manual','system'));
+```
 
+```text
+NOT NULL 字段清单（按表）—— 与附录 A 的 DDL 逐列对齐（C33 校正）：
+
+users                  id, name, timezone, settings, created_at, updated_at
 conversations          id, user_id, status, created_at, updated_at
 messages               id, conversation_id, role, content, sequence, metadata, created_at
+extraction_runs        id, conversation_id, start_sequence, end_sequence, extractor_version,
+                       status, memories_created, memories_updated, memories_superseded,
+                       conflicts_found, created_at
+conversation_summaries id, conversation_id, summary, sequence_from, sequence_to,
+                       summarizer_version, status, created_at
 memories               id, user_id, type, content, importance_score, confidence_score,
                        status, source_count, created_at, updated_at
 memory_embeddings      id, memory_id, model, dim, embedded_text, content_hash,
                        embedding, status, created_at
 memory_sources         id, memory_id, source_type, created_at
-extraction_runs        id, conversation_id, start_sequence, end_sequence,
-                       extractor_version, status, created_at
-conversation_summaries id, conversation_id, summary, sequence_from, sequence_to,
-                       summarizer_version, status, created_at
-events                 id, user_id, title, event_time, source_type, timeline_visible, created_at
+events                 id, user_id, title, event_time, importance_score, source_type,
+                       timeline_visible, created_at, updated_at
 goals                  id, user_id, title, status, priority, created_at, updated_at
-relationships          id, user_id, name, relation_type, status, created_at, updated_at
+relationships          id, user_id, name, status, created_at, updated_at
+
+说明：
+  • 标注 DEFAULT 的列（如 users.settings、status、各类计数列）在 INSERT 时可省略，
+    但它们仍是 NOT NULL —— 省略靠默认值，写入 NULL 依然会被拒绝。
+  • 本清单不含可空列。特别地：relationships.relation_type 可空，
+    conversations.title / summary 可空，memories 的槽位字段与时间字段均可空。
 ```
 
 ## 19.6 约束与文档的一致性要求
@@ -2210,7 +2246,7 @@ users
 
 ```text
 ① 级联失效（默认）
-     - messages / summaries 软删除
+     - messages / conversation_summaries 物理删除（见下方 C29）
      - 由这些消息派生的 Memory：
          若 memory_sources 全部指向被删消息 → 一并置 deleted
          若仍有其他来源                   → 保留，但移除指向被删消息的 source
@@ -2221,6 +2257,17 @@ users
      - 保留全部 Memory（适用于「只是想清理聊天列表」）
      - 前端需明确提示两种语义的差异
 ```
+
+> 🟠 **C29：messages / summaries 是物理删除，不是软删除。**
+>
+> V1.1 初稿在这里写「messages / summaries 软删除」，但这两张表都没有 `deleted_at`
+> （见 §10.2、§12.2 与附录 A），该表述无法落地。更重要的是它与 §24.1 的删除意图冲突：
+> 用户要求删除的内容如果只是打个标记，内容仍然留在库里。
+>
+> ```text
+> 【必须】 会话级软删除由 conversations.status / deleted_at 承担（见步骤 ⑥），
+>          那是「不想在列表里看到它」，与「内容必须消失」是两回事，不可混用。
+> ```
 
 无论哪种，Memory Viewer 中来源不可解析时必须显式显示「原始对话已删除」。
 
@@ -2240,16 +2287,37 @@ BEGIN
       WHERE memory_id = ANY($2) AND message_id <> ALL($3)
       GROUP BY memory_id;
 
-  ③ 无剩余来源者 → memories.status='deleted', deleted_at=now()
-                     memory_embeddings.status='deleted'
-     有剩余来源者 → DELETE 指向被删消息的 memory_sources 行
+  ③ 处理来源行与派生记忆。**两支都必须删除来源行**：
 
-  ④ 删除 messages（此时 RESTRICT 外键已无阻碍）
-     messages 软删除或物理删除，取决于配置
+     a) 有剩余来源者
+        → 保留记忆，DELETE 指向被删消息的 memory_sources 行
 
-  ⑤ conversations.status='deleted', deleted_at=now()
+     b) 无剩余来源者
+        → memories.status='deleted', deleted_at=now()
+          memory_embeddings.status='deleted'
+        → DELETE 指向被删消息的 memory_sources 行   ← V1.1 初稿漏了这一步（C30）
+
+  ④ 删除 messages（物理删除）
+     此时 message_id 的 RESTRICT 外键才真的没有阻碍
+
+  ⑤ DELETE FROM conversation_summaries WHERE conversation_id = $1
+     （摘要由消息派生；消息已不存在，摘要没有保留意义）
+
+  ⑥ conversations.status='deleted', deleted_at=now()
 
 COMMIT
+```
+
+```text
+【必须】 步骤③的 a、b 两支都要删除来源行（C30）。
+
+  只在 a 支删除、b 支不删（V1.1 初稿的写法），b 支会遗留指向被删消息的
+  memory_sources 行，第 ④ 步会立刻被 message_id 的 ON DELETE RESTRICT
+  挡住，整个事务回滚。
+
+  这与审计报告 F-02 属于同一类缺陷：流程步骤与约束要求的实际数据状态不一致。
+  验证方式见 audit/constraint-test.sql 的 [C30] 段——它按本节顺序逐步执行，
+  并断言「两支都处理之后 messages 才能删除」。
 ```
 
 ```text
@@ -2795,6 +2863,9 @@ Q4 Embedding        bge-m3，VECTOR(1024)，本地部署，MIT
 -- ============ 扩展 ============
 CREATE EXTENSION IF NOT EXISTS vector;
 CREATE EXTENSION IF NOT EXISTS pg_trgm;
+-- EXCLUDE 约束（excl_extraction_range）需要 uuid 的 GiST 操作符类，见 §11.3.2
+CREATE EXTENSION IF NOT EXISTS btree_gist;
+-- 不需要 uuid-ossp：主键统一使用 gen_random_uuid()（PostgreSQL 13+ 内置，见 §7）
 
 -- ============ users ============
 CREATE TABLE users (
@@ -3018,6 +3089,28 @@ CREATE TABLE relationships (
 CREATE INDEX idx_relationships_user_status ON relationships (user_id, status);
 CREATE UNIQUE INDEX uq_relationships_user_name
   ON relationships (user_id, name) WHERE deleted_at IS NULL;
+
+-- ============ 后置约束（因建表顺序依赖，不能内联）============
+-- memory_sources 建表早于 events / goals，这两条外键只能在这里补。
+-- 遗漏它们不会报错，但删除 Goal / Event 后会留下悬空指针、
+-- 投影记忆不会被失效（C31，正文见 §15.2 与 §23.1）。
+
+ALTER TABLE memory_sources
+  ADD CONSTRAINT fk_memory_sources_event
+  FOREIGN KEY (event_id) REFERENCES events(id) ON DELETE SET NULL;
+
+ALTER TABLE memory_sources
+  ADD CONSTRAINT fk_memory_sources_goal
+  FOREIGN KEY (goal_id) REFERENCES goals(id) ON DELETE SET NULL;
+
+-- 成功的抽取区间不得两两重叠（C20 / C32，正文见 §11.3.2）。
+-- 需要 btree_gist 扩展：conversation_id 的等值部分要求 uuid 的 GiST 操作符类。
+ALTER TABLE extraction_runs
+  ADD CONSTRAINT excl_extraction_range
+  EXCLUDE USING gist (
+    conversation_id WITH =,
+    int8range(start_sequence, end_sequence, '[]') WITH &&
+  ) WHERE (status = 'succeeded');
 ```
 
 ---
@@ -3048,8 +3141,10 @@ CREATE UNIQUE INDEX uq_relationships_user_name
 □ 编写 Drizzle Schema（以本文档 §13–§22 为准）
 □ 生成 Migration 并人工审阅 SQL
 □ 拉起 PostgreSQL + pgvector 容器
-□ 验证 CREATE EXTENSION vector / pg_trgm
+□ 验证 CREATE EXTENSION vector / pg_trgm / btree_gist
 □ 验证 VECTOR(1024) 插入与相似度查询
+□ 验证后置约束已生效：excl_extraction_range（区间重叠被拒）、
+  fk_memory_sources_event / fk_memory_sources_goal（附录 A 末尾）
 □ 部署 bge-m3 并确认输出维度为 1024
 □ 编写受控词表的 TypeScript 枚举（§13.7）
 □ 编写「当前有效记忆」谓词的单一常量（§13.6）

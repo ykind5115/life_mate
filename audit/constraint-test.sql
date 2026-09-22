@@ -1,12 +1,20 @@
 -- ============================================================
 -- 约束交互实测 · 修复后回归验证
 --
--- 验证对象：《数据库设计 V1.1》（含审计修订 C19~C28）
+-- 验证对象：《数据库设计 V1.1》（含审计修订 C19~C32）
 -- 执行：sqlite3 :memory: ".read audit/constraint-test.sql"
 --
 -- 结构说明：
 --   第 1 部分 —— 修复前 schema 的缺陷复现（保留为回归证据）
 --   第 2 部分 —— 修复后 schema 的通过验证
+--
+-- C19~C28 来自《设计契约审计报告》；C29~C32 来自其后的文档一致性复查。
+-- 本节新增的 [C30] 用例专门验证「删除会话」链路：第 1 部分演示初稿写法
+-- （步骤③只在「有剩余来源」一支删除来源行）必然被 RESTRICT 外键挡住，
+-- 第 2 部分按修正后的 §24.3 两支流程执行并断言 messages 能真正删除。
+--
+-- 已知局限（与首次回归相同）：SQLite 无法验证 EXCLUDE 约束（需 btree_gist）
+-- 与 pgvector 相关项，这两项仍须在 PostgreSQL 上复跑。
 -- ============================================================
 PRAGMA foreign_keys = ON;
 
@@ -73,6 +81,36 @@ SELECT id, source_type, conversation_id FROM old_sources2;
 
 
 .print ''
+.print '--- [C30] 修复前：步骤③只在「有剩余来源」一支删除来源行 ---'
+CREATE TABLE old3_conv (id TEXT PRIMARY KEY);
+CREATE TABLE old3_messages (
+  id              TEXT PRIMARY KEY,
+  conversation_id TEXT REFERENCES old3_conv(id) ON DELETE CASCADE
+);
+CREATE TABLE old3_mem (id TEXT PRIMARY KEY, status TEXT NOT NULL);
+CREATE TABLE old3_sources (
+  id          TEXT PRIMARY KEY,
+  memory_id   TEXT NOT NULL,
+  source_type TEXT NOT NULL,
+  message_id  TEXT REFERENCES old3_messages(id) ON DELETE RESTRICT,
+  event_id    TEXT,
+  goal_id     TEXT
+);
+INSERT INTO old3_conv VALUES ('conv1');
+INSERT INTO old3_messages VALUES ('msg1','conv1');
+INSERT INTO old3_mem VALUES ('mem1','active');
+INSERT INTO old3_sources VALUES ('src1','mem1','conversation','msg1',NULL,NULL);
+
+.print '步骤③（初稿写法）：mem1 无剩余来源 → 只改状态，不删来源行'
+UPDATE old3_mem SET status='deleted' WHERE id='mem1';
+
+.print '步骤④：删除 messages → 预期报 FOREIGN KEY constraint failed:'
+DELETE FROM old3_messages WHERE conversation_id='conv1';
+.print '删除后（msg1 与来源行仍在，说明步骤④未能执行）:'
+SELECT (SELECT COUNT(*) FROM old3_messages) AS msg_left,
+       (SELECT COUNT(*) FROM old3_sources)  AS sources_left;
+
+.print ''
 .print '============================================================'
 .print '第二部分：修复后 schema —— 应全部通过'
 .print '============================================================'
@@ -93,13 +131,23 @@ SELECT id, status, superseded_by FROM new_memories;
 .print '>>> 通过：物理删除能力可兑现'
 
 .print ''
-.print '--- [C22] memory_sources 不再有 conversation_id 字段 ---'
-CREATE TABLE new_conv (id TEXT PRIMARY KEY);
+.print '--- [C22 + C29 + C30] 删除会话：严格按 §24.3 的顺序，两支都要删来源行 ---'
+CREATE TABLE new_conv (
+  id         TEXT PRIMARY KEY,
+  status     TEXT NOT NULL,
+  deleted_at TEXT
+);
 CREATE TABLE new_messages (
   id              TEXT PRIMARY KEY,
   conversation_id TEXT REFERENCES new_conv(id) ON DELETE CASCADE,
   sequence        INTEGER NOT NULL
 );
+CREATE TABLE new_summaries (
+  id              TEXT PRIMARY KEY,
+  conversation_id TEXT REFERENCES new_conv(id) ON DELETE CASCADE
+);
+CREATE TABLE new_mem (id TEXT PRIMARY KEY, status TEXT NOT NULL);
+CREATE TABLE new_emb (memory_id TEXT PRIMARY KEY, status TEXT NOT NULL);
 CREATE TABLE new_sources (
   id          TEXT PRIMARY KEY,
   memory_id   TEXT NOT NULL,
@@ -107,28 +155,65 @@ CREATE TABLE new_sources (
   message_id  TEXT REFERENCES new_messages(id) ON DELETE RESTRICT,
   event_id    TEXT,
   goal_id     TEXT,
-  -- 修正：无 conversation_id
+  -- 修正 C22：无 conversation_id
   CHECK (message_id IS NOT NULL OR event_id IS NOT NULL
          OR goal_id IS NOT NULL OR source_type IN ('manual','system'))
 );
-INSERT INTO new_conv VALUES ('conv1');
-INSERT INTO new_messages VALUES ('msg1', 'conv1', 1);
-INSERT INTO new_sources VALUES ('src1','mem1','conversation','msg1',NULL,NULL);
 
-.print '按会话反查派生记忆（替代 conversation_id 的 JOIN 写法）:'
+-- conv1 是待删除的会话；conv2 提供「剩余来源」，用于覆盖步骤③的 a 支
+INSERT INTO new_conv VALUES ('conv1','active',NULL);
+INSERT INTO new_conv VALUES ('conv2','active',NULL);
+INSERT INTO new_messages VALUES ('msg1','conv1',1);
+INSERT INTO new_messages VALUES ('msg2','conv2',1);
+INSERT INTO new_summaries VALUES ('sum1','conv1');
+INSERT INTO new_mem VALUES ('mem1','active');   -- 来源全部指向 conv1 → b 支
+INSERT INTO new_mem VALUES ('mem2','active');   -- 还有一个 conv2 的来源 → a 支
+INSERT INTO new_emb VALUES ('mem1','ready');
+INSERT INTO new_sources VALUES ('src1','mem1','conversation','msg1',NULL,NULL);
+INSERT INTO new_sources VALUES ('src2','mem2','conversation','msg1',NULL,NULL);
+INSERT INTO new_sources VALUES ('src3','mem2','conversation','msg2',NULL,NULL);
+
+.print '步骤①：经 messages JOIN 反查受影响的记忆（替代 conversation_id 字段）:'
 SELECT DISTINCT ms.memory_id
   FROM new_sources ms
   JOIN new_messages m ON m.id = ms.message_id
  WHERE m.conversation_id = 'conv1';
 
-.print '删除会话（先清来源，再删消息，最后删会话）:'
-DELETE FROM new_sources WHERE message_id IN (SELECT id FROM new_messages WHERE conversation_id='conv1');
-DELETE FROM new_messages WHERE conversation_id='conv1';
-DELETE FROM new_conv WHERE id='conv1';
-.print '查询剩余行数（会话与消息应为 0）:'
-SELECT (SELECT COUNT(*) FROM new_conv) AS conv_left,
-       (SELECT COUNT(*) FROM new_messages) AS msg_left;
-.print '>>> 通过：删除链路不再触发 CHECK 违约'
+.print '步骤②：统计剩余有效来源数（mem1 = 0，mem2 = 1）:'
+SELECT memory_id, COUNT(*) AS remaining
+  FROM new_sources
+ WHERE memory_id IN ('mem1','mem2') AND message_id <> 'msg1'
+ GROUP BY memory_id;
+
+.print '步骤③a：有剩余来源 → 保留记忆，只删指向被删消息的来源行'
+DELETE FROM new_sources WHERE memory_id = 'mem2' AND message_id = 'msg1';
+
+.print '步骤③b：无剩余来源 → 失效记忆与向量，并删除来源行（初稿漏了最后一步）'
+UPDATE new_mem SET status = 'deleted' WHERE id = 'mem1';
+UPDATE new_emb SET status = 'deleted' WHERE memory_id = 'mem1';
+DELETE FROM new_sources WHERE memory_id = 'mem1' AND message_id = 'msg1';
+
+.print '步骤④：删除 messages（此时 RESTRICT 外键才真的没有阻碍）'
+DELETE FROM new_messages WHERE conversation_id = 'conv1';
+
+.print '步骤⑤：删除该会话的摘要（C29：摘要随消息一起物理删除）'
+DELETE FROM new_summaries WHERE conversation_id = 'conv1';
+
+.print '步骤⑥：软删除会话（C29：只有会话是软删除）'
+UPDATE new_conv SET status = 'deleted', deleted_at = '2026-01-01T00:00:00Z'
+ WHERE id = 'conv1';
+
+.print '结果（mem1 失效 / mem2 保留 / src3 仍在 / msg1 与摘要已删除 / 会话仅软删除）:'
+SELECT (SELECT status FROM new_mem WHERE id = 'mem1')        AS mem1_status,
+       (SELECT status FROM new_emb WHERE memory_id = 'mem1') AS mem1_emb,
+       (SELECT status FROM new_mem WHERE id = 'mem2')        AS mem2_status,
+       (SELECT COUNT(*) FROM new_sources)                    AS sources_left,
+       (SELECT COUNT(*) FROM new_messages)                   AS msgs_left,
+       (SELECT COUNT(*) FROM new_summaries)                  AS summaries_left,
+       (SELECT status FROM new_conv WHERE id = 'conv1')      AS conv1_status;
+.print '注：msgs_left = 1 是 conv2 的 msg2（本用例保留它作为 mem2 的剩余来源）；'
+.print '    conv1 的 msg1 已被删除 —— 这正是步骤③b 补上「删除来源行」之后才成立的。'
+.print '>>> 通过：按 §24.3 的两支流程执行后，messages 才能被真正删除'
 
 .print ''
 .print '--- [C24] 删除 Goal 时先清理投影记忆与来源 ---'
