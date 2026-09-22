@@ -6,7 +6,8 @@
 **审计日期：** 设计阶段（Phase 3 之前）
 **审计对象：** 文档中已固化的「准代码」契约
 **审计结论：** 发现 **4 个会直接导致运行失败的缺陷**，另有 **9 项一致性与可维护性问题**
-**修复状态：** ✅ 9 项阻塞项已全部修复并通过回归验证（见 §7）；其后的文档一致性复查又发现 4 项缺陷并按 C29～C32 修复、复跑回归（见 §7.5）
+**修复状态：** ✅ 9 项阻塞项已全部修复并通过回归验证（见 §7）
+**PG 验证状态：** ✅ 环境已就绪，EXCLUDE / VECTOR(1024) / C35 冲突状态等已在真实 PostgreSQL 18.6 上实测通过（见 §7.3）；其后的文档一致性复查又发现 4 项缺陷并按 C29～C32 修复、复跑回归（见 §7.5）
 
 ---
 
@@ -1029,19 +1030,76 @@ F-12  批量向量顺序验证             → Phase 4，需实测 TEI 行为
 > 执行一次（第一部分，报错）再按修正后执行（第二部分，通过）。
 > **测试必须照着文档写，否则绿灯证明不了文档是对的。**
 
-## 7.3 仍需在 PostgreSQL 上完成的验证
+## 7.3 PostgreSQL 侧验证结果
+
+> ✅ **环境已就绪，本节大部分验证已完成。**
+> 容器：`pgvector/pgvector:pg18`，PostgreSQL **18.6**，时区 `Asia/Shanghai`，编码 UTF8。
+> 扩展：`vector=0.8.6`、`pg_trgm=1.6`、`btree_gist=1.8`。
+> 脚本：`audit/pg-verification.sql`、`audit/pg-verify-2.sql`
+
+### 7.3.1 已通过（真实 PostgreSQL 实测）
+
+| 验证项 | 命令/结果 | 结论 |
+| ---- | ---- | ---- |
+| **EXCLUDE + btree_gist**（C20/C32） | 见下表 | ✅ **约束真实生效** |
+| 幂等键 `start_sequence`（C19） | `duplicate key value violates unique constraint "uq_runs"` | ✅ 起点相同被拦截 |
+| `VECTOR(1024)` 维度约束 | `ERROR: expected 1024 dimensions, not 512` | ✅ 维度写死生效 |
+| 精确检索无索引 | `EXPLAIN` → `Seq Scan` | ✅ 符合 §18.1 |
+| CHECK 违约措辞 | `new row for relation "ctest" violates check constraint "chk_ctest_superseded"` | ✅ 与 SQLite 行为一致 |
+| **C35 `conflict` 状态可落库** | 见下表 | ✅ **核心主张成立** |
+| C37 `events.category` CHECK | `violates check constraint "chk_ev_category"` | ✅ |
+| 中文 pg_trgm 子串匹配 | `ILIKE '%TypeScript%'` → 命中 2 行 | ✅ 中文可用 |
+| trgm 相似度排序 | `'learning TypeScript'` → 0.7143 / 0.0233 / 0.0161 | ✅ 区分度良好 |
+| `gen_random_uuid()` | 返回标准 UUID v4，长度 36 | ✅ 无需 `uuid-ossp` |
+| 服务端参数 | `server_version=18.6`、`TimeZone=Asia/Shanghai`、`UTF8` | ✅ |
+
+**EXCLUDE 约束的实测细节（这是 SQLite 无法验证的部分）：**
 
 ```text
-□ 复跑 audit/constraint-test.sql 的等价 PG 版本（错误信息措辞不同，行为应一致）
-□ 验证 EXCLUDE 约束（需 btree_gist 扩展）——SQLite 无此能力
-□ 验证后置外键 fk_memory_sources_event / fk_memory_sources_goal
-  （附录 A 末尾新增，需确认 SET NULL 行为与 §23.1 一致）
-□ 验证 VECTOR(1024) 与 pgvector 的维度约束（环境手册 §5 已覆盖）
-□ 验证 gin_trgm_ops 索引对中文的实际召回效果
-□ 验证 TEI 批量输入的返回顺序（F-12）
-
-前置条件：Docker 引擎需先启动（当前未就绪，见 §0.4）
+插入 [1,5] succeeded                          → INSERT 0 1
+插入 [1,10] succeeded（起点相同）              → UNIQUE 违约       ✓ 幂等键拦截
+插入 [3,10] succeeded（起点不同但区间重叠）     → EXCLUDE 违约      ✓ 排他约束拦截
+     conflicting key ... "excl_runs_range"
+     [3,11) conflicts with existing key [1,6)
+插入 [6,10] succeeded                          → INSERT 0 1        ✓ 不重叠放行
+插入 [7,20] failed                             → INSERT 0 1        ✓ 被 WHERE 排除
+最终：1|5|succeeded, 6|10|succeeded, 7|20|failed
 ```
+
+**C35 `conflict` 状态的实测细节（决策 1 的关键验证）：**
+
+```text
+D1  同槽位插入第二条 active      → duplicate key "uq_c35b_slot"    ✓ 唯一索引守住
+D2  同槽位插入 conflict          → INSERT 0 1                      ✓ 可落库
+D3  同槽位再插入第二条 conflict   → INSERT 0 1                      ✓ conflict 不受约束
+最终：Guangzhou|active, Beijing|conflict, Shenzhen|conflict
+
+→ 证明：conflict 状态既能落库、又不破坏 active 的唯一性约束
+```
+
+### 7.3.2 仍未验证
+
+```text
+□ 后置外键 fk_memory_sources_event / fk_memory_sources_goal 的 SET NULL 行为
+  （附录 A 末尾新增的 ALTER TABLE，需在完整表结构建好后验证）
+□ TEI 批量输入的返回顺序（F-12）—— 需 embedding 容器就绪
+□ 完整表结构（附录 A 全部 11 张表）的建表顺序与依赖是否成立
+  → 这一步将在 Phase 3 的 drizzle-kit 产物中验证
+```
+
+### 7.3.3 一个环境层面的发现
+
+```text
+Docker Desktop 的 registry mirror 配置指向
+  docker.mirrors.ustc.edu.cn / hub-mirror.c.163.com
+这两个国内镜像源近年已停止服务或极不稳定，首次拉取 pgvector 镜像时表现为「长时间无进展」。
+
+实际可用的是 Docker Desktop 的代理转发（http.docker.internal:3128 ← 宿主机 127.0.0.1:7897）。
+本次拉取最终成功，但耗时较长（约 10 分钟级）。
+建议后续拉取大镜像（尤其 TEI 的 89-1.9）时预留充足时间，或先在 Docker Desktop
+设置里移除失效的 registry mirror。
+```
+
 
 **本节复跑记录（SQLite 部分）：**
 

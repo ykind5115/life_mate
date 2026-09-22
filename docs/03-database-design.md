@@ -79,6 +79,23 @@ C19～C28 来自《设计契约审计报告》；C29～C32 来自其后的文档
 | C33 | §19 约束清单补全：补 `chk_relationships_status` / `chk_sources_has_origin`，NOT NULL 清单与附录 A 逐列对齐 | 🟡 表述澄清 | §19 自称「列出全部 CHECK / NOT NULL / UNIQUE」，但与附录 A 不一致（漏 `users` 整表、误列 `relationships.relation_type`） |
 | C34 | §7 重写：主键明确为 UUID v4，补「为什么不用 v7」与「什么条件下改用 v7」，删除两条在本项目不成立的理由 | 🟡 表述澄清 | 初稿理由泛化，且 PG18 内置 `uuidv7()` 后容易被当成"顺手优化"改掉 |
 
+### 0.3.1 待决策项闭环（C35～C38）
+
+C35～C38 解决的是 §6 遗留的四项**需要产品决策**的未决问题。决策结论：
+
+| 编号 | 修订 | 类型 | 原问题 |
+| ---- | ---- | ---- | ---- |
+| C35 | `memories.status` 新增 **`conflict`** 状态，并明确其状态转移与自动归档条件 | 🔴 结构性 | §13.7 的「真正冲突 → 标记待用户确认」无法落库：同槽位不允许两条 `active`，且枚举里没有可表达「待裁决」的状态 |
+| C36 | 修正 §14.2 的「平滑换模型」承诺：**仅同维度可平滑换，跨维度需显式迁移** | 🟡 承诺收敛 | §4.2/§14.2 声称 `(memory_id, model)` 多行支持平滑换模型，但 `VECTOR(1024)` 写死列类型，非 1024 维模型无法入库 |
+| C37 | `events.category` 与 `conversation_summaries.status` 补库层 CHECK（`category` 增加 `other` 兜底值） | 🟠 新增约束 | 两处有文档枚举但库层无 CHECK，与 §19「约束下沉」的目标不一致 |
+| C38 | 会话删除时清空 `conversations.title` 与 `summary`，改为固定占位文案 | 🟠 流程修订 | `conversations` 是软删除，`title` 为内容派生的私密信息，删除后仍留在库中与 §24.1 的删除意图冲突 |
+
+```text
+伴随的语义调整（C36 的副作用）：
+  §0.4 与 §4.2 中「embedding 维度变更按四步走」的表述已加注，
+  指向 §14.2 的实际约束，避免读者据此以为换维度可以直接双写。
+```
+
 ## 0.4 与 V1.0 的不兼容说明
 
 ```text
@@ -89,6 +106,9 @@ C19～C28 来自《设计契约审计报告》；C29～C32 来自其后的文档
 
 后续如需修改 memories 的时间模型或 embedding 维度，
 必须按「新增版本 → 双写 → 回填 → 切换」四步走，不得直接改表。
+
+⚠️ 注意：上述四步走对「embedding 维度变更」目前并不成立，见 §14.2 的 C36。
+   换模型的实际约束与切换条件以 §14.2 为准。
 ```
 
 ---
@@ -908,7 +928,7 @@ CHECK (status IN ('pending','running','succeeded','failed','skipped'))
 | sequence_from | BIGINT | NOT NULL | 覆盖起始序号（含） |
 | sequence_to | BIGINT | NOT NULL | 覆盖结束序号（含） |
 | summarizer_version | VARCHAR(50) | NOT NULL | 摘要器版本 |
-| status | VARCHAR(20) | NOT NULL DEFAULT 'active' | active / stale |
+| status | VARCHAR(20) | NOT NULL DEFAULT 'active', CHECK | active / stale |
 | created_at | TIMESTAMPTZ | NOT NULL | 创建时间 |
 
 > 🟡 C18：V1.0 字段名为 `start_sequence` / `end_sequence`，与 `extraction_runs` 重名易混淆，本版改为 `sequence_from` / `sequence_to` 并在文档中统一术语。同时新增 `summarizer_version` 与 `status`。
@@ -1031,7 +1051,7 @@ System Prompt
 | polarity | VARCHAR(10) | | affirm / deny（Q2） |
 | importance_score | REAL | NOT NULL DEFAULT 0.5 | 重要性 |
 | confidence_score | REAL | NOT NULL DEFAULT 1.0 | 置信度 |
-| status | VARCHAR(20) | NOT NULL DEFAULT 'active' | 状态 |
+| status | VARCHAR(20) | NOT NULL DEFAULT 'active', CHECK | 状态（见 §13.5，含 `conflict`） |
 | valid_from | TIMESTAMPTZ | | 事实生效时间 |
 | valid_until | TIMESTAMPTZ | | 事实失效时间 |
 | superseded_by | UUID | **无外键**（见下） | 被哪条记忆替代 |
@@ -1106,15 +1126,54 @@ deleted_at      表达「用户是否要求删除」
 | 目标状态 | status | valid_until | superseded_by | deleted_at | 是否被召回 | 触发者 |
 | ---- | ---- | ---- | ---- | ---- | ---- | ---- |
 | 当前有效 | `active` | NULL | NULL | NULL | ✅ | 抽取 / 用户新建 |
+| 待用户裁决 | `conflict` | 保持原值 | NULL | NULL | ❌ | 冲突解决流程（见 §13.7） |
 | 已被替代 | `superseded` | 非空 | 非空 | NULL | ❌ | 冲突解决流程 |
 | 已归档 | `archived` | 非空 | NULL | NULL | ❌ | 长期未使用降级 |
 | 已删除 | `deleted` | 保持原值 | 保持原值 | 非空 | ❌ | 用户操作 |
 
 ```sql
-CHECK (status IN ('active','superseded','archived','deleted'))
+CHECK (status IN ('active','conflict','superseded','archived','deleted'))
 CHECK (status <> 'superseded' OR superseded_by IS NOT NULL)
 CHECK (status <> 'deleted' OR deleted_at IS NOT NULL)
 ```
+
+> 🟠 **C35：新增 `conflict` 状态（补 §13.7 无法落库的分支）**
+>
+> **问题：** §13.7 的「真正冲突 → 新记忆 confidence 降低，标记待用户确认」此前无法落库：
+>
+> ```text
+> ① uq_memories_current_slot 把同一槽位的 active 记录限制为一条，
+>    新记忆以 active 身份插不进去
+> ② status 枚举里没有 conflict，无处表达「等用户裁决」这个状态
+> → 冲突分支实现不了，只能静默降级
+> ```
+>
+> **决定：** 新增 `conflict` 状态。冲突记忆**照常写入 `memories`**（保留全部上下文，便于审阅与回溯），但：
+>
+> ```text
+> ① 不被召回 —— 谓词要求 status='active'（§13.6）
+> ② 不参与部分唯一索引 —— 索引的 WHERE 只匹配 status='active'（§13.11）
+> ③ 不阻塞同槽位的新写入 —— 因为索引不覆盖 conflict 行
+> ```
+>
+> **裁决后的流转（由用户在前端触发）：**
+>
+> ```text
+>      ┌── 用户认可新记忆 ──→ 新记忆转 active
+>      │                      旧记忆置 superseded（写 valid_until + superseded_by）
+>      │                      本条 conflict 记录转为 superseded 或 archived
+>      │
+> conflict ──┬── 用户认为旧记忆才对 ──→ 新记忆转 archived（保留为历史，不召回）
+>      │
+>      └── 用户判定两者共存 ──→ 走 §13.7 的「可共存」分支：
+>                                修正 predicate_key 后重新判定
+>
+> 若长期（默认 30 天）未裁决 → 自动转 archived，避免 conflict 记录无限累积
+> ```
+>
+> **为什么不用「独立待确认队列」：** 那会引入第二张表和一套并行状态流转，
+> 而冲突候选与普通记忆共享全部字段（content / 槽位 / 来源 / embedding）。
+> 放进同一张表用状态区分，成本最低且不会两处漂移。
 
 ## 13.6 「当前有效记忆」的判定谓词
 
@@ -1195,8 +1254,9 @@ relationship.person           人际关系（object_value 存人名）
    ├── object_value 不同 ──────→ 交给 LLM 做「三选一」窄任务
    │                             ├─ 状态变化 → 旧记忆写 valid_until +
    │                             │              superseded_by，新记忆插入
-   │                             ├─ 真正冲突 → 新记忆 confidence 降低，
-   │                             │              标记待用户确认
+   │                             ├─ 真正冲突 → 新记忆以 status='conflict' 落库，
+   │                             │              confidence 降低，等待用户裁决
+   │                             │              （状态流转见 §13.5 的 C35）
    │                             └─ 可共存   → 检查 predicate 是否实际不同，
    │                                           修正后按「新增」处理
    │
@@ -1329,7 +1389,55 @@ Memory
    └── Embedding Model C（备选）
 ```
 
-这样可以在不破坏 Memory 本身的前提下重新生成向量、平滑迁移模型。
+这样可以：
+
+```text
+✅ 在不破坏 Memory 本身的前提下重新生成向量（正文不变，只重算向量）
+✅ 同一维度下共存多个模型（例如 bge-m3 与另一个 1024 维模型做效果对照）
+✅ 单条记忆的向量重算失败时，不影响记忆本体（status='failed' 可重试）
+```
+
+> 🟠 **C36：但「平滑换模型」这个承诺当前不成立，必须修正。**
+>
+> **问题：** 本节原文写「平滑迁移模型」，而 `embedding` 的列类型是 `VECTOR(1024)`（§14.3）。
+> **非 1024 维的模型根本无法入库**，所谓「新增 model 记录 → 双写 → 回填 → 切换」在换到
+> 不同维度的模型时走不通——插入就会被 `expected 1024 dimensions` 拒绝。
+>
+> **V1.0 的实际约束（以此为准）：**
+>
+> ```text
+> ✅ 支持：换到任意 1024 维模型
+>     同一列可容纳，只需新增 model 行、回填、切换查询里的 model 过滤条件
+>
+> ❌ 不支持：换到非 1024 维模型
+>     例如 768 维（bge-base-zh）、1536 维（gte-Qwen2）、2560/4096 维（Qwen3-Embedding）
+>
+> 换到非 1024 维模型 = 一次显式的数据迁移，且必须改表结构
+> ```
+>
+> **真要换维度时的两条路径（届时择一，不在 V1.0 实施）：**
+>
+> ```text
+> 路径 A：新增专用列 + 表达式索引
+>     ALTER TABLE memory_embeddings ADD COLUMN embedding_2560 VECTOR(2560);
+>     与「V1.0 不建向量索引」的取舍一致，成本最低。
+>
+> 路径 B：新建 memory_embeddings_v2 表，双写 → 回填 → 切换 → 删除旧表
+>     适合维度跨度大、需要长时间灰度的情况。
+> ```
+>
+> **为什么不在 V1.0 就改用无维度 `vector` 以"提前支持"：**
+>
+> ```text
+> ① 无维度 vector 无法建普通索引，只能靠「表达式 + 部分索引」按 model 分别建，
+>    而 V1.0 决定不建向量索引（§18.1），两者叠加后收益为零、复杂度为正
+> ② 维度写死能在数据库层拦住「用错模型的向量」这类静默错误
+>    （见环境手册 §5.3 的实测：插入 512 维会被明确拒绝）
+> ③ YAGNI：V1.0 没有任何换维度的实际需求
+> ```
+>
+> **结论：** 保留 `VECTOR(1024)`，但把「平滑换模型」的表述收敛为
+> **「同一维度内可平滑换，跨维度需显式迁移」**。§4.2 与 §0.3 已同步。
 
 ## 14.3 字段设计
 
@@ -1914,7 +2022,7 @@ ALTER TABLE messages           ADD CONSTRAINT chk_messages_role
 ALTER TABLE memories           ADD CONSTRAINT chk_memories_type
   CHECK (type IN ('fact','preference','event','goal','relationship','state'));
 ALTER TABLE memories           ADD CONSTRAINT chk_memories_status
-  CHECK (status IN ('active','superseded','archived','deleted'));
+  CHECK (status IN ('active','conflict','superseded','archived','deleted'));
 ALTER TABLE memories           ADD CONSTRAINT chk_memories_polarity
   CHECK (polarity IS NULL OR polarity IN ('affirm','deny'));
 ALTER TABLE memory_embeddings  ADD CONSTRAINT chk_embeddings_status
@@ -1932,6 +2040,16 @@ ALTER TABLE memory_sources     ADD CONSTRAINT chk_sources_type
 -- 附录 A 已有 CHECK，但本节清单漏列 —— 清单不全会让实现者以为该表无需约束。
 ALTER TABLE relationships      ADD CONSTRAINT chk_relationships_status
   CHECK (status IN ('active','ended','archived'));
+
+-- 🟠 C37：events.category 此前只有字段说明、无库层约束
+-- 'other' 是兜底值，避免抽取器编造枚举外的分类
+ALTER TABLE events             ADD CONSTRAINT chk_events_category
+  CHECK (category IS NULL
+         OR category IN ('work','study','project','life','health','other'));
+
+-- 🟠 C37：conversation_summaries.status 同样只有说明、无库层约束
+ALTER TABLE conversation_summaries ADD CONSTRAINT chk_summaries_status
+  CHECK (status IN ('active','stale'));
 ```
 
 ## 19.2 取值范围
@@ -2073,7 +2191,7 @@ events 表（唯一的真相）
 | title | VARCHAR(200) | NOT NULL | 事件名称 |
 | description | TEXT | | 事件描述 |
 | event_time | TIMESTAMPTZ | NOT NULL | 事件在现实中发生的时间 |
-| category | VARCHAR(50) | | 分类：work / study / project / life / health |
+| category | VARCHAR(50) | CHECK（可空） | 分类：work / study / project / life / health / other |
 | importance_score | REAL | NOT NULL DEFAULT 0.5 | 重要性 |
 | source_type | VARCHAR(20) | NOT NULL DEFAULT 'conversation' | 来源类型 |
 | source_message_id | UUID | FK → messages(id) ON DELETE SET NULL | 来源消息（可追溯） |
@@ -2083,6 +2201,28 @@ events 表（唯一的真相）
 | deleted_at | TIMESTAMPTZ | | 软删除时间 |
 
 > 🟠 C8：新增 `source_type` / `source_message_id` / `timeline_visible` / `deleted_at`。
+
+> 🟠 **C37：`category` 补库层 CHECK（`other` 为兜底值）**
+>
+> V1.1 此前只在字段说明里列了枚举，库层无约束，与 §19「约束下沉」的目标不一致。
+>
+> ```sql
+> CONSTRAINT chk_events_category CHECK (
+>   category IS NULL
+>   OR category IN ('work','study','project','life','health','other')
+> )
+> ```
+>
+> **两个刻意的设计点：**
+>
+> ```text
+> ① 可空 —— Event 允许没有分类，不强制归类
+> ② 提供 'other' 兜底 —— 抽取器遇到无法归类的真实事件时，
+>    写 'other' 而不是编造一个不在枚举里的值，也不是弃之不存
+>
+> 新增分类时：改 CHECK 约束 + 迁移。因为要求「约束下沉」，
+> 这部分成本是刻意接受换取的可控性（避免脏值悄悄入库）。
+> ```
 
 ## 20.3 时间线效果
 
@@ -2315,6 +2455,37 @@ users
      - 保留全部 Memory（适用于「只是想清理聊天列表」）
      - 前端需明确提示两种语义的差异
 ```
+
+> 🟠 **C38：两种语义下 `conversations.title` 都置为占位文案。**
+>
+> **问题：** `conversations` 是软删除（`status='deleted'` + `deleted_at`），行本身保留。
+> 而 `title` 是从对话内容生成的（如「LifeMate 系统设计」），属于**用户可见的私密内容**。
+> 若删除时保留原文，就与 §24.1「用户删除一段私密对话，是期望这段内容不再存在」的意图冲突——
+> 用户删了会话，标题却还留在库里甚至可能出现在列表中。
+>
+> **决定：** 两种语义下都执行
+>
+> ```sql
+> UPDATE conversations
+>    SET title = '[已删除的对话]',
+>        summary = NULL,                 -- summary 同样是内容派生，一并清空
+>        status = 'deleted',
+>        deleted_at = now()
+>  WHERE id = $1;
+> ```
+>
+> **为什么用固定占位文案而非 NULL 或空串：**
+>
+> ```text
+> ① title 是 NOT NULL，置 NULL 需改表结构
+> ② 置空串会让前端列表出现无标识的空条目，疑似 bug
+> ③ 固定文案让「这里曾有对话、已被删除」这一状态对用户可见、可理解
+> ④ 不泄露任何原内容（占位文案是常量，不含对话信息）
+> ```
+>
+> **注意与 C29 的区别：** `messages` / `summaries` 是**物理删除**（内容彻底消失）；
+> `conversations` 保留行是因为它是软删除的锚点（`deleted_at`），
+> 但**其内容派生字段必须清空**——两者目标一致：删除后不留内容痕迹。
 
 > 🟠 **C29：messages / summaries 是物理删除，不是软删除。**
 >
@@ -3001,7 +3172,8 @@ CREATE TABLE conversation_summaries (
   summarizer_version VARCHAR(50) NOT NULL,
   status             VARCHAR(20) NOT NULL DEFAULT 'active',
   created_at         TIMESTAMPTZ NOT NULL DEFAULT now(),
-  CONSTRAINT chk_summaries_range CHECK (sequence_to >= sequence_from)
+  CONSTRAINT chk_summaries_range CHECK (sequence_to >= sequence_from),
+  CONSTRAINT chk_summaries_status CHECK (status IN ('active','stale'))
 );
 CREATE UNIQUE INDEX uq_summaries_range
   ON conversation_summaries (conversation_id, sequence_from, sequence_to);
@@ -3027,7 +3199,7 @@ CREATE TABLE memories (
   updated_at       TIMESTAMPTZ NOT NULL DEFAULT now(),
   deleted_at       TIMESTAMPTZ,
   CONSTRAINT chk_memories_type       CHECK (type IN ('fact','preference','event','goal','relationship','state')),
-  CONSTRAINT chk_memories_status     CHECK (status IN ('active','superseded','archived','deleted')),
+  CONSTRAINT chk_memories_status     CHECK (status IN ('active','conflict','superseded','archived','deleted')),
   CONSTRAINT chk_memories_polarity   CHECK (polarity IS NULL OR polarity IN ('affirm','deny')),
   CONSTRAINT chk_memories_importance CHECK (importance_score BETWEEN 0 AND 1),
   CONSTRAINT chk_memories_confidence CHECK (confidence_score BETWEEN 0 AND 1),
@@ -3099,7 +3271,9 @@ CREATE TABLE events (
   updated_at        TIMESTAMPTZ NOT NULL DEFAULT now(),
   deleted_at        TIMESTAMPTZ,
   CONSTRAINT chk_events_source_type CHECK (source_type IN ('conversation','manual','system')),
-  CONSTRAINT chk_events_importance  CHECK (importance_score BETWEEN 0 AND 1)
+  CONSTRAINT chk_events_importance  CHECK (importance_score BETWEEN 0 AND 1),
+  CONSTRAINT chk_events_category    CHECK (category IS NULL
+    OR category IN ('work','study','project','life','health','other'))
 );
 CREATE INDEX idx_events_user_time     ON events (user_id, event_time DESC);
 CREATE INDEX idx_events_user_category ON events (user_id, category);
