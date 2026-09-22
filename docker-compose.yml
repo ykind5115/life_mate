@@ -14,7 +14,13 @@ services:
       # 只绑本机回环，不对局域网暴露
       - "127.0.0.1:5432:5432"
     volumes:
-      - lifemate-pgdata:/var/lib/postgresql/data
+      # ⚠️ PostgreSQL 18 起官方镜像改了数据目录，不能再用 17 及以前的路径：
+      #      PGDATA → /var/lib/postgresql/18/docker
+      #      镜像声明的 VOLUME → /var/lib/postgresql
+      #    挂到 /var/lib/postgresql/data 会导致容器启动失败（mount 报
+      #    no such file or directory），或数据落进匿名卷、容器重建后静默丢失。
+      # 依据：https://www.postgresql.org/message-id/6eec7166-3f56-4962-a015-719eef3dd964%40headcrashing.eu
+      - lifemate-pgdata:/var/lib/postgresql
       - ./devops/postgres/init:/docker-entrypoint-initdb.d:ro
     healthcheck:
       test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER} -d ${POSTGRES_DB}"]
