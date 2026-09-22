@@ -150,7 +150,7 @@ docker run --rm --gpus all nvidia/cuda:12.4.1-base-ubuntu22.04 nvidia-smi
 | `--gpus` 参数未被识别 | Docker 版本过旧 | 升级 Docker Desktop |
 | 容器启动但 `nvidia-smi` 不存在 / 报错 | WSL2 内核或驱动不匹配 | 更新 Windows 版 NVIDIA 驱动（**必须装 Windows 驱动，不要装 WSL 内驱动**），然后 `wsl --shutdown` 重启 |
 
-> ⚠️ **不要跳过这一步。** 如果容器拿不到 GPU，第 6 步的 bge-m3 会退化成 CPU 推理，虽然能跑但毫无意义（CPU 上 bge-m3 单条推理约 100～300ms，GPU 约 5～15ms）。
+> ⚠️ **不要跳过这一步。** 如果容器拿不到 GPU，第 6 步的 bge-m3 会退化成 CPU 推理，虽然能跑但毫无意义（**GPU 约 10～50 ms，CPU 约 100～300 ms**，见 [§7.5](#75-测量推理延迟) 的实测口径）。
 
 ## 1.6 确认 Embedding 镜像标签与 GPU 匹配
 
@@ -195,6 +195,17 @@ if ($LASTEXITCODE -eq 0) { "镜像标签可用" } else { "镜像标签不可用�
 
 > 💡 如果你的机器换成别的显卡（例如换了 RTX 30 系），**必须同步修改这个标签**，否则第 6 步会失败。修改位置见 `docker-compose.yml` 中 `embedding.image`。
 
+## 1.7 确认 Docker Compose 是 V2
+
+本手册所有命令都写成 **Compose V2 的子命令形式**（`docker compose`，中间是空格）。先确认版本，避免后面被 V1 的差异误导：
+
+```powershell
+docker compose version
+```
+
+✅ 期望：输出 `Docker Compose version v2.x.y`。
+
+❌ 若报 `docker: 'compose' is not a docker command`：说明只有旧的独立二进制 `docker-compose`（V1）。升级 Docker Desktop 到最新版即可；**不要把本手册的 `docker compose` 自行改成 `docker-compose`**，两者参数行为不一致（详见 [§10.10.3](#10103-docker-compose-is-not-a-docker-command)）。
 
 ---
 
@@ -204,6 +215,7 @@ if ($LASTEXITCODE -eq 0) { "镜像标签可用" } else { "镜像标签不可用�
 
 > 📌 **本节列出的文件仓库中均已存在，无需手动创建。**
 > 这里只做核对，确认你拉到的是正确版本。
+> 唯一例外是 `backups\`：它是备份输出目录，不入库，在 [§11.1](#111-手动备份) 首次备份时创建。
 
 项目根目录 `D:\workspace\LifeMate` 的当前结构：
 
@@ -215,6 +227,7 @@ D:\workspace\LifeMate\
 │       └── init\
 │           └── 01-extensions.sql      ← 数据库初始化脚本
 ├── src\                               （预留）TypeScript 源码
+├── backups\                           备份输出目录（不入库，首次备份时创建）
 ├── docker-compose.yml                 postgres + embedding 两个服务
 ├── .env                               环境变量（含密码，不提交）
 ├── .env.example                       环境变量模板（提交）
@@ -255,22 +268,29 @@ Test-Path .env.example
 仓库中已有 `.gitignore`，内容如下（供核对）：
 
 ```gitignore
-# 环境变量（含密码，绝不提交）
+# 环境变量（含数据库密码，绝不提交）
 .env
 
-# 备份文件
+# 备份文件（含私密数据的明文，绝不提交）
 backups/
 *.dump
+*.7z
 
 # 依赖与构建产物
 node_modules/
 dist/
 build/
+*.tsbuildinfo
 
-# 编辑器
+# 日志
+*.log
+logs/
+
+# 编辑器与系统
 .vscode/
 .idea/
-*.log
+.DS_Store
+Thumbs.db
 ```
 
 ## 2.3 `docker-compose.yml`
@@ -280,12 +300,9 @@ build/
 ```powershell
 # 查看实际内容
 Get-Content docker-compose.yml
-
-# 校验语法（会自动展开变量，能发现大部分配置错误）
-docker compose config
 ```
 
-✅ 期望：`docker compose config` 退出码为 0，并输出展开后的完整配置。
+> 💡 **这里先不要跑 `docker compose config`。** 此时 `.env` 尚未创建（见 §2.5），所有 `${POSTGRES_*}` 变量都是空的，compose 只会刷一屏 `variable is not set` 警告，什么也验证不了。语法校验放在 §2.5 末尾 `.env` 就绪之后。
 
 **核对清单：**
 
@@ -347,17 +364,37 @@ EMBEDDING_DIM=1024
 
 ```powershell
 cd D:\workspace\LifeMate
-Copy-Item .env.example .env
+Copy-Item .env.example .env -Force
 ```
 
-然后编辑 `.env`，**把密码换成一个强密码**。生成一个随机密码：
+> 💡 加 `-Force` 是为了让这条命令**可重复执行**：`.env` 已存在时直接覆盖，不会中途报错。
+
+**然后编辑 `.env`，把密码换成一个强密码。** 生成一个随机密码：
 
 ```powershell
 # 生成 32 位随机密码
 -join ((48..57) + (65..90) + (97..122) | Get-Random -Count 32 | ForEach-Object {[char]$_})
 ```
 
+> 🔴 **`.env` 里有两处密码，必须改成同一个值：**
+>
+> ```text
+> POSTGRES_PASSWORD=<新密码>                        ← 容器用它初始化/校验账号
+> DATABASE_URL=postgresql://lifemate:<新密码>@127.0.0.1:5432/lifemate
+>                                 ↑ .env.example 第 14 行嵌着同一份密码
+> ```
+>
+> 只改 `POSTGRES_PASSWORD` 而漏掉 `DATABASE_URL`，容器能起来，但应用侧仍拿着旧密码连接，表现为 `password authentication failed for user "lifemate"`。两处必须**完全一致**。
+
 > ⚠️ 密码中的特殊字符会破坏 `DATABASE_URL` 的解析。建议只用**字母和数字**，或对特殊字符做 URL 编码。
+
+> ⚠️ **`.env` 必须以 UTF-8（无 BOM）保存，不能是 UTF-16。** Windows PowerShell 5.1 的 `Set-Content` / `>` 重定向默认写出 **UTF-16 LE（带 BOM）**，Compose 解析时会看到字符之间夹着的 NUL 字节，报出难以定位的解析错误。请用编辑器另存为 UTF-8，或显式指定编码：
+>
+> ```powershell
+> Get-Content .env.example | Set-Content -Encoding utf8NoBOM .env
+> ```
+>
+> （`utf8NoBOM` 是 PowerShell 7+ 的写法；5.1 下请改用编辑器保存。）
 
 **验证 `.env` 已被 git 忽略：**
 
@@ -366,6 +403,20 @@ git check-ignore -v .env     # 应输出匹配的忽略规则
 git status --short           # .env 不应出现在列表中
 ```
 
+**校验 compose 配置（必须在 `.env` 就绪之后做）：**
+
+```powershell
+# 退出码为 0，并输出展开后的完整配置
+docker compose config
+
+# 只看解析后的环境变量（Compose V2 可用）
+docker compose config --environment
+```
+
+✅ 期望：`docker compose config` 退出码为 0，输出中 `POSTGRES_USER`、`POSTGRES_DB` 为真实值 `lifemate`，`POSTGRES_PASSWORD` 为**你刚设置的密码**（既不是空串，也不是模板里的 `change_me_to_a_strong_password`）。
+
+❌ 若输出里出现 `variable is not set. Defaulting to a blank string`，说明 `.env` 没被读到（文件名不对、不在 compose 同目录、或编码是 UTF-16），**不要继续下一步**。
+
 ## 2.6 初始化脚本 `devops/postgres/init/01-extensions.sql`
 
 > 📌 **该文件已存在，无需创建。** 内容如下（供核对）：
@@ -373,26 +424,40 @@ git status --short           # .env 不应出现在列表中
 ```sql
 -- LifeMate 数据库初始化
 -- 仅在数据卷首次创建时执行一次
+-- 对应《LifeMate 数据库设计 V1.1》§7、§11.3.2、§17.4 与 §18
+--
+-- ⚠️ 本脚本只在「数据卷为空」时执行。
+--    对已经存在数据的库补扩展，必须写进 Migration —— 改这里不会生效。
 
 -- 向量检索扩展（pgvector）
 CREATE EXTENSION IF NOT EXISTS vector;
 
--- 关键词检索扩展（中文场景使用三元组匹配，见《数据库设计 V1.1》§17.4）
+-- 关键词检索扩展
+-- 中文场景下 PostgreSQL 默认全文检索不支持中文分词，
+-- 因此混合检索的关键词通道使用 pg_trgm 的字符三元组匹配。
 CREATE EXTENSION IF NOT EXISTS pg_trgm;
 
--- 通用工具
-CREATE EXTENSION IF NOT EXISTS "uuid-ossp";
+-- 区间排他约束所需
+-- extraction_runs 的 excl_extraction_range 用 EXCLUDE 保证「成功区间不重叠」，
+-- 其等值部分（conversation_id）需要 uuid 的 GiST 操作符类，由 btree_gist 提供。
+-- 缺少本扩展时该约束无法创建，见《数据库设计 V1.1》§11.3.2。
+CREATE EXTENSION IF NOT EXISTS btree_gist;
+
+-- 不需要 uuid-ossp：所有主键使用 gen_random_uuid()，PostgreSQL 13+ 内置（见 §7）。
 
 -- 输出确认
 DO $$
 BEGIN
-  RAISE NOTICE 'LifeMate extensions installed: vector=%, pg_trgm=%',
+  RAISE NOTICE 'LifeMate extensions installed: vector=%, pg_trgm=%, btree_gist=%',
     (SELECT extversion FROM pg_extension WHERE extname = 'vector'),
-    (SELECT extversion FROM pg_extension WHERE extname = 'pg_trgm');
+    (SELECT extversion FROM pg_extension WHERE extname = 'pg_trgm'),
+    (SELECT extversion FROM pg_extension WHERE extname = 'btree_gist');
 END $$;
 ```
 
 > 📌 `pg_trgm` 是**必须的**，不是可选项。《数据库设计 V1.1》§17.4 决定用 `pg_trgm` 承担混合检索的关键词通道——因为 PostgreSQL 默认全文检索不支持中文分词。
+
+> 📌 `btree_gist` 同样是**必须的**，不是可选项。《数据库设计 V1.1》§11.3.2 的 `excl_extraction_range` 用 `EXCLUDE` 保证「同一会话的成功抽取区间不重叠」，其等值部分 `conversation_id` 是 `uuid`，需要由 `btree_gist` 提供 GiST 操作符类。**缺少该扩展时 `ALTER TABLE ... ADD CONSTRAINT excl_extraction_range` 会直接失败**，而报错文案（见 [§10.2](#102-扩展创建失败)）不会提示你缺的是扩展。
 
 ---
 
@@ -414,16 +479,16 @@ docker compose logs -f postgres
 ✅ 期望看到（顺序大致如下）：
 
 ```text
+NOTICE:  LifeMate extensions installed: vector=0.8.x, pg_trgm=1.x, btree_gist=1.x
+...
 PostgreSQL init process complete; ready for start up.
 ...
 database system is ready to accept connections
 ```
 
-以及初始化脚本的输出：
-
-```text
-NOTICE:  LifeMate extensions installed: vector=0.8.x, pg_trgm=1.6
-```
+> 📌 **`NOTICE` 在 `PostgreSQL init process complete; ready for start up.` 之前**——初始化脚本是在 `/docker-entrypoint-initdb.d` 阶段跑的，早于数据库正式启动。
+>
+> 📌 **`NOTICE` 只在「首次初始化」出现。** 它由 `devops/postgres/init/01-extensions.sql` 发出，而该脚本仅在**数据卷为空**时执行一次。第二次及以后启动，日志里**没有这行 `NOTICE` 是完全正常的**，不要据此判断失败；要确认扩展是否装好，用 [§4.2](#42-验证扩展已加载) 的 SQL 查询。
 
 看到 `ready to accept connections` 后按 **Ctrl+C** 退出日志跟踪（**不会停止容器**）。
 
@@ -467,16 +532,26 @@ docker compose exec postgres psql -U lifemate -d lifemate
 SELECT extname, extversion FROM pg_extension ORDER BY extname;
 ```
 
-✅ 期望至少包含：
+✅ 期望：至少包含下面四行（`btree_gist` / `pg_trgm` / `plpgsql` / `vector`），且版本号落在下面的模式里：
 
 ```text
- extname  | extversion
-----------+------------
- pg_trgm  | 1.6
- plpgsql  | 1.0
- uuid-ossp| 1.1
- vector   | 0.8.x
+ extname   | extversion   ← 不要按字面核对，只要匹配前缀即可
+-----------+------------
+ btree_gist| 1.*
+ pg_trgm   | 1.*
+ plpgsql   | 1.0
+ vector    | 0.8.*
 ```
+
+> 📌 **判据只看到前缀：`vector` 以 `0.8.` 开头，`btree_gist` / `pg_trgm` 以 `1.` 开头。** 文档里不写死具体小版本号（不同镜像 tag 会有出入），要看本机实际值就直接查：
+>
+> ```sql
+> SELECT extname, extversion FROM pg_extension
+>  WHERE extname IN ('vector', 'pg_trgm', 'btree_gist', 'plpgsql')
+>  ORDER BY extname;
+> ```
+
+> 📌 **`uuid-ossp` 是刻意不安装的。** 初始化脚本用的是 PostgreSQL 13+ 内置的 `gen_random_uuid()`（见《数据库设计 V1.1》§7），所以清单里**不应该**出现 `uuid-ossp`。若出现了，说明用的还是旧版初始化脚本。
 
 ## 4.3 验证服务器参数
 
@@ -486,23 +561,33 @@ SHOW TimeZone;
 SHOW server_encoding;
 ```
 
-✅ 期望：
+✅ 期望：`server_version` **以 `18.` 开头**，`TimeZone` 为 `Asia/Shanghai`，`server_encoding` 为 `UTF8`。
 
 ```text
- server_version  | 18.x
+ server_version  | 18.0 (Debian 18.0-1.pgdg120+1)
  TimeZone        | Asia/Shanghai
  server_encoding | UTF8
 ```
+
+> 📌 `SHOW server_version` 打印的是**完整版本串**（形如 `18.0 (Debian ...)`），不会只输出 `18.x`。所以判据只能写成「以 `18.` 开头」，不要去找字面量 `18.x`。想要纯数字版本用 `SHOW server_version_num;`（应为 `180000` 级别）。
 
 > ⚠️ 如果 `TimeZone` 不是 `Asia/Shanghai`，`TIMESTAMPTZ` 的显示会与你的预期差 8 小时。虽然存储是 UTC 不受影响，但排查问题时容易误判。修正方式见 [§10.6](#106-时区不正确)。
 
 ## 4.4 验证中文存储
 
 ```sql
+-- ① 字面量：只证明客户端能显示中文
 SELECT '测试中文与 emoji 😀' AS check_text, length('测试中文与 emoji 😀') AS len;
+
+-- ② 真正的插入 + 回读：证明中文能落盘再取回（§12.2 的检查项指的是这一步）
+CREATE TEMP TABLE _cn_check (id SERIAL PRIMARY KEY, t TEXT);
+INSERT INTO _cn_check (t) VALUES ('测试中文与 emoji 😀');
+SELECT id, t, length(t) AS len FROM _cn_check;
 ```
 
-✅ 期望：中文正常显示，`len` 为合理值（不是乱码或问号）。
+✅ 期望：两步都正常。第 ② 步回读出来的 `t` 必须与插入时**逐字相同**（emoji 也不能变成 `?`），`len` 为合理值。
+
+> 💡 `_cn_check` 是临时表，只存在于当前会话，`\q` 退出即自动消失，不会污染数据库。
 
 ❌ 如果显示为乱码，是**客户端编码**问题而非数据库问题，执行：
 
@@ -611,20 +696,31 @@ LIMIT 5;
 ```sql
 EXPLAIN ANALYZE
 SELECT id FROM _vector_smoke_test
-ORDER BY embedding <=> (SELECT embedding FROM _vector_smoke_test WHERE id = 1)
+ORDER BY embedding <=> (array_fill(1.0::real, ARRAY[1024]))::vector
 LIMIT 1;
 ```
 
-✅ 期望：执行计划是 **`Seq Scan`**（顺序扫描），而非 `Index Scan`。
+✅ 期望：**只判读「对 `embedding` 排序」这一步**——它是 `Seq Scan`（必要时配 `Sort` / `Limit`），而不是向量索引扫描。
 
 **这是符合预期的**——《数据库设计 V1.1》§18.1 决定 V1.0 不建向量索引，走精确检索（召回率 100%）。
 
-❌ 如果出现了 `Index Scan`，说明有遗留索引：
+**判读要点（容易误判，务必看完）：**
+
+```text
+• 上面的查询用「字面量向量」作排序键，计划里只应该出现 Seq Scan
+• 如果写成子查询 (SELECT embedding FROM _vector_smoke_test WHERE id = 1)，
+  计划里出现 Index Scan using _vector_smoke_test_pkey 是完全正常的：
+  那是主键在查 id = 1 这一行，与向量排序无关，不是问题
+• 真正的问题只有一种：embedding 列上存在 hnsw / ivfflat 向量索引
+```
+
+❌ 只有当 `\d _vector_smoke_test` 显示 `embedding` 列上有 hnsw / ivfflat 向量索引时，才需要删掉它：
 
 ```sql
 \d _vector_smoke_test
--- 若有 hnsw / ivfflat 索引
-DROP INDEX <索引名>;
+-- 仅当 embedding 列上有 hnsw / ivfflat 索引时才执行
+-- DROP INDEX <向量索引名>;
+-- 注意：_vector_smoke_test_pkey 是主键索引，不要删
 ```
 
 ## 5.6 清理
@@ -706,7 +802,9 @@ docker compose logs --tail 50 embedding
 docker compose exec embedding nvidia-smi
 ```
 
-✅ 期望：输出 GPU 信息表，且能看到一个 python 进程占用显存（约 3.2 GB）。
+✅ 期望：输出 GPU 信息表，且能看到一个名为 `text-embeddings-` 的进程占用显存（约 3.2 GB）。
+
+> 📌 TEI 是 Rust 二进制，进程名不是 `python`。`nvidia-smi` 的 `Processes` 表里显示的进程名会被截断为 `text-embeddings-`（完整名 `text-embeddings-router`）。看到 `python` 反而说明跑的不是 TEI。
 
 ❌ 若报 `nvidia-smi: command not found`：TEI 镜像可能未包含该工具，改用下面的方式间接验证（看响应延迟）。
 
@@ -732,7 +830,9 @@ curl.exe http://127.0.0.1:8080/health
 curl.exe http://127.0.0.1:8080/info
 ```
 
-✅ 期望：返回 JSON，包含 `"model_id":"BAAI/bge-m3"` 与 `"max_input_length":8192` 之类的字段。
+✅ 期望：返回 JSON，包含 `"model_id":"BAAI/bge-m3"`，且存在 `max_input_length` 字段。
+
+> 📌 `max_input_length` 的具体数值由模型配置决定（本文档不写死），这里**只要求该字段存在**。真正的硬性门槛是 [§7.3](#73-生成一个向量并检查维度关键) 的 **1024 维**检查，不是这个字段的值。
 
 ## 7.3 生成一个向量并检查维度（关键）
 
@@ -805,8 +905,16 @@ $doc2  = Get-Embedding "今天中午吃了个鸡腿"
 
 ## 7.5 测量推理延迟
 
+> ⚠️ **必须先丢弃第一次（预热）调用。** 首次请求包含模型预热与 CUDA kernel 装载，耗时会明显高于稳态（可能达到数百毫秒），把它算进平均会得出「GPU 没生效」的错误结论。
+
 ```powershell
 $body = @{ inputs = "测试延迟" } | ConvertTo-Json
+
+# 第 1 次：预热，只发不测
+Invoke-RestMethod -Uri "http://127.0.0.1:8080/embed" `
+                  -Method Post -ContentType "application/json" -Body $body | Out-Null
+
+# 之后 10 次：取平均
 $sw = [System.Diagnostics.Stopwatch]::StartNew()
 1..10 | ForEach-Object {
     Invoke-RestMethod -Uri "http://127.0.0.1:8080/embed" `
@@ -816,13 +924,15 @@ $sw.Stop()
 "平均单次延迟: {0:N1} ms" -f ($sw.ElapsedMilliseconds / 10)
 ```
 
-✅ 期望（GPU 正常）：
+✅ 期望（GPU 正常，已丢弃预热）：**约 10～50 ms**。
 
 ```text
-平均单次延迟: 10 ~ 50 ms
+平均单次延迟: 25.0 ms
 ```
 
-❌ 若为 **100～500 ms**：GPU 没有生效，正在用 CPU 推理。回到 [§1.5](#15-确认容器内可访问-gpu关键验证)。
+❌ 若为 **约 100～300 ms**：GPU 没有生效，正在用 CPU 推理。回到 [§1.5](#15-确认容器内可访问-gpu关键验证)。
+
+> 📌 全文只用这一对数字：**GPU 约 10～50 ms、CPU 约 100～300 ms**。任何位置的期望值都以本节的实测口径为准（首次调用含预热会更慢，不参与统计）。
 
 ---
 
@@ -878,16 +988,17 @@ function Get-Sha256([string]$text) {
     ($hash | ForEach-Object { $_.ToString("x2") }) -join ""
 }
 
-function Insert-Memory([string]$content) {
-    # 与《数据库设计 V1.1》§14.5 的拼接规则一致
-    $embeddedText = "fact｜用户｜$content"
+function Insert-Memory([string]$content, [string]$timeHint = (Get-Date -Format "yyyy-MM-dd")) {
+    # 与《数据库设计 V1.1》§14.5 的拼接规则一致：
+    #   embedded_text = "{type}｜{主体}｜{content}｜{时间提示}"   ← 四段，缺一不可
+    $embeddedText = "fact｜用户｜$content｜$timeHint"
     $vec  = Get-Embedding $embeddedText
     $hash = Get-Sha256 $embeddedText
     $vecLiteral = To-PgVector $vec
 
     $sql = @"
 INSERT INTO _e2e_test (content, embedded_text, content_hash, model, embedding)
-VALUES ('$content', '$embeddedText', '$hash', 'bge-m3', '$vecLiteral'::vector)
+VALUES ('$content', '$embeddedText', '$hash', 'BAAI/bge-m3', '$vecLiteral'::vector)
 RETURNING id;
 "@
     docker compose exec -T postgres psql -U lifemate -d lifemate -t -A -c $sql
@@ -900,6 +1011,24 @@ Insert-Memory "用户喜欢直接、具体的技术解释"
 ```
 
 ✅ 期望：三条都返回一个 UUID。
+
+> 📌 **`model` 列必须写完整的 `BAAI/bge-m3`，不能写短名 `bge-m3`。** 这是《数据库设计 V1.1》§14.5 的 C27 决策：写入与检索两侧必须用同一个字面量，否则 JOIN 会静默失配、检索永远返回空。真实实现里该值应来自单一常量（如 `EMBEDDING_MODEL_ID`），不要手写。
+
+> 📌 **`embedded_text` 必须包含「时间提示」这第四段。** §14.5 定义的构成是 `{type}｜{主体}｜{content}｜{时间提示}`（示例：`fact｜用户｜用户住在广州｜2026-01-01 起有效`）。上面的函数用当天的 `yyyy-MM-dd` 作时间提示，保证与设计一致。
+
+> ⚠️ **`-c $sql` 会把整条 SQL（含约 20 KB 的向量字面量）当作一个命令行参数传给 `psql`。** Windows 单个命令行参数最长约 32767 字符，且 `$vecLiteral` 里全是要转义的引号，稍有不慎就被截断或改写。更稳的做法是**落成临时 `.sql` 文件再执行，或把 SQL 通过 stdin 喂给 `psql`**：
+>
+> ```powershell
+> # 方案 A：临时文件（推荐）
+> $sql | Set-Content -Encoding utf8NoBOM "$env:TEMP\insert.sql"
+> docker compose cp "$env:TEMP\insert.sql" postgres:/tmp/insert.sql
+> docker compose exec -T postgres psql -U lifemate -d lifemate -t -A -f /tmp/insert.sql
+>
+> # 方案 B：stdin（注意管道只传文本，不要传二进制）
+> $sql | docker compose exec -T postgres psql -U lifemate -d lifemate -t -A -f -
+> ```
+>
+> 真正写业务代码时更应把向量作为**参数**绑定（`$1::vector`），而不是拼进 SQL 字符串。
 
 ❌ 若报 `invalid input syntax for type vector`，是向量字符串格式化问题，检查 `To-PgVector` 是否用了 InvariantCulture（某些区域设置会用逗号作小数点，导致向量解析失败）。
 
@@ -939,7 +1068,7 @@ Search-Memory "我最近那个 TS 项目怎么样了"
 1. `embedded_text` 是否真的包含了内容（§8.2 的拼接）
 2. 是否用了同一个模型生成查询向量与文档向量（**必须同一个模型**，否则向量空间不通用）
 
-## 8.4 验证软件层面的去重（对应 §14.4）
+## 8.4 验证软件层面的去重（对应 §13.7）
 
 再插入一次相同内容：
 
@@ -1048,9 +1177,11 @@ docker compose exec postgres psql -U lifemate -d lifemate
 常用 psql 命令：
 
 ```text
-\dt              列出所有表
-\d memories      查看表结构
-\d+ memories     查看表结构（含约束与索引）
+\dt              列出所有表（当前环境里只有临时测试表，业务表尚不存在）
+\d <表名>        查看表结构
+                 ⚠️ memories 等业务表要等 Phase 3 迁移执行后才有；
+                    现在执行 \d memories 会报 `Did not find any relation named "memories"`
+\d+ <表名>       查看表结构（含约束与索引）
 \di              列出索引
 \df              列出函数
 \x               切换展开显示（宽表阅读友好）
@@ -1090,7 +1221,7 @@ TEI 模型信息 http://127.0.0.1:8080/info
 **症状：**
 
 ```text
-Error response from daemon: Ports are not available: exposing port TCP 0.0.0.0:5432 -> ... bind: address already in use
+Error response from daemon: Ports are not available: exposing port TCP 127.0.0.1:5432 -> ... bind: address already in use
 ```
 
 **排查：**
@@ -1142,6 +1273,27 @@ docker compose down -v      # ⚠️ 会清空数据，仅在无真实数据时�
 docker compose up -d postgres
 ```
 
+### 10.2.1 缺少 `btree_gist`：`EXCLUDE` 约束建不上
+
+**症状：** 执行《数据库设计 V1.1》§11.3.2 的 `excl_extraction_range` 时失败：
+
+```text
+ERROR:  data type uuid has no default operator class for access method "gist"
+HINT:  You must specify an operator class for the index or define a default operator class for the data type.
+```
+
+**原因：** `EXCLUDE USING gist (conversation_id WITH =, ...)` 的等值部分 `conversation_id` 是 `uuid`，它没有内置的 GiST 操作符类，必须由 `btree_gist` 扩展提供。初始化脚本已包含 `CREATE EXTENSION IF NOT EXISTS btree_gist;`，所以出现这个报错说明**当前数据卷是用旧脚本初始化的**（或扩展被手工删掉了）。
+
+**处理：** 在 psql 里直接补扩展：
+
+```sql
+CREATE EXTENSION IF NOT EXISTS btree_gist;
+-- 确认
+SELECT extname, extversion FROM pg_extension WHERE extname = 'btree_gist';
+```
+
+> ⚠️ **改初始化脚本对已存在的数据卷无效。** `devops/postgres/init/*.sql` 只在数据卷为空的首次启动时执行一次；对已有数据的库补扩展，必须在 psql 里补（如上），并把这一步写进 Migration 以便在别的机器上可复现。**不要用 `down -v` 来「让脚本重新跑」——那会删掉全部数据。**
+
 ## 10.3 Embedding 容器反复重启
 
 **排查顺序：**
@@ -1156,7 +1308,7 @@ docker compose logs --tail 100 embedding
 | `no kernel image is available for execution on the device` | **镜像计算能力与显卡不匹配** | 见下方 §10.3.1，这是 8.9 显卡最容易踩的坑 |
 | `OutOfMemoryError` / `CUDA out of memory` | 显存不足 | 见 §10.4 |
 | `Connection error` / `timeout` 下载模型 | 网络无法访问 HuggingFace | 见 §10.5 |
-| `permission denied` 写 `/data` | 卷权限 | `docker compose down` 后删除 `lifemate-hf-cache` 卷重建 |
+| `permission denied` 写 `/data` | 卷权限 / 卷内容坏了 | 停服务 → 确认真实卷名 → 删卷重建，见下方 §10.3.2 |
 | `Address already in use` | 8080 被占 | 见 §10.1 |
 
 ### 10.3.1 镜像计算能力不匹配（RTX 40 系最易踩）
@@ -1195,7 +1347,10 @@ image: ghcr.io/huggingface/text-embeddings-inference:89-1.9
 然后重建：
 
 ```powershell
-docker compose down embedding
+# down 不接受服务名（Compose V2 会报 "no such service" / 用法错误），
+# 停单个服务用 stop，再 rm 掉容器
+docker compose stop embedding
+docker compose rm -f embedding
 docker compose up -d embedding
 docker compose logs -f embedding
 ```
@@ -1210,6 +1365,38 @@ docker run --rm -p 8080:80 `
 ```
 
 > ⚠️ CPU 模式下单条推理约 100～300 ms，**不要用它做正式环境**，仅用于隔离问题。
+
+### 10.3.2 修复 `lifemate-hf-cache` 卷（HF 缓存损坏）
+
+> ⚠️ **两个常见错误先澄清：**
+>
+> ```text
+> ❌ 只跑 docker compose down —— down 不会删除具名卷（volume），卷还在，问题依旧
+> ❌ 直接写 docker volume rm lifemate-hf-cache —— 卷名是「项目名_卷名」带前缀的，
+>    项目名默认取自 compose 文件所在目录名，例如：
+>      D:\workspace\LifeMate     → lifemate_lifemate-hf-cache
+>      E:\workspace\life_mate    → life_mate_lifemate-hf-cache
+>    名字猜错会得到 "No such volume"
+> ```
+
+**正确做法：**
+
+```powershell
+# 1) 先停掉用卷的服务（down 不接受服务名，停单个服务用 stop）
+docker compose stop embedding
+
+# 2) 列出真实卷名，按实际输出取用
+docker volume ls
+#   形如 lifemate_lifemate-hf-cache / life_mate_lifemate-hf-cache
+
+# 3) 删除该卷（模型权重会在下次启动时重新下载，约 2.3 GB）
+docker volume rm <上一步列出的实际卷名>
+
+# 4) 重新起服务
+docker compose up -d embedding
+```
+
+> 🔴 **`docker compose down -v` 是核选项，不要为了修这一个卷去用它。** 它会一次删掉**全部**具名卷（含 `lifemate-hf-cache`），包括 `lifemate-pgdata`——你的全部记忆数据不可恢复。
 
 ## 10.4 显存不足
 
@@ -1229,9 +1416,15 @@ nvidia-smi
 # 释放被 Docker 占用的显存
 docker compose restart embedding
 
-# 若仍不足，限制 TEI 的批大小
-# docker-compose.yml 中把 --max-client-batch-size 从 32 调小到 8
+# 若仍不足，优先调小 --max-batch-tokens（TEI 默认 16384）
+#   峰值显存由「一次实际处理多少 token」决定，这才是 OOM 的主旋钮：
+#   docker-compose.yml 中 embedding.command 里加/改 --max-batch-tokens 4096（或更小）
+#
+# 其次才考虑 --max-client-batch-size（默认已是 32，调小收益有限）：
+#   它是「客户端一次最多提交多少条」，不是显存峰值的主因
 ```
+
+> 📌 **旋钮顺序不要弄反：先 `--max-batch-tokens`，再 `--max-client-batch-size`。** 长文本单条就可能撞上 token 上限，此时把客户端批大小降到 8 也救不了；反之把 `--max-batch-tokens` 降到 4096 通常立刻见效（代价是吞吐下降）。
 
 可选：把 Windows 桌面上的 GPU 加速关掉（浏览器 → 设置 → 系统 → 关闭硬件加速）。
 
@@ -1297,7 +1490,7 @@ SET client_encoding = 'UTF8';
 SHOW client_encoding;
 ```
 
-若想永久生效，在项目根目录建 `~/.psqlrc` 不便（Windows），可改用连接参数：
+若想永久生效，可以写 `~/.psqlrc`（注意：这是**用户主目录**下的文件，即 `C:\Users\<你>`，不是项目根目录），Windows 下 `~` 不总是被展开，直接用连接参数更省事：
 
 ```powershell
 docker compose exec -e PGCLIENTENCODING=UTF8 postgres psql -U lifemate -d lifemate
@@ -1312,9 +1505,20 @@ docker compose exec -e PGCLIENTENCODING=UTF8 postgres psql -U lifemate -d lifema
 **处理：** 始终使用 `curl.exe`，或用 `Invoke-RestMethod`：
 
 ```powershell
+# PowerShell 的单引号是字面量，JSON 里的双引号不需要反斜杠转义
 curl.exe -X POST http://127.0.0.1:8080/embed `
   -H "Content-Type: application/json" `
-  -d '{\"inputs\":\"测试\"}'
+  -d '{"inputs":"测试"}'
+```
+
+> 📌 写成 `-d '{\"inputs\":\"测试\"}'` 是错的：PowerShell 会把反斜杠原样传给 `curl.exe`，服务端收到的是非法 JSON。
+
+更稳的是用 `Invoke-RestMethod`（与 [§7.3](#73-生成一个向量并检查维度关键) 一致），完全绕开引号转义：
+
+```powershell
+$body = @{ inputs = "测试" } | ConvertTo-Json
+Invoke-RestMethod -Uri "http://127.0.0.1:8080/embed" `
+                  -Method Post -ContentType "application/json" -Body $body
 ```
 
 ## 10.9 Docker 磁盘占用过大
@@ -1336,6 +1540,115 @@ docker system df -v
 
 > ⚠️ `docker system prune --volumes` **会删除数据卷**，包含你的数据库。不要用它。
 
+## 10.10 `postgres` 容器起不来
+
+**症状：** `docker compose ps` 里 `postgres` 反复 `Restarting` / `Exited`，或 `docker compose up -d postgres` 直接报错退出。按下面三类原因逐条排查。
+
+### 10.10.1 数据卷挂载点写错（PostgreSQL 18 的目录变更）
+
+PostgreSQL 18 官方镜像把数据目录从 `/var/lib/postgresql/data` 改成了 **`/var/lib/postgresql`**。
+
+```text
+✅ 正确：命名卷挂到 /var/lib/postgresql
+❌ 错误：仍然挂到 /var/lib/postgresql/data
+```
+
+**后果有两种，都不好发现：**
+
+```text
+① 直接起不来 —— 挂载点与镜像预期的数据目录冲突，日志里出现 mount / initdb 相关报错
+② 能起来，但数据「神秘消失」—— 挂载点没用上，数据实际写进了容器内的匿名卷，
+   容器一被重建（up -d 后重建、rm 后重建）数据全丢
+```
+
+**处理：**
+
+```powershell
+# 确认 compose 里 postgres 的挂载点
+docker compose config | Select-String "lifemate-pgdata" -Context 2,2
+# 期望看到：source: lifemate-pgdata
+#           target: /var/lib/postgresql      ← 注意没有 /data
+```
+
+改对挂载点后重建（⚠️ 若之前的数据写在了匿名卷里，重建会丢数据，仅在无真实数据时执行）：
+
+```powershell
+docker compose stop postgres
+docker compose rm -f postgres
+docker compose up -d postgres
+docker compose logs --tail 50 postgres
+```
+
+### 10.10.2 `POSTGRES_PASSWORD` 为空 / 缺 `.env`
+
+镜像在首次初始化时**要求非空密码**，否则拒绝初始化：
+
+```text
+Error: Database is uninitialized and superuser password is not specified.
+       You must specify POSTGRES_PASSWORD to a non-empty value for the superuser.
+```
+
+**排查：**
+
+```powershell
+Test-Path .env                                   # 必须为 True，且与 docker-compose.yml 同目录
+docker compose config --environment | Select-String "POSTGRES"
+# POSTGRES_PASSWORD 必须是非空真实值
+```
+
+**处理：** 按 [§2.5](#25-创建-env本步骤需要你动手) 重建 `.env`（含 UTF-8 编码要求），注意 `POSTGRES_PASSWORD` 与 `DATABASE_URL` 里的密码必须一致。
+
+### 10.10.3 `docker: 'compose' is not a docker command`
+
+```text
+docker: 'compose' is not a docker command.
+```
+
+**原因：** 装的是 Compose V1（独立二进制 `docker-compose`），或 Docker CLI 里没有 Compose V2 插件。
+
+**处理：**
+
+```powershell
+# 本手册所有命令都要求 Compose V2（子命令形式 docker compose，中间是空格）
+docker compose version
+# 期望：Docker Compose version v2.x.y
+
+# 若只有旧的 V1，会看到：
+docker-compose version
+```
+
+升级 Docker Desktop 到最新版即可获得 V2 插件。**不要**把本手册里的 `docker compose` 替换成 `docker-compose` 来绕过——V1 已停止维护，且行为差异（如 `down` 的参数处理）会让后面的排查结论失真。
+
+## 10.11 改了 `POSTGRES_PASSWORD` 却连不上
+
+**症状：** 按 [§2.5](#25-创建-env本步骤需要你动手) 改了 `.env` 里的密码，重启容器后连接失败：
+
+```text
+FATAL:  password authentication failed for user "lifemate"
+```
+
+**原因：** `POSTGRES_PASSWORD` **只在数据卷为空、首次初始化时生效**。数据卷一旦存在，Postgres 的账号密码已经写在数据目录里了，后续再改 `.env` 不会再同步——环境变量被忽略，密码还是旧的那个。
+
+同样的道理，**改 `.env` 不会改数据库里的密码，删卷重建才会**（而那是不可接受的，会丢数据）。
+
+**处理：** 用 `ALTER USER` 在库内改密码，然后让 `.env` 跟上：
+
+```powershell
+# 用旧密码进入 psql
+docker compose exec postgres psql -U lifemate -d lifemate
+```
+
+```sql
+-- 改成本次设置的新密码（与 .env 中两处保持一致）
+ALTER USER lifemate WITH PASSWORD '<新密码>';
+-- 确认
+\du lifemate
+```
+
+> 🔴 **顺序很重要：** 先用**旧密码**进得去，再执行 `ALTER USER`；改完之后才把 `.env` 的 `POSTGRES_PASSWORD` 与 `DATABASE_URL` 一起更新为新密码，然后 `docker compose restart postgres`。
+>
+> 若旧密码已经忘了，唯一出路是 `docker compose down -v` 重建数据卷（会清空全部数据）——所以密码请务必记牢。
+
 ---
 
 # 11. 备份与恢复演练
@@ -1344,18 +1657,47 @@ docker system df -v
 
 ## 11.1 手动备份
 
+> 🔴 **不要用 PowerShell 的重定向（`>`）或管道把 `pg_dump -Fc` 的二进制结果导出容器。**
+>
+> ```text
+> ❌ docker compose exec -T postgres pg_dump ... -Fc > backups\x.dump
+>      → Windows PowerShell 5.1 会把管道/重定向内容按文本编码处理，
+>        结果是 0 字节或损坏的 dump（且不报错）
+> ❌ Get-Content x.dump -AsByteStream -Raw | docker compose exec -T ...
+>      → -AsByteStream 是 PowerShell 7 才有的参数；5.1 只有 -Encoding Byte
+>      → 能字节保真的原生重定向要 PowerShell ≥ 7.4 才具备
+> ✅ 正确做法：让 dump 落在容器内的文件里，再用 docker compose cp 取出来
+> ```
+>
+> 下面这套写法**与 PowerShell 版本无关**（5.1 / 7.x 都一样），是唯一推荐的流程。
+
 ```powershell
 cd D:\workspace\LifeMate
+
+# 0) 确保备份目录存在（backups\ 不入库，仓库里没有这个目录）
+New-Item -ItemType Directory -Force backups | Out-Null
+
 $date = Get-Date -Format "yyyyMMdd-HHmmss"
 
-docker compose exec -T postgres pg_dump -U lifemate -d lifemate -Fc `
-  > "backups/lifemate-$date.dump"
+# 1) 在容器内生成 dump（-T 禁用 TTY）
+docker compose exec -T postgres pg_dump -U lifemate -d lifemate -Fc -f /tmp/lifemate.dump
 
+# 2) 从容器拷到宿主机（docker cp 是字节保真的，不走 PowerShell 管道）
+docker compose cp postgres:/tmp/lifemate.dump "./backups/lifemate-$date.dump"
+
+# 3) 清理容器内临时文件
+docker compose exec -T postgres rm -f /tmp/lifemate.dump
+
+# 4) 确认文件真的写出来了，且不是 0 字节
 "已备份: backups/lifemate-$date.dump"
-Get-Item "backups/lifemate-$date.dump" | Select-Object Name, Length
+Get-Item "./backups/lifemate-$date.dump" | Select-Object Name, Length
 ```
 
+✅ 期望：`Length` **明显大于 0**（一个只有扩展、没有业务表的库也有几十 KB）。若 `Length` 为 0 或文件不存在，说明上面某一步失败了，**这份备份等于没有**，不要继续往下做。
+
 `-Fc` 是自定义格式，支持压缩和选择性恢复。
+
+> 💡 **本步骤要真的手动跑通一次**，并把 `Length` 记下来（[§12.6](#126-工程配套) 的检查项之一）。
 
 ## 11.2 恢复演练（每季度一次）
 
@@ -1364,40 +1706,91 @@ Get-Item "backups/lifemate-$date.dump" | Select-Object Name, Length
 ```powershell
 cd D:\workspace\LifeMate
 
+# 0) 确认 dump 文件在本地，且不是 0 字节
+Get-ChildItem backups\*.dump | Select-Object Name, Length
+
 # 1) 建一个演练库
 docker compose exec -T postgres psql -U lifemate -d postgres `
   -c "CREATE DATABASE lifemate_restore_test;"
 
-# 2) 恢复备份到演练库
-Get-Content "backups/lifemate-<你选的文件>.dump" -AsByteStream -Raw |
-  docker compose exec -T postgres pg_restore -U lifemate -d lifemate_restore_test --no-owner
+# 2) 把 dump 拷进容器（同样是字节保真，不经 PowerShell 管道）
+docker compose cp "./backups/lifemate-<你选的文件>.dump" postgres:/tmp/restore.dump
 
-# 3) 验证数据
+# 3) 先在容器内列出 dump 内容目录（不写库，最快的完整性自检）
+docker compose exec -T postgres pg_restore -l /tmp/restore.dump
+
+# 4) 恢复备份到演练库
+docker compose exec -T postgres pg_restore -U lifemate -d lifemate_restore_test `
+  --no-owner /tmp/restore.dump
+
+# 5) 验证：看演练库里实际有哪些表（注意：业务表要等 Phase 3 迁移后才有）
 docker compose exec -T postgres psql -U lifemate -d lifemate_restore_test `
-  -c "SELECT COUNT(*) FROM memories;"
+  -c "SELECT table_schema, table_name FROM information_schema.tables WHERE table_schema = 'public' ORDER BY table_name;"
 
-# 4) 清理演练库
+# 6) 清理容器内临时文件与演练库
+docker compose exec -T postgres rm -f /tmp/restore.dump
 docker compose exec -T postgres psql -U lifemate -d postgres `
   -c "DROP DATABASE lifemate_restore_test;"
 ```
 
-✅ 期望：第 3 步返回正确的记忆条数。
+✅ 期望：
+
+```text
+• 第 3 步 pg_restore -l 能列出 dump 目录（证明文件完整、格式可读）
+• 第 4 步 pg_restore 无 fatal 报错
+• 第 5 步返回的表清单与备份时一致
+```
+
+> 📌 **暂时不要验证 `SELECT COUNT(*) FROM memories;`——`memories` 表现在还不存在。** 仓库里还没有任何 Migration（见 [§9.3](#93-进入数据库)），此刻库中只有扩展和临时测试表。等 **Phase 3 的 Migration 执行完**之后，这一项才升级为「对 `memories` 做行数比对」：
+
+```sql
+-- Phase 3 迁移之后才有意义
+SELECT COUNT(*) FROM memories;
+```
 
 **记录演练耗时**：__________（这是真实的 RTO 参考值）。
 
 ## 11.3 自动备份（Windows 任务计划）
+
+> ⚠️ **本节是可选的，且未经验证。** 它是一份**起点草稿**，不是可以直接挂着无人值守运行的成品。启用前请先确认下列前提，并完成加密改造。
+>
+> **前提条件：**
+>
+> ```text
+> □ 使用 PowerShell 7 的 pwsh.exe —— 不是系统自带的 powershell.exe（5.1）
+> □ 注册任务需要「以管理员身份」运行（-RunLevel Highest 要求已提权）
+> □ 需要安装 7-Zip，并把 7z.exe 加进 PATH
+> □ 脚本首次运行前先手动跑一次，确认 dump 的 Length > 0
+> ```
+>
+> 🔴 **警告：下面的脚本会写出明文 dump，而本手册与《数据库设计 V1.1》§28 都要求备份必须加密后才能留存。**
+> **在把 7z 加密步骤合并进脚本、并确认加密产物可解密之前，不要让它无人值守跑。**
 
 ```powershell
 # 创建备份脚本 backups\backup.ps1
 @'
 $ErrorActionPreference = "Stop"
 Set-Location "D:\workspace\LifeMate"
+
+# $date 必须在本脚本内定义：任务计划启动的是新进程，
+# 不会继承你交互式会话里的变量
 $date = Get-Date -Format "yyyyMMdd-HHmmss"
-$out  = "backups\lifemate-$date.dump"
 
-docker compose exec -T postgres pg_dump -U lifemate -d lifemate -Fc > $out
+New-Item -ItemType Directory -Force backups | Out-Null
 
-# 删除 30 天前的备份
+# 与 §11.1 一致：dump 落在容器内，再 cp 出来（不要用 PowerShell 重定向）
+docker compose exec -T postgres pg_dump -U lifemate -d lifemate -Fc -f /tmp/lifemate.dump
+docker compose cp postgres:/tmp/lifemate.dump "backups/lifemate-$date.dump"
+docker compose exec -T postgres rm -f /tmp/lifemate.dump
+
+$out = "backups\lifemate-$date.dump"
+
+# ⚠️ TODO（启用前必须完成）：在这里插入 7z 加密步骤，并删除明文 dump：
+#   7z a -p"<密码>" -mhe=on "backups\lifemate-$date.7z" $out
+#   Remove-Item $out -Force
+# 在此之前，本脚本留存的是明文备份，不允许无人值守运行。
+
+# 删除 30 天前的备份（路径由脚本内的 $date 变量决定，不依赖外部会话）
 Get-ChildItem backups\*.dump |
   Where-Object { $_.LastWriteTime -lt (Get-Date).AddDays(-30) } |
   Remove-Item -Force
@@ -1416,9 +1809,12 @@ Register-ScheduledTask -TaskName "LifeMate-Backup" `
   -Action $action -Trigger $trigger -RunLevel Highest
 ```
 
-> ⚠️ **备份文件必须加密。** 它包含你全部的记忆内容（明文形式）。Windows 可用 BitLocker 加密整个 `D:\`，或用 7-Zip 加密后再存：
+> 📌 这里用 `pwsh.exe`（PowerShell 7）。若机器上只装了 Windows PowerShell 5.1，`New-ScheduledTaskAction` 会因找不到可执行文件而失败；改 `powershell.exe` 之前，先确认脚本里没有用到 7.x 专属语法。
+
+> ⚠️ **备份文件必须加密。** 它包含你全部的记忆内容（明文形式）。Windows 可用 BitLocker 加密整个 `D:\`，或用 7-Zip 加密后再存（下面的 `$date` 沿用本节的同一值；若在新会话里执行，请自行重新定义）：
 
 ```powershell
+$date = Get-Date -Format "yyyyMMdd-HHmmss"   # 与 §11.1 一致，独立会话里必须重新定义
 7z a -p"<密码>" -mhe=on "backups/lifemate-$date.7z" "backups/lifemate-$date.dump"
 Remove-Item "backups/lifemate-$date.dump"
 ```
@@ -1433,6 +1829,7 @@ Remove-Item "backups/lifemate-$date.dump"
 
 ```text
 □ docker version 成功
+□ docker compose version 显示 v2.x（Compose V2）
 □ Docker Desktop 使用 WSL2 后端
 □ wsl --version 成功
 □ nvidia-smi 在宿主机正常
@@ -1446,10 +1843,10 @@ Remove-Item "backups/lifemate-$date.dump"
 ```text
 □ docker compose up -d postgres 成功
 □ docker compose ps 显示 healthy
-□ SELECT extname FROM pg_extension 包含 vector 与 pg_trgm
-□ SHOW server_version 为 18.x
+□ SELECT extname FROM pg_extension 包含 vector、pg_trgm 与 btree_gist
+□ SHOW server_version 以 18. 开头
 □ SHOW TimeZone 为 Asia/Shanghai
-□ 中文插入与查询正常
+□ 中文能真的 INSERT 并原样回读（§4.4 的第 ② 步，不是只 SELECT 字面量）
 ```
 
 ## 12.3 pgvector
@@ -1469,8 +1866,8 @@ Remove-Item "backups/lifemate-$date.dump"
 □ /info 返回 model_id = BAAI/bge-m3
 □ 向量维度为 1024                                              ← 关键
 □ 相关文本相似度明显高于无关文本（差距 > 0.2）
-□ 单次推理延迟 < 50 ms（证明 GPU 生效）                        ← 关键
-□ nvidia-smi 显示显存占用约 3.2 GB
+□ 单次推理延迟 约 10～50 ms（丢弃首次预热后取平均，证明 GPU 生效）  ← 关键
+□ nvidia-smi 显示显存占用约 3.2 GB，且占用进程名为 text-embeddings-（不是 python）
 ```
 
 ## 12.5 端到端
@@ -1489,7 +1886,7 @@ Remove-Item "backups/lifemate-$date.dump"
 □ .env 未被 git 跟踪（git status 中不出现）
 □ .env.example 已创建并提交
 □ docker-compose.yml 端口绑定为 127.0.0.1
-□ 备份脚本就位，且手动跑通过一次
+□ 备份脚本就位，且手动跑通过一次：确认 dump 文件存在且 Length > 0（§11.1）
 □ 记录下 pgvector 版本、单次 embedding 延迟作为基线
 ```
 
@@ -1515,13 +1912,14 @@ git check-ignore -v .env
 | GPU 计算能力 | 8.9 (sm_89) | | 决定镜像标签 |
 | TEI 镜像标签 | 89-1.9 | | 与计算能力匹配 |
 | NVIDIA 驱动版本 | ≥ CUDA 12.2 兼容 | | |
-| pgvector 版本 | 0.8.x | | |
-| pg_trgm 版本 | 1.6 | | |
-| PostgreSQL 版本 | 18.x | | |
+| pgvector 版本 | 0.8.* | | 只核前缀 |
+| pg_trgm 版本 | 1.* | | 只核前缀 |
+| btree_gist 版本 | 1.* | | 只核前缀，EXCLUDE 约束依赖它 |
+| PostgreSQL 版本 | 18.* | | `SHOW server_version` 以 `18.` 开头 |
 | 数据库时区 | Asia/Shanghai | | |
 | Embedding 模型 | BAAI/bge-m3 | | |
 | **向量维度** | **1024** | | 不符则需修订数据库设计 |
-| Embedding 延迟 | < 50 ms | | 超过则 GPU 未生效 |
+| Embedding 延迟 | 约 10～50 ms | | GPU 口径；丢弃首次预热后取平均，明显更慢则 GPU 未生效 |
 | GPU 显存占用 | ~3.2 GB | | |
 | 相关文本相似度 | 明显更高 | | |
 | 无关文本相似度 | 明显更低 | | |
@@ -1536,7 +1934,7 @@ git check-ignore -v .env
 
 | 本手册步骤 | 对应设计决策 | 章节 |
 | ---- | ---- | ---- |
-| §2.6 创建 pg_trgm 扩展 | Keyword 通道用 pg_trgm 承担 | §17.4 |
+| §2.6 核对 pg_trgm 扩展（初始化脚本已存在，不新建） | Keyword 通道用 pg_trgm 承担 | §17.4 |
 | §5 验证 `VECTOR(1024)` | Q4：bge-m3，维度冻结 | §4.2 |
 | §5.5 验证 Seq Scan | V1.0 不建向量索引，精确检索 | §18.1 |
 | §7.3 验证 1024 维 | `memory_embeddings.embedding` 的维度 | §14.3 |
