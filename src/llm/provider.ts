@@ -24,8 +24,39 @@ export interface GenerateInput {
   tools?: LLMToolDefinition[];
   /** 覆盖默认模型（用于实验对比） */
   model?: string;
+  /**
+   * ⚠️ 采样温度。
+   *
+   * 【实测警告】DeepSeek 的**思考模式不支持 temperature**
+   * （官方文档：「思考模式不支持 temperature、presence_penalty、
+   *   frequency_penalty 参数。为了兼容已有软件，设置参数不会报错，
+   *   但也不会生效。」）。
+   *
+   * 由于思考模式默认开启（effort=high），默认情况下传这个参数是**无效**的。
+   * 若确实需要 temperature 生效，必须显式设置 thinking: { type: 'disabled' }。
+   */
   temperature?: number;
   maxOutputTokens?: number;
+  /**
+   * 思考模式控制（实测：2026-09-22，与官方文档一致）。
+   *
+   * - { type: 'enabled' }  默认行为，先输出思维链再回答
+   * - { type: 'disabled' } 直接回答，无 reasoning_content，reasoningTokens=0
+   *
+   * 何时该关：简单任务（如给标签分类、格式转换）不需要思考，
+   * 关闭可省 token、降延迟；复杂任务（抽取判定、冲突裁决）保留思考更准。
+   *
+   * ⚠️ 不要用 enable_thinking / chat_template_kwargs 等参数名 ——
+   *    实测这些会被静默忽略、思考照常发生（错误参数名不报错）。
+   */
+  thinking?: { type: 'enabled' | 'disabled' };
+  /**
+   * 思考强度。官方支持 'low' | 'high' | 'max'。
+   * 亦可用 'none' 关闭思考（等价于 thinking.type='disabled'）。
+   *
+   * 默认 effort 为 high，因此不设置时推理开销较大。
+   */
+  reasoningEffort?: 'none' | 'low' | 'high' | 'max';
   /** 中止信号。用户断开 SSE 时必须能中止上游请求，避免白花钱 */
   signal?: AbortSignal;
 }

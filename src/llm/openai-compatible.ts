@@ -235,7 +235,30 @@ export class OpenAICompatibleProvider implements LLMProvider {
       body.stream_options = { include_usage: true };
     }
 
-    if (input.temperature !== undefined) body.temperature = input.temperature;
+    // ---------- 思考模式（实测 2026-09-22，与官方文档一致）----------
+    const thinkingDisabled = input.thinking?.type === 'disabled' || input.reasoningEffort === 'none';
+
+    if (input.thinking) {
+      body.thinking = { type: input.thinking.type };
+    }
+    if (input.reasoningEffort) {
+      body.reasoning_effort = input.reasoningEffort;
+    }
+
+    // ---------- 采样参数 ----------
+    if (input.temperature !== undefined) {
+      if (!thinkingDisabled) {
+        // 官方文档：思考模式不支持 temperature，设置了不报错但也不生效。
+        // 静默无效比报错更危险 —— 调用方会以为自己的采样设置起了作用。
+        // 这里选择显式告警而不是抛错：temperature 无害，只是无效。
+        console.warn(
+          '[llm] temperature 在思考模式下不生效（DeepSeek 官方限制）。' +
+            '若需其生效，请设置 thinking: { type: "disabled" }。'
+        );
+      }
+      body.temperature = input.temperature;
+    }
+
     if (input.maxOutputTokens !== undefined) body.max_tokens = input.maxOutputTokens;
 
     if (input.tools?.length) {

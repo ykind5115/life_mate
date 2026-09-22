@@ -84,6 +84,41 @@ async function main(): Promise<void> {
   );
 
   results.push(
+    await check('思考模式可关闭（对比推理开销与延迟）', async () => {
+      const question: Parameters<typeof provider.generate>[0]['messages'] = [
+        { role: 'user', content: '把这句话分成词：今天天气很好' },
+      ];
+
+      const t0 = Date.now();
+      const withThinking = await provider.generate({
+        messages: question,
+        maxOutputTokens: 1024,
+      });
+      const msThinking = Date.now() - t0;
+
+      const t1 = Date.now();
+      const noThinking = await provider.generate({
+        messages: question,
+        maxOutputTokens: 1024,
+        thinking: { type: 'disabled' },
+      });
+      const msNoThinking = Date.now() - t1;
+
+      if (noThinking.usage.reasoningTokens !== 0) {
+        throw new Error(
+          `设置 thinking.type=disabled 后 reasoningTokens 应为 0，` +
+            `实际 ${noThinking.usage.reasoningTokens} —— 参数可能未生效`
+        );
+      }
+
+      return (
+        `思考开：推理 ${withThinking.usage.reasoningTokens} token / ${msThinking}ms  |  ` +
+        `思考关：推理 ${noThinking.usage.reasoningTokens} token / ${msNoThinking}ms`
+      );
+    })
+  );
+
+  results.push(
     await check('返回模型与请求一致（防止别名导致归属不准）', async () => {
       const r = await provider.generate({
         messages: [{ role: 'user', content: 'ok' }],
