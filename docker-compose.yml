@@ -40,20 +40,51 @@ services:
     image: ghcr.io/huggingface/text-embeddings-inference:89-1.9
     container_name: lifemate-embedding
     restart: unless-stopped
-    # bge-m3：XLM-RoBERTa 架构，1024 维，8192 上下文
-    # 需要国内镜像时在 environment 中加 HF_ENDPOINT: https://hf-mirror.com
-    command: ["--model-id", "BAAI/bge-m3", "--port", "80", "--max-client-batch-size", "32"]
+
+    # bge-m3：XLM-RoBERTa 架构，hidden_size=1024，8192 上下文
+    #
+    # 使用**宿主机已有的本地权重**，不从 HuggingFace 下载（见 .env 的 BGE_M3_MODEL_DIR）。
+    # 这样既省去 2.3 GB 下载，也让模型文件完全不出网、不受网络波动影响。
+    #
+    # --pooling cls 是必须显式指定的：
+    #   本地权重缺少 Sentence-Transformers 的 1_Pooling/config.json
+    #   （只有 config.json / model.safetensors / tokenizer.json / tokenizer_config.json），
+    #   TEI 无法从中推断池化方式，不指定会用到错误池化、向量质量下降。
+    #   bge-m3 官方使用 CLS pooling。
+    #
+    # --max-client-batch-size 32：V1.0 计划用 batch=1（见审计报告 F-12，
+    #   批量返回顺序未经验证），此处保留上限仅为不阻塞未来批量调用。
+    command:
+      - "--model-id"
+      - "/data/models/bge-m3"
+      - "--port"
+      - "80"
+      - "--pooling"
+      - "cls"
+      - "--max-client-batch-size"
+      - "32"
+
     ports:
       - "127.0.0.1:8080:80"
+
     volumes:
-      # 模型权重缓存（约 2.3 GB），避免每次重启重新下载
-      - lifemate-hf-cache:/data
+      # 本地模型目录挂载为只读：容器不需要写模型文件
+      # ⚠️ 路径由 .env 的 BGE_M3_MODEL_DIR 提供 —— 两台机器的仓库根目录不同
+      #    （家里 D:\workspace，公司 E:\workspace），因此不得硬编码（AGENTS.md §4.2）
+      - type: bind
+        source: ${BGE_M3_MODEL_DIR:?必须在 .env 中设置 BGE_M3_MODEL_DIR（见 .env.example）}
+        target: /data/models/bge-m3
+        read_only: true
+      # 仍需一个可写卷给 HF_HOME：TEI 会在此写少量缓存/配置
+      - lifemate-hf-cache:/data/hf
+
     environment:
-      HF_HOME: /data
+      HF_HOME: /data/hf
       TZ: Asia/Shanghai
       # 强制 FP16：bge-m3 显存占用约 3.2 GB，8G 卡余量充足
-      # 不设置时 TEI 可能用 FP32，显存翻倍
+      # 不设置时 TEI 可能用 FP32（本权重 config 里 dtype 就是 float32），显存翻倍
       DTYPE: float16
+
     deploy:
       resources:
         reservations:
