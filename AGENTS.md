@@ -159,24 +159,42 @@ Agent Tool      不直接操作数据库，与 API 共享 Application Service
 □ 涉及数据库的改动：docker compose up -d postgres 后真实执行过 SQL
 □ docker compose config 校验通过（改了 compose 时）
 □ 新增环境变量已进 .env.example
+□ **改了表结构或约束时：附录 A 的 DDL、§17 索引清单、`devops/postgres/init/*.sql` 是否同步**
+  （C31/C32 的教训：正文改了、附录与脚本没跟上，同一次提交里发作了两次）
+□ **改了字段语义时：全仓库搜一遍旧写法**（`grep` 旧字段名 / 旧枚举值 / 旧模型名），
+  确认 README、环境手册、示例代码、测试脚本都跟上了（C19/C27 的教训）
+□ 测试脚本是否**照文档写的流程**执行，而不是照"更简单的等价写法"（C30 的教训）
 □ git diff 逐个文件看过：没有调试代码、没有 .env、没有 dump/日志文件
 □ 提交信息符合 docs/07 的 type(scope): subject 格式，一次提交只做一件事
 ```
 
 ---
 
-## 6. 已知待修的设计问题（照 03 实现前先确认，不要照抄）
+## 6. 设计问题的状态（照 03 实现前先看这里）
 
-以下是 `docs/03-database-design.md` V1.1 中已发现、尚未修订的问题。实现到对应位置时**先提出问题**，按修正后的方案写，并在回报中说明：
+`docs/03-database-design.md` V1.1 的修订都登记在它的 §0.2 / §0.3（C1～C34）。**写 Schema 前以最新登记的编号为准**，不要照抄 `docs/06-design-review.md` 附录里的建议稿（那是评审当时的旧稿）。
 
-| 位置 | 问题 |
-| ---- | ---- |
-| §15.2 / §23.1 vs 附录 A | `memory_sources.event_id` / `goal_id` 文档承诺 `FK → events/goals ON DELETE SET NULL`，附录 A DDL 是裸 `UUID`；且 `memory_sources` 建表早于 `events`/`goals`，补 FK 必须用后置 `ALTER TABLE` |
-| §24.3 | 级联步骤③对"无剩余来源"的记忆只改 status、不删 `memory_sources` 行，步骤④删消息会被 `message_id ON DELETE RESTRICT` 阻塞 |
-| §13.3 / §24.4 | `superseded_by ON DELETE SET NULL` + `CHECK (status<>'superseded' OR superseded_by IS NOT NULL)` 组合使物理删除必然失败 |
-| §24.2 vs §10.2 / §12.2 | 要求 messages / summaries 软删除，但 `messages` 没有 `status`/`deleted_at`，`conversation_summaries.status` 也只有 active/stale |
-| §13.7 vs §13.11 | "真正冲突 → 标记待用户确认"与 `uq_memories_current_slot` 部分唯一索引冲突（同槽位不允许两条 active），且状态枚举里没有 `conflict` |
-| §4.2 / §14.2 | 声称 `(memory_id, model)` 多行支持未来换模型，但 `VECTOR(1024)` 写死列类型，非 1024 维模型无法入库 |
+**已修复（不必再踩，但改动时要保持）：**
+
+```text
+✅ C22  memory_sources 不再有 conversation_id（反查改 JOIN）
+✅ C23  superseded_by 无外键，物理删除可兑现
+✅ C24  删除 Goal 前先失效投影记忆、再清来源
+✅ C29  messages / 摘要为物理删除，只有会话是软删除
+✅ C30  §24.3 步骤③：无剩余来源的记忆也要删除来源行
+✅ C31  附录 A 补 event_id / goal_id 外键（后置 ALTER TABLE）
+✅ C32  附录 A 补 EXCLUDE 约束；btree_gist 已在初始化脚本中
+✅ C33  §19 约束清单与附录 A 逐列对齐
+```
+
+**仍未解决（实现到对应位置时先提出问题，不要自行发明方案）：**
+
+| 位置 | 问题 | 影响 |
+| ---- | ---- | ---- |
+| §13.7 vs §13.11 | "真正冲突 → 标记待用户确认"与 `uq_memories_current_slot` 部分唯一索引冲突（同槽位不允许两条 active），且状态枚举里没有 `conflict` | 冲突分支无法落库；需要产品决策：加 `conflict` 状态、还是把冲突记忆写进独立的待确认队列 |
+| §4.2 / §14.2 | 声称 `(memory_id, model)` 多行支持未来平滑换模型，但 `VECTOR(1024)` 写死列类型，非 1024 维模型无法入库 | 换模型时"双写 → 回填 → 切换"四步走目前不成立；需要先决定是否放宽该承诺 |
+| §19 vs 附录 A | `events.category`、`conversation_summaries.status` 有文档枚举但库层无 CHECK（其余约束已在 C33 对齐） | 约束未下沉，与 §19「约束下沉」的目标不一致；补 CHECK 前先确认枚举是否会扩展 |
+| §24.2 | 会话软删除时 `conversations.title` 仍是用户可见内容，未规定是否清空 | 隐私口径问题，需产品决策 |
 
 ---
 
