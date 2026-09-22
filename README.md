@@ -27,6 +27,9 @@ LifeMate/
 ├── devops/                      环境与运维配置
 │   └── postgres/init/           PostgreSQL 初始化脚本
 │
+├── audit/                       设计契约的实测复现与回归验证
+│   └── constraint-test.sql      约束交互测试（`sqlite3 :memory: ".read …"`）
+│
 ├── src/                         （预留）TypeScript 源码
 │   ├── agent/                   Agent Core
 │   ├── conversation/            会话
@@ -38,6 +41,7 @@ LifeMate/
 │   └── shared/                  共享工具
 │
 ├── docker-compose.yml           PostgreSQL + Embedding 服务
+├── AGENTS.md                    编码 Agent 工作规则（动手前先读）
 ├── .env.example                 环境变量模板（复制为 .env）
 ├── .gitmessage                  提交信息模板
 ├── .gitignore
@@ -95,9 +99,9 @@ docs/     文档 —— 与代码分离，便于交给别人看或整包导出
 
 ### 1. 本地环境
 
-```bash
-# 复制环境变量模板并设置密码
-cp .env.example .env
+```powershell
+# 复制环境变量模板并设置密码（Windows PowerShell）
+Copy-Item .env.example .env -Force
 
 # 启动数据库与 Embedding 服务
 docker compose up -d
@@ -136,9 +140,11 @@ docker compose ps
 配套要点：
 
 ```text
-• 向量索引    V1.0 不建 HNSW / IVFFlat，走精确检索（10 万条以内够用且召回率 100%）
+• 向量索引    V1.0 不建 HNSW / IVFFlat，走精确检索（5 万条以内够用且召回率 100%）
 • 关键词通道  使用 pg_trgm（中文场景下 PostgreSQL 默认全文检索不切词）
-• 抽取幂等    extraction_runs 表，幂等键 (conversation_id, end_sequence, extractor_version)
+• 抽取幂等    extraction_runs 表，幂等键 (conversation_id, start_sequence, extractor_version)
+              + EXCLUDE 排他约束保证「成功区间不重叠」（需 btree_gist）
+• 删除语义    会话软删除；messages / 摘要 / 派生记忆按 §24.3 真正清除
 • Timeline    不是独立表，而是 events 的查询视图
 ```
 
@@ -166,6 +172,22 @@ docker compose ps
 
 **下一步：** 进入 Phase 3，初始化工程骨架并编写 Drizzle Schema。
 
+> ℹ️ **关于阶段编号**：上表是**本项目当前采用**的编号（Phase 0～11）。
+> `docs/01-prd.md` §16 与 `docs/06-design-review.md` §6 使用的是更早的一版（Phase 0～8），
+> 两套编号的对应关系如下 —— 以本表为准，读到旧编号时按下表换算：
+>
+> ```text
+> 旧 0 产品设计      = 本表 0
+> 旧 1 技术架构      = 本表 1（本表 2「数据库设计」在旧版中并入此阶段）
+> 旧 2 工程基础      = 本表 3 + 4 + 5
+> 旧 3 Chat Agent    = 本表 6
+> 旧 4 Memory V1     = 本表 7
+> 旧 5 Memory 智能   = 本表 8
+> 旧 6 Timeline/Review = 本表 9
+> 旧 7 Web UI        = 本表 10
+> 旧 8 测试/Benchmark = 本表 11
+> ```
+
 ---
 
 ## 当前状态
@@ -174,8 +196,9 @@ docker compose ps
 | ---- | ---- |
 | 设计文档 | ✅ 完成（PRD / 架构 / 数据库 / 接口 四份基线） |
 | 设计评审 | ✅ 完成（39 项问题已给出方案，P0 阻塞项已解决） |
+| 设计契约审计 | ✅ 完成（13 项缺陷已修复；SQLite 回归通过，见 docs/08） |
 | 环境配置 | ✅ 完成（compose / 初始化脚本 / 模板文件） |
-| 容器环境 | ⬜ 待启动验证（见 docs/05） |
+| 容器环境 | ⬜ 待启动验证（见 docs/05；本机尚未安装 Docker） |
 | 应用代码 | ⬜ 未开始 |
 
 ---

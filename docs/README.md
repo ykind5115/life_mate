@@ -17,7 +17,7 @@
 | 05 | [05-environment-setup.md](./05-environment-setup.md) | 本地环境搭建操作手册 | V1.0 | 可用 |
 | 06 | [06-design-review.md](./06-design-review.md) | 设计评审与改进建议 | V1.0 | 待决策项已闭环 |
 | 07 | [07-git-conventions.md](./07-git-conventions.md) | Git 提交规范 | V1.0 | 生效 |
-| 08 | [08-contract-audit.md](./08-contract-audit.md) | 设计契约审计报告 | V1.0 | **4 处严重缺陷待修复** |
+| 08 | [08-contract-audit.md](./08-contract-audit.md) | 设计契约审计报告 | V1.0 | 已修复并回归（C29～C32 为二次复查） |
 
 **归档：**
 

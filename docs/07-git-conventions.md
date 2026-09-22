@@ -337,7 +337,7 @@ git log --oneline --grep "^fix"  v1.0.0..HEAD   # 修复清单
    同一次对话被重复抽取会产生重复记忆，
    直接导致 Memory Noise 指标失控。
 
-   以 (conversation_id, end_sequence, extractor_version)
+   以 (conversation_id, start_sequence, extractor_version)
    作为唯一约束：重复触发时插入冲突即跳过执行。
 ```
 
@@ -458,7 +458,7 @@ build: 新增本地容器环境（Postgres + pgvector + TEI）
   - docker-compose.yml：postgres 与 embedding 两个服务，
     端口只绑 127.0.0.1
   - devops/postgres/init/01-extensions.sql：安装
-    vector / pg_trgm / uuid-ossp
+    vector / pg_trgm / btree_gist
   - .env.example：环境变量模板
   - .gitignore：排除 .env 与备份文件
   - .gitattributes：统一 LF，避免 SQL 在容器内报错
