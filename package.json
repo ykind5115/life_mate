@@ -1,0 +1,31 @@
+{
+  "name": "lifemate",
+  "version": "0.1.0",
+  "private": true,
+  "description": "个人长期记忆型 AI Agent —— 以自然对话为入口，持续整理具有长期价值的信息",
+  "type": "module",
+  "engines": {
+    "node": ">=20"
+  },
+  "packageManager": "pnpm@11.7.0",
+  "scripts": {
+    "typecheck": "tsc --noEmit",
+    "db:generate": "drizzle-kit generate",
+    "db:migrate": "node --env-file=.env --import tsx src/database/migrate.ts",
+    "db:check": "node --env-file=.env --import tsx src/database/check-connection.ts",
+    "db:studio": "drizzle-kit studio"
+  },
+  "dependencies": {
+    "drizzle-orm": "^0.45.3",
+    "fastify": "^5.12.5",
+    "pg": "^8.23.0",
+    "zod": "^4.6.5"
+  },
+  "devDependencies": {
+    "@types/node": "^26.6.2",
+    "@types/pg": "^8.23.1",
+    "drizzle-kit": "^0.31.11",
+    "tsx": "^4.23.15",
+    "typescript": "^5.9.3"
+  }
+}

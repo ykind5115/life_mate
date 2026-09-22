@@ -1,0 +1,14 @@
+# pnpm 配置
+#
+# 说明：pnpm 11 起不再读取 package.json 的 "pnpm" 字段，
+#       相关设置迁移到本文件（见 https://pnpm.io/settings）。
+#
+# esbuild：
+#   pnpm 默认不执行依赖的安装脚本（供应链安全），因此需要显式放行。
+#
+#   实测（2026-09-22）：即使不放行，功能也不受影响 ——
+#   esbuild 的平台二进制来自 @esbuild/win32-x64 包（已正常安装），
+#   postinstall 只做校验与回退。tsx / drizzle-kit 均可正常运行。
+#   放行是为了消除每次 install 的 ERR_PNPM_IGNORED_BUILDS 噪音。
+allowBuilds:
+  esbuild: true
