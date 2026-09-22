@@ -17,6 +17,7 @@
 import type { GenerateInput, LLMProvider } from '../llm/provider.js';
 import { LLMError } from '../llm/provider.js';
 import type { LLMMessage, LLMTokenUsage, LLMToolCall } from '../llm/types.js';
+import { env } from '../shared/env.js';
 
 /** 循环上限。集中在这里，便于按实测调整（评审 P0-7 要求写进文档并集中配置） */
 export const AGENT_LIMITS = {
@@ -56,7 +57,18 @@ export interface RunAgentOptions {
   /** 工具是否只读。V1.0 应为 true（Q3：Agent 不持有写工具） */
   signal?: AbortSignal;
   model?: string;
+  /**
+   * 单次 LLM 调用的输出预算。
+   *
+   * 缺省取 env.LLM_MAX_OUTPUT_TOKENS（默认 4096）。
+   * ⚠️ 不要传太小的值：推理模型的思考与回答共享该预算，
+   *    实测推理开销可达回答的 3~4 倍，给太小会「思考完没预算回答」。
+   *    详见 src/shared/env.ts 的 LLM_MAX_OUTPUT_TOKENS 注释。
+   */
   maxOutputTokens?: number;
+  /** 思考模式。抽取/判定这类语义任务建议保持开启（缺省即开启） */
+  thinking?: { type: 'enabled' | 'disabled' };
+  reasoningEffort?: 'none' | 'low' | 'high' | 'max';
   /**
    * 覆盖默认上限，仅用于测试。
    * ⚠️ 不能用 Partial<typeof AGENT_LIMITS>：AGENT_LIMITS 用了 as const，
@@ -138,15 +150,10 @@ export async function runAgent(options: RunAgentOptions): Promise<RunAgentResult
     // ---------- 调用 LLM（带一次重试）----------
     let response;
     try {
-      response = await generateWithRetry(options.provider, {
-        messages,
-        ...(toolDefs.length > 0 ? { tools: toolDefs } : {}),
-        ...(options.model !== undefined ? { model: options.model } : {}),
-        ...(options.maxOutputTokens !== undefined
-          ? { maxOutputTokens: options.maxOutputTokens }
-          : {}),
-        ...(options.signal !== undefined ? { signal: options.signal } : {}),
-      });
+      response = await generateWithRetry(
+        options.provider,
+        buildLLMInput(options, messages, toolDefs)
+      );
     } catch (err) {
       const retryable = err instanceof LLMError && err.options.retryable;
       const message = err instanceof Error ? err.message : 'LLM 调用失败';
@@ -253,16 +260,13 @@ export async function runAgent(options: RunAgentOptions): Promise<RunAgentResult
       '不要再请求调用工具，并说明哪些信息可能不完整。）',
   });
 
-  const final = await options.provider.generate({
-    messages,
-    ...(options.maxOutputTokens !== undefined
-      ? { maxOutputTokens: options.maxOutputTokens }
-      : {}),
-    ...(options.signal !== undefined ? { signal: options.signal } : {}),
-  });
+  const final = await options.provider.generate(
+    buildLLMInput(options, messages, [], { noTools: true })
+  );
 
   usage.inputTokens += final.usage.inputTokens;
   usage.outputTokens += final.usage.outputTokens;
+  usage.reasoningTokens += final.usage.reasoningTokens;
 
   return {
     content: final.content,
@@ -272,6 +276,35 @@ export async function runAgent(options: RunAgentOptions): Promise<RunAgentResult
     toolCallsExecuted,
     model: final.model,
     finishReason: final.finishReason,
+  };
+}
+
+/**
+ * 构造给 Provider 的输入。
+ *
+ * 集中在一处的原因：循环内与收尾调用必须用**同样的**预算与思考设置，
+ * 否则收尾回答可能因预算不同而失败。此前两处各写一遍，容易漏改。
+ *
+ * ⚠️ maxOutputTokens 的缺省来源是 env.LLM_MAX_OUTPUT_TOKENS。
+ *    不能省略不传 —— 虽然服务端有默认值且看起来够用，
+ *    但那样预算就不受我们控制，成本上限与行为都变得不可预期。
+ */
+function buildLLMInput(
+  options: RunAgentOptions,
+  messages: LLMMessage[],
+  toolDefs: GenerateInput['tools'],
+  extra: { noTools?: boolean } = {}
+): GenerateInput {
+  return {
+    messages,
+    ...(!extra.noTools && toolDefs && toolDefs.length > 0 ? { tools: toolDefs } : {}),
+    ...(options.model !== undefined ? { model: options.model } : {}),
+    maxOutputTokens: options.maxOutputTokens ?? env.LLM_MAX_OUTPUT_TOKENS,
+    ...(options.thinking !== undefined ? { thinking: options.thinking } : {}),
+    ...(options.reasoningEffort !== undefined
+      ? { reasoningEffort: options.reasoningEffort }
+      : {}),
+    ...(options.signal !== undefined ? { signal: options.signal } : {}),
   };
 }
 

@@ -58,8 +58,32 @@ const envSchema = z.object({
   LLM_MODEL: z.string().default('deepseek-flash'),
   LLM_API_KEY: z.string().min(1, 'LLM_API_KEY 不能为空'),
   LLM_TIMEOUT_MS: z.coerce.number().int().positive().default(120_000),
-  /** 单轮对话输入 token 预算（docs/01 §12.4 的非功能目标） */
-  LLM_MAX_INPUT_TOKENS: z.coerce.number().int().positive().default(8_000),
+
+  /**
+   * 单次调用的**输出**预算（思考 + 回答合计）。
+   *
+   * ⚠️ 这是推理模型最容易被低估的参数。实测（2026-09-22，deepseek-flash）：
+   *     任务：从 1 数到 500
+   *       不传 max_tokens → 推理 3412 + 回答约 1000，finish=stop
+   *       max_tokens=256  → 推理吃掉全部 256，回答 0 字，finish=length
+   *       max_tokens=8192 → 正常完成
+   *
+   *   即**推理开销可达回答的 3~4 倍**，且思考与回答共享同一预算。
+   *   按「回答要多长」来设置必然不够 —— 必须留出推理余量。
+   *
+   *   默认 4096：够覆盖抽取出结构化 JSON 这类任务（含推理余量），
+   *   同时能挡住失控的长输出（避免单次调用耗费过多）。
+   */
+  LLM_MAX_OUTPUT_TOKENS: z.coerce.number().int().positive().default(4_096),
+
+  /**
+   * 推理预留比例。用于估算「实际能产出多长回答」：
+   *   可用回答预算 ≈ LLM_MAX_OUTPUT_TOKENS / (1 + REASONING_RESERVE_RATIO)
+   *
+   * 仅用于日志与告警估算，不参与请求下发 —— 服务端不提供
+   * 「只限制回答、不限制思考」的参数（实测确认），因此只能整体给预算。
+   */
+  LLM_REASONING_RESERVE_RATIO: z.coerce.number().min(0).max(10).default(3),
 
   // ---------- 日志 ----------
   // docs/03 §29.1：日志禁止记录消息正文与记忆内容
