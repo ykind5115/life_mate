@@ -742,41 +742,96 @@ cd D:\workspace\LifeMate
 docker compose up -d embedding
 ```
 
-> ⚠️ **首次启动会下载约 2.3 GB 模型权重**，取决于网速需要几分钟到几十分钟。
+> ✅ **不需要下载模型。** 当前 `docker-compose.yml` 使用的是**宿主机上已有的
+> bge-m3 权重**（bind mount），不走 HuggingFace 下载。见下方说明。
 
 **本次启动使用的关键配置（已在 `docker-compose.yml` 中设定）：**
 
 ```text
 镜像           ghcr.io/huggingface/text-embeddings-inference:89-1.9
                └─ 89 = Ada Lovelace（你的 4070，sm_89）。用错标签会启动失败
-模型           BAAI/bge-m3
+               └─ 镜像约 8.16 GB，ghcr.io 拉取可能较慢
+模型           /data/models/bge-m3   ← 容器内路径，由 bind mount 提供
+               └─ 宿主机实际路径来自 .env 的 BGE_M3_MODEL_DIR
+pooling        cls          → 必须显式指定，见下方说明
 DTYPE          float16      → 显存约 3.2 GB
 max-client-batch-size  32
 端口           127.0.0.1:8080 → 容器内 80
 ```
 
-> 💡 `DTYPE: float16` 是刻意设置的。不指定时 TEI 可能以 FP32 加载，显存翻倍到约 6.4 GB，在 8G 卡上会给后续的 reranker 留不下空间。
+### 6.1.1 为什么用本地权重而不是让 TEI 下载
+
+```text
+① 省掉 2.3 GB 下载，且不受网络波动影响
+   （实测：ghcr.io 镜像拉取多次 TLS 超时，容器内下载模型同样可能失败）
+② 模型文件完全不出网，契合「数据默认私有」的隐私要求（docs/03 §29）
+③ 权重目录已存在于本机：D:\workspace\RAG_system\rag_qa\models\bge-m3
+```
+
+**模型目录的内容要求**（约 2.13 GB）：
+
+```text
+config.json              架构 xlm-roberta，hidden_size=1024，max_position_embeddings=8194
+model.safetensors        权重，约 2.27 GB
+tokenizer.json
+tokenizer_config.json
+```
+
+### 6.1.2 `--pooling cls` 为什么必须显式指定
+
+上面那份权重**缺少 Sentence-Transformers 的 `1_Pooling/config.json`**（没有 `modules.json`）。
+TEI 启动时会警告：
+
+```text
+WARN Could not find a Sentence Transformers config
+```
+
+没有该文件时 TEI 无法推断池化方式，**不指定会用到错误池化、导致向量质量下降**。
+bge-m3 官方使用 CLS pooling，因此在 `command` 中显式加了 `--pooling cls`。
+
+> ⚠️ 若今后换成从 HuggingFace 完整下载的权重（含 `1_Pooling`），
+> 该参数可以去掉，但留着也无害（显式指定优先于推断）。
+
+> 💡 `DTYPE: float16` 也是刻意设置的。不指定时 TEI 可能以 FP32 加载
+> （该权重的 `config.json` 里 `dtype` 就是 `float32`），显存翻倍到约 6.4 GB，
+> 在 8G 卡上会给后续的 reranker 留不下空间。
 
 
-## 6.2 观察下载与加载日志
+## 6.2 观察加载日志
 
 ```powershell
 docker compose logs -f embedding
 ```
 
-✅ 期望依次看到：
+✅ 期望依次看到（本机实测输出，已省略时间戳）：
 
 ```text
-Downloading model.safetensors ...
-...
-Starting model server at 0.0.0.0:80
+Args { model_id: "/data/models/bge-m3", ... dtype: Some(Float16), ... pooling: Some(Cls), ... }
+WARN Could not find a Sentence Transformers config        ← 预期内，见 §6.1.2
+INFO Maximum number of tokens per request: 8192
+INFO Starting model backend
+INFO Starting FlashBert model on Cuda(CudaDevice(DeviceId(1)))   ← GPU 生效
+INFO Warming up model
+INFO Starting HTTP server: 0.0.0.0:80
+INFO Ready
 ```
 
-以及类似：
+**关键三行，对应三项配置：**
 
 ```text
-Ready
+dtype: Some(Float16)                    ← DTYPE 生效
+pooling: Some(Cls)                      ← --pooling cls 生效
+Starting FlashBert model on Cuda(...)   ← GPU 生效
 ```
+
+> ⚠️ 那条 `Could not find a Sentence Transformers config` 的 WARN
+> **是预期内的**，不是错误 —— 本地权重缺少 `1_Pooling/config.json`，
+> 已用 `--pooling cls` 显式补偿。详见 §6.1.2。
+>
+> 若看到 `Downloading model.safetensors`，说明 bind mount 没生效、
+> TEI 回退到了联网下载，检查 `.env` 的 `BGE_M3_MODEL_DIR`。
+
+从启动到 `Ready` 约 **35 秒**（含模型加载与 warmup），比联网下载快得多。
 
 看到 `Ready` 后 Ctrl+C 退出日志跟踪。
 
