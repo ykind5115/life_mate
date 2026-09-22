@@ -19,6 +19,12 @@ BEGIN;
 
 INSERT INTO users (id, name) VALUES ('00000000-0000-0000-0000-000000000001', 'test');
 
+-- 前置数据：T8/T9 的 extraction_runs 与 summaries 都引用会话，
+-- 缺了它失败原因会变成外键违约而非预期的 CHECK 违约，
+-- 导致事务 abort、后续用例全部失效（测试就没证明力了）。
+INSERT INTO conversations (id, user_id, title) VALUES
+  ('00000000-0000-0000-0000-000000000002', '00000000-0000-0000-0000-000000000001', 'test conv');
+
 \echo ''
 \echo '=== T1 partial unique index: one active per slot ==='
 SAVEPOINT s1;
@@ -160,10 +166,103 @@ VALUES ('00000000-0000-0000-0000-000000000002', 10, 5, 'v1');
 ROLLBACK TO SAVEPOINT s18;
 
 \echo ''
+\echo '=== T9 EXCLUDE: successful extraction ranges must not overlap (C20/C32) ==='
+SAVEPOINT s19;
+INSERT INTO extraction_runs (conversation_id, start_sequence, end_sequence, extractor_version, status)
+VALUES ('00000000-0000-0000-0000-000000000002', 1, 5, 'v1', 'succeeded');
+\echo 'T9a [1,5] succeeded -> expect success'
+RELEASE SAVEPOINT s19;
+
+SAVEPOINT s20;
+INSERT INTO extraction_runs (conversation_id, start_sequence, end_sequence, extractor_version, status)
+VALUES ('00000000-0000-0000-0000-000000000002', 1, 10, 'v1', 'succeeded');
+\echo 'T9b [1,10] same start -> expect ERROR uq_extraction_idempotency'
+ROLLBACK TO SAVEPOINT s20;
+
+SAVEPOINT s21;
+INSERT INTO extraction_runs (conversation_id, start_sequence, end_sequence, extractor_version, status)
+VALUES ('00000000-0000-0000-0000-000000000002', 3, 10, 'v1', 'succeeded');
+\echo 'T9c [3,10] different start but overlaps -> expect ERROR excl_extraction_range'
+ROLLBACK TO SAVEPOINT s21;
+
+SAVEPOINT s22;
+INSERT INTO extraction_runs (conversation_id, start_sequence, end_sequence, extractor_version, status)
+VALUES ('00000000-0000-0000-0000-000000000002', 6, 10, 'v1', 'succeeded');
+\echo 'T9d [6,10] no overlap -> expect success'
+RELEASE SAVEPOINT s22;
+
+SAVEPOINT s23;
+INSERT INTO extraction_runs (conversation_id, start_sequence, end_sequence, extractor_version, status)
+VALUES ('00000000-0000-0000-0000-000000000002', 7, 20, 'v1', 'failed');
+\echo 'T9e [7,20] failed overlapping -> expect success (WHERE excludes non-succeeded)'
+RELEASE SAVEPOINT s23;
+
+\echo 'T9f resulting ranges:'
+SELECT start_sequence, end_sequence, status FROM extraction_runs
+ WHERE conversation_id='00000000-0000-0000-0000-000000000002'
+ ORDER BY start_sequence;
+
+\echo ''
+\echo '=== T10 deferred FKs on memory_sources (C31) ==='
+SAVEPOINT s25;
+INSERT INTO events (id, user_id, title, event_time) VALUES
+  ('00000000-0000-0000-0000-0000000000e1','00000000-0000-0000-0000-000000000001','evt', now());
+INSERT INTO goals (id, user_id, title) VALUES
+  ('00000000-0000-0000-0000-0000000000a1','00000000-0000-0000-0000-000000000001','goal');
+\echo 'T10a insert event + goal -> expect success'
+
+INSERT INTO memory_sources (memory_id, source_type, event_id)
+SELECT id, 'event_derived', '00000000-0000-0000-0000-0000000000e1'
+  FROM memories WHERE predicate_key='residence.city' LIMIT 1;
+\echo 'T10b event_derived source with event_id -> expect success'
+
+INSERT INTO memory_sources (memory_id, source_type, goal_id)
+SELECT id, 'goal_projection', '00000000-0000-0000-0000-0000000000a1'
+  FROM memories WHERE predicate_key='residence.city' LIMIT 1;
+\echo 'T10c goal_projection source with goal_id -> expect success'
+
+\echo 'T10d event_id pointing to non-existent event -> expect ERROR fk_memory_sources_event'
+SAVEPOINT s26;
+INSERT INTO memory_sources (memory_id, source_type, event_id)
+SELECT id, 'event_derived', '00000000-0000-0000-0000-00000000dead'
+  FROM memories WHERE predicate_key IS NULL LIMIT 1;
+ROLLBACK TO SAVEPOINT s26;
+
+\echo 'T10e C24 flow: delete goal AFTER clearing sources -> expect success'
+DELETE FROM memory_sources WHERE goal_id='00000000-0000-0000-0000-0000000000a1';
+DELETE FROM goals WHERE id='00000000-0000-0000-0000-0000000000a1';
+SELECT count(*) AS goals_left FROM goals;
+RELEASE SAVEPOINT s25;
+
+\echo ''
+\echo '=== T11 events category check (C37) ==='
+SAVEPOINT s27;
+INSERT INTO events (user_id, title, event_time, category) VALUES
+  ('00000000-0000-0000-0000-000000000001','ok', now(), 'other');
+\echo 'T11a category=other -> expect success'
+RELEASE SAVEPOINT s27;
+
+SAVEPOINT s28;
+INSERT INTO events (user_id, title, event_time, category) VALUES
+  ('00000000-0000-0000-0000-000000000001','bad', now(), 'random_stuff');
+\echo 'T11b category=random_stuff -> expect ERROR chk_events_category'
+ROLLBACK TO SAVEPOINT s28;
+
+\echo ''
+\echo '=== T12 goals time order check (C26) ==='
+SAVEPOINT s29;
+INSERT INTO goals (user_id, title, started_at, target_at) VALUES
+  ('00000000-0000-0000-0000-000000000001','bad order', now(), now() - interval '10 days');
+\echo 'T12a target_at before started_at -> expect ERROR chk_goals_time_order'
+ROLLBACK TO SAVEPOINT s29;
+
+\echo ''
 \echo '=== FINAL STATE (inside transaction) ==='
 SELECT status, count(*) AS n FROM memories GROUP BY status ORDER BY status;
 SELECT count(*) AS embeddings FROM memory_embeddings;
 SELECT source_type, count(*) AS n FROM memory_sources GROUP BY source_type ORDER BY source_type;
+SELECT count(*) AS extraction_runs FROM extraction_runs;
+SELECT count(*) AS events FROM events;
 
 ROLLBACK;
 

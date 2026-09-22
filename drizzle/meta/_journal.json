@@ -15,6 +15,20 @@
       "when": 1790078820893,
       "tag": "0001_glamorous_skaar",
       "breakpoints": true
+    },
+    {
+      "idx": 2,
+      "version": "7",
+      "when": 1790079013830,
+      "tag": "0002_narrow_guardian",
+      "breakpoints": true
+    },
+    {
+      "idx": 3,
+      "version": "7",
+      "when": 1790079021081,
+      "tag": "0003_exclude_constraint_and_deferred_fks",
+      "breakpoints": true
     }
   ]
 }
