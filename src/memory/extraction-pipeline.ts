@@ -41,7 +41,11 @@ import { embed, buildEmbeddedText, embeddingModelId, embeddingDimensions } from 
 import type { LLMProvider } from '../llm/provider.js';
 import { buildExtractionMessages } from './extraction-prompt.js';
 import { LlmSlotAdjudicator } from './slot-adjudicator.js';
-import { normalizeCandidate, parseExtractionResult } from './extraction-schema.js';
+import {
+  normalizeCandidate,
+  parseExtractionResultWithDiagnostics,
+  type ExtractionDiagnostics,
+} from './extraction-schema.js';
 import {
   processCandidate,
   type CandidateOutcome,
@@ -96,7 +100,16 @@ export interface ExtractionSummary {
   skippedReason?: 'already_succeeded' | 'in_progress' | 'duplicate' | 'no_new_messages';
   runId?: string;
   coveredRange?: { from: number; to: number };
+  /** 模型声称抽出的条数（未经校验） */
   candidatesFound: number;
+  /**
+   * 抽取诊断：哪些条目被丢弃、哪些字段被降级、槽位命中率。
+   *
+   * ⚠️ 这不是调试信息，而是质量指标：
+   *    槽位命中率下降意味着结构化抽取在退化（提示词或词表需调整），
+   *    被丢弃条目增多意味着模型输出偏离契约。两者都该被监控。
+   */
+  diagnostics: ExtractionDiagnostics;
   outcomes: {
     created: number;
     merged: number;
@@ -216,7 +229,10 @@ export async function runExtraction(
       ...(params.thinking !== undefined ? { thinking: params.thinking } : {}),
     });
 
-    const extraction = parseExtractionResult(res.content);
+// 用带诊断的解析：丢弃与降级的事实必须被记录，
+// 否则槽位命中率下降这类质量退化会静默发生（见 extraction-schema 的分级策略）
+const parsed = parseExtractionResultWithDiagnostics(res.content);
+const extraction = parsed.result;
     const candidates = extraction.memories.map(normalizeCandidate);
 
     // ---------- ⑤ 逐条判定并落库（事务 A：每条一个事务）----------
@@ -247,7 +263,8 @@ export async function runExtraction(
       executed: true,
       runId,
       coveredRange: { from: startSequence, to: endSequence },
-      candidatesFound: candidates.length,
+      candidatesFound: parsed.diagnostics.rawCount,
+      diagnostics: parsed.diagnostics,
       outcomes: {
         created: outcomes.filter((o) => o.kind === 'created').length,
         merged: outcomes.filter((o) => o.kind === 'merged').length,
@@ -288,6 +305,13 @@ function emptySummary(
     executed,
     ...(skippedReason !== undefined ? { skippedReason } : {}),
     candidatesFound: 0,
+    diagnostics: {
+      rawCount: 0,
+      validCount: 0,
+      dropped: [],
+      degradations: [],
+      slotCoverage: { withSlot: 0, total: 0 },
+    },
     outcomes: { created: 0, merged: 0, superseded: 0, conflict: 0 },
     adjudicationCalls: 0,
     embeddings: { succeeded: 0, failed: 0 },

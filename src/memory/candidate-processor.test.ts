@@ -428,24 +428,37 @@ test('parseExtractionResult 容忍顶层直接是数组', () => {
 test('parseExtractionResult 对非法 JSON 抛错，而不是返回空结果', () => {
   // 这个行为很关键：返回空结果会被上层当成「这段对话没有值得记的内容」，
   // 从而静默丢失记忆 —— 抽取流水线最危险的失败模式
-  assert.throws(() => parseExtractionResult('这不是 JSON'), /不是合法 JSON/);
+  assert.throws(() => parseExtractionResult('这不是 JSON'), /合法 JSON/);
 });
 
-test('parseExtractionResult 对枚举外的 type 抛错', () => {
-  assert.throws(
-    () => parseExtractionResult('{"memories":[{"type":"unknown_type","content":"x"}]}'),
-    /不符合契约/
+/**
+ * ⚠️ 下面两个用例原本断言「非法值 → 抛错」。
+ *    分级策略修订后行为变了：**条目级/字段级问题不再抛错**。
+ *    原因见 extraction-schema.ts 文件头 —— 整批抛错会把同批里
+ *    完全合格的记忆一起丢掉（实测踩到过）。
+ *
+ *    这两个用例改为断言新的分级行为，避免它们成为"锁住旧设计"的阻力。
+ */
+test('枚举外的 type → 丢弃该条（条目级），不抛错', () => {
+  const r = parseExtractionResult(
+    '{"memories":[{"type":"unknown_type","content":"x"},{"type":"fact","content":"合格的一条"}]}'
   );
+  assert.equal(r.memories.length, 1, '不合格条目被丢弃，合格条目保留');
+  assert.equal(r.memories[0]?.content, '合格的一条');
 });
 
-test('parseExtractionResult 拒绝受控词表外的 predicateKey', () => {
-  // 词表外的槽位会污染冲突判定，必须在契约层就拒绝
-  assert.throws(
-    () =>
-      parseExtractionResult(
-        '{"memories":[{"type":"fact","content":"x","predicateKey":"made.up.slot","objectValue":"y"}]}'
-      ),
-    /不符合契约/
+test('受控词表外的 predicateKey → 降级为无槽位（字段级），不丢条目也不抛错', () => {
+  const r = parseExtractionResult(
+    '{"memories":[{"type":"fact","content":"有价值的内容","predicateKey":"made.up.slot","objectValue":"y"}]}'
+  );
+
+  // 关键：内容被保留。词表外槽位按 §13.7 只是「不参与冲突判定」，
+  // 不该连带丢掉整条记忆。
+  assert.equal(r.memories.length, 1, '内容有价值，不该因槽位非法而丢条');
+  assert.equal(r.memories[0]?.content, '有价值的内容');
+  assert.ok(
+    r.memories[0]?.predicateKey == null,
+    '槽位被降级 —— 从而不会污染冲突判定（这正是原先要防的事）'
   );
 });
 

@@ -59,11 +59,16 @@ interface ExtractionView {
     slot: string | null;
     value: string | null;
   }[];
-  inputTokens: number;
-  outputTokens: number;
-  reasoningTokens: number;
   wallMs: number;
   adjudicationCalls: number;
+  /** 契约诊断：降级与丢弃的事实。不展示它，分级策略就等于没做 */
+  diagnostics: {
+    rawCount: number;
+    validCount: number;
+    dropped: { index: number; reason: string; rawPreview: string }[];
+    degradations: { index: number; field: string; original: string; action: string }[];
+    slotCoverage: { withSlot: number; total: number };
+  };
 }
 
 async function cleanup(): Promise<void> {
@@ -128,13 +133,9 @@ async function extractOnce(
       slot: r.predicateKey,
       value: r.objectValue,
     })),
-    // 抽取阶段的用量无法从 runExtraction 直接拿到，改用汇总口径：
-    // 这里只报告 token 总数（含判定调用），足以对比量级
-    inputTokens: 0,
-    outputTokens: 0,
-    reasoningTokens: 0,
     wallMs,
     adjudicationCalls: summary.adjudicationCalls,
+    diagnostics: summary.diagnostics,
   };
 }
 
@@ -142,6 +143,35 @@ function printView(v: ExtractionView): void {
   console.log(`\n${'─'.repeat(72)}`);
   console.log(`【${v.label}】`);
   console.log(`  耗时 ${String(v.wallMs)} ms   判定调用 ${String(v.adjudicationCalls)} 次`);
+
+  const d = v.diagnostics;
+  const coverage =
+    d.slotCoverage.total > 0
+      ? `${String(Math.round((d.slotCoverage.withSlot / d.slotCoverage.total) * 100))}%`
+      : 'n/a';
+  console.log(
+    `  契约：模型给出 ${String(d.rawCount)} 条 → 有效 ${String(d.validCount)} 条` +
+      `   槽位命中率 ${coverage}`
+  );
+
+  // 降级与丢弃必须被展示 —— 分级策略的价值就在于「不静默」
+  if (d.dropped.length > 0) {
+    console.log(`  ⚠️ 丢弃 ${String(d.dropped.length)} 条（条目级）：`);
+    for (const x of d.dropped) {
+      console.log(`      [${String(x.index)}] ${x.reason}`);
+      console.log(`          ${x.rawPreview}`);
+    }
+  }
+  if (d.degradations.length > 0) {
+    console.log(`  ⚠️ 降级 ${String(d.degradations.length)} 处（字段级，内容已保留）：`);
+    for (const x of d.degradations) {
+      console.log(`      [${String(x.index)}] ${x.field}: ${x.original} → ${x.action}`);
+    }
+  }
+  if (d.dropped.length === 0 && d.degradations.length === 0) {
+    console.log('  ✅ 无丢弃、无降级（模型输出完全符合契约）');
+  }
+
   console.log(`  抽出 ${String(v.memories.length)} 条记忆：`);
 
   for (const m of v.memories) {
