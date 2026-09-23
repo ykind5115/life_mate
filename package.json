@@ -9,6 +9,8 @@
   },
   "packageManager": "pnpm@11.7.0",
   "scripts": {
+    "dev": "node --env-file=.env --watch --import tsx src/api/main.ts",
+    "start": "node --env-file=.env --import tsx src/api/main.ts",
     "typecheck": "tsc --noEmit",
     "test": "node --env-file=.env --import tsx --test \"src/**/*.test.ts\"",
     "db:generate": "drizzle-kit generate",

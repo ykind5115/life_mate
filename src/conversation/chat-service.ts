@@ -1,0 +1,357 @@
+/**
+ * ChatService —— 一次聊天的编排（docs/02 §28、docs/04 §10）
+ *
+ * 流程（严格按文档顺序）：
+ *   ① 校验入参（Zod，在 Controller 做）
+ *   ② 解析或创建会话
+ *   ③ 保存 user message
+ *   ④ 组装上下文（Context Builder）
+ *   ⑤ 运行 Agent
+ *   ⑥ 保存 assistant message
+ *   ⑦ 返回结果
+ *   ⑧ **响应之后**触发记忆抽取（异步、不阻塞、失败不影响聊天 —— 接口 §45）
+ *
+ * 【事务边界】
+ *   保存 user message 与保存 assistant message 是**两个独立事务**，不是一个。
+ *   理由：中间夹着一次可能耗时数十秒的 LLM 调用。
+ *   把它们放进同一个事务会让数据库连接在整个推理期间被占用（§25.2 的同类问题），
+ *   而且一旦 LLM 失败，用户刚说的话也会被回滚 —— 那句话已经真实发生过，
+ *   不应该因为助手没答上来就消失。
+ *
+ * 【为什么抽取是 fire-and-forget】
+ *   接口 §45 明确规定：Memory Extraction 失败不能导致聊天失败。
+ *   因此这里不 await 它的结果，只记录日志（不含正文，§29.1）。
+ *   ⚠️ 进程内触发意味着进程重启会丢掉排队中的抽取。
+ *      未做持久化队列是 V1.0 的既定取舍（不引入 Redis / MQ，AGENTS.md §2），
+ *      但抽取本身是幂等的（extraction_runs 的 idempotency key），
+ *      因此「补跑」是安全的：下次该会话有新消息时会一并覆盖。
+ */
+import type { LLMProvider } from '../llm/provider.js';
+import { LLMError } from '../llm/provider.js';
+import type { ToolDefinition } from '../agent/loop.js';
+import { runAgent } from '../agent/loop.js';
+import { db } from '../database/client.js';
+import {
+  appendMessage,
+  createConversation,
+  findAliveConversationById,
+  findConversationById,
+  findRecentMessages,
+  getOrCreateDefaultUser,
+  touchConversation,
+  type Message,
+} from '../database/repository/index.js';
+import {
+  buildChatContext,
+  DEFAULT_RECENT_MESSAGE_LIMIT,
+  type ContextMemory,
+  type MemoryRetrieval,
+} from './context-builder.js';
+import type { ExtractionTrigger } from './extraction-trigger.js';
+
+/** 从历史消息中排除的角色：system / tool 不属于「短期对话上下文」 */
+const CONTEXT_ROLES = new Set(['user', 'assistant']);
+
+export interface ChatParams {
+  /** 为 null / undefined 时新建会话 */
+  conversationId?: string | null;
+  message: string;
+  /** 请求级取消信号。客户端断开时应中止 LLM 调用，避免继续烧 token */
+  signal?: AbortSignal;
+}
+
+export interface ChatResult {
+  conversation: {
+    id: string;
+    /** 本次是否新建了会话 */
+    created: boolean;
+    title: string | null;
+  };
+  userMessage: {
+    id: string;
+    content: string;
+    sequence: number;
+    createdAt: Date;
+  };
+  assistantMessage: {
+    id: string;
+    content: string;
+    sequence: number;
+    createdAt: Date;
+  };
+  /** Agent 执行的可观测信息。不含正文 */
+  meta: {
+    iterations: number;
+    toolCallsExecuted: number;
+    model: string;
+    finishReason: string;
+    truncatedBy?: 'max_iterations' | 'max_tool_calls' | 'timeout';
+    usage: { inputTokens: number; outputTokens: number; reasoningTokens: number };
+    context: {
+      historyCount: number;
+      injectedMemoryCount: number;
+      approxTokens: number;
+    };
+  };
+}
+
+export interface ChatServiceDeps {
+  /** 覆盖 LLM Provider（测试注入用） */
+  provider?: LLMProvider;
+  /**
+   * 记忆检索。
+   *
+   * ⚠️ 检索模块尚未实现，因此缺省不检索（retrieval.performed=false）。
+   *    这里保留注入点而不是留 TODO 注释：
+   *    没有这个参数，Context Builder 的记忆注入分支就无法被测试覆盖，
+   *    等检索实现后接上来也只是换个实现，不用改 ChatService。
+   */
+  retrieveMemories?: (params: {
+    userId: string;
+    query: string;
+  }) => Promise<ContextMemory[]>;
+  /** Agent 可用的工具。V1.0 应为只读工具（Q3） */
+  tools?: ToolDefinition[];
+  /** 抽取触发器。不传则不触发抽取（测试用） */
+  extractionTrigger?: ExtractionTrigger;
+  /**
+   * 逐 token 回调，透传给 Agent Loop。
+   * 传了它就走流式（provider.stream）。
+   */
+  onToken?: (token: string, turn: number) => void;
+  /** 注入的记忆条数上限，透传 Context Builder */
+  injectLimit?: number;
+  /** 近期消息条数上限。缺省 20（docs/02 §23） */
+  recentMessageLimit?: number;
+}
+
+/**
+ * 执行一次聊天。
+ *
+ * @throws LLMError    LLM 调用失败（Controller 应映射为 502 LLM_ERROR）
+ * @throws Error       会话不存在等业务错误（Controller 应映射为 404/409）
+ */
+export async function chat(
+  params: ChatParams,
+  deps: ChatServiceDeps = {}
+): Promise<ChatResult> {
+  const provider = deps.provider ?? (await defaultProvider());
+
+  // ---------- ② 解析会话 ----------
+  const user = await getOrCreateDefaultUser();
+
+  /**
+   * ⚠️ 新会话在这里**只是拿一个 id，并不落库**。
+   *
+   * 为什么：本次对话可能因为 LLM 失败而根本没有结果。
+   * 若先落库，一次失败的请求就会在会话列表里留下一个空会话
+   * （实测复现：连续几次 LLM 失败后列表里多出一串点进去什么都没有的会话）。
+   * 「先建后删」的写法还要处理删除失败，不如根本不建。
+   *
+   * 会话在步骤⑥（确定要写入内容时）才真正 INSERT。
+   */
+  const existingConversationId = params.conversationId ?? null;
+  const created = existingConversationId === null;
+  let title: string | null = null;
+
+  if (existingConversationId) {
+    /**
+     * 必须用 findAliveConversationById 而不是 findConversationById：
+     * 往已删除的会话里追加消息会违背用户的删除意图（§24.1）。
+     * 区分「不存在」与「已删除」两种错误，前端才能给出有意义的提示。
+     */
+    const existing = await findAliveConversationById(existingConversationId);
+    if (!existing) {
+      throw (await findConversationById(existingConversationId))
+        ? new ConversationDeletedError(existingConversationId)
+        : new ConversationNotFoundError(existingConversationId);
+    }
+    title = existing.title;
+  }
+
+  // ---------- ④ 组装上下文 ----------
+  /**
+   * 历史消息必须在**当前消息入上下文之前**读，且当前消息不能重复出现。
+   *
+   * 已存在的会话：历史就在库里，读到的是「当前消息之前」的内容。
+   * 新会话：没有历史，只有 system + 当前消息。
+   */
+  const history = existingConversationId
+    ? (await findRecentMessages({
+        conversationId: existingConversationId,
+        limit: deps.recentMessageLimit ?? DEFAULT_RECENT_MESSAGE_LIMIT,
+      }))
+        .filter((m: Message) => CONTEXT_ROLES.has(m.role))
+        .map((m: Message) => ({ role: m.role as 'user' | 'assistant', content: m.content }))
+    : [];
+
+  let retrieval: MemoryRetrieval;
+  if (deps.retrieveMemories) {
+    try {
+      const memories = await deps.retrieveMemories({ userId: user.id, query: params.message });
+      retrieval = { performed: true, memories };
+    } catch (err) {
+      /**
+       * 检索失败降级为「没有记忆」而不是让聊天失败。
+       *
+       * 判断依据：检索是**增强**，不是完成对话的必要条件；
+       * 而用户此刻在等一次回答。失败原因记录下来（不含正文）。
+       */
+      console.error('[chat] 记忆检索失败，降级为无记忆上下文：', describeError(err));
+      retrieval = { performed: true, skippedReason: 'failed', memories: [] };
+    }
+  } else {
+    retrieval = { performed: false, skippedReason: 'not_implemented', memories: [] };
+  }
+
+  const context = buildChatContext({
+    recentMessages: history,
+    userMessage: params.message,
+    retrieval,
+    ...(deps.injectLimit !== undefined ? { injectLimit: deps.injectLimit } : {}),
+  });
+
+  // ---------- ⑤ 运行 Agent ----------
+  const agentResult = await runAgent({
+    provider,
+    messages: context.messages,
+    ...(deps.tools !== undefined ? { tools: deps.tools } : {}),
+    ...(params.signal !== undefined ? { signal: params.signal } : {}),
+    ...(deps.onToken !== undefined ? { onToken: deps.onToken } : {}),
+  });
+
+  // ---------- ⑥ 落库：会话（首次）→ 用户消息 → 助手消息 ----------
+  /**
+   * ⚠️ 三条写入放在**同一个事务**里。
+   *
+   * 理由：它们要么一起生效，要么一起不生效。
+   *   · 会话建了却没有消息 → 列表里出现点进去空白的会话
+   *   · 用户消息写了但没有助手消息 → 下次重试会看到一条孤立的提问
+   * 前两种都不该出现在用户面前。
+   *
+   * 事务里**不含** LLM 调用（那在步骤⑤，早已完成）——
+   * 这正是「先算完再落库」的意义：事务只覆盖纯数据库写入，毫秒级，
+   * 不会因为一次几十秒的推理而长期占用连接（§25.2 的同类要求）。
+   */
+  const saved = await db.transaction(async (tx) => {
+    const conversationId =
+      existingConversationId ??
+      (await createConversation({ userId: user.id }, { executor: tx })).id;
+
+    const userMessage = await appendMessage(
+      { conversationId, role: 'user', content: params.message },
+      { executor: tx }
+    );
+
+    const assistantMessage = await appendMessage(
+      {
+        conversationId,
+        role: 'assistant',
+        content: agentResult.content,
+        /**
+         * 元数据里只放**可观测指标**，不放正文（§29.1）。
+         * 模型与用量值得留：排查「为什么这次答得怪」时，
+         * 第一件事就是看用的哪个模型、是否被截断。
+         */
+        metadata: {
+          model: agentResult.model,
+          iterations: agentResult.iterations,
+          ...(agentResult.truncatedBy !== undefined
+            ? { truncatedBy: agentResult.truncatedBy }
+            : {}),
+        },
+      },
+      { executor: tx }
+    );
+
+    // 会话的 updated_at 必须一起推进，否则列表排序看不到这次对话。
+    // clock_timestamp 而非 now()：同事务内 now() 是常量（见 conversation-store）
+    await touchConversation(conversationId, { executor: tx });
+
+    return { conversationId, userMessage, assistantMessage };
+  });
+
+  const { conversationId, userMessage, assistantMessage } = saved;
+
+  // ---------- ⑧ 触发后台抽取（不 await 结果）----------
+  deps.extractionTrigger?.schedule(conversationId);
+
+  return {
+    conversation: { id: conversationId, created, title },
+    userMessage: {
+      id: userMessage.id,
+      content: userMessage.content,
+      sequence: userMessage.sequence,
+      createdAt: userMessage.createdAt,
+    },
+    assistantMessage: {
+      id: assistantMessage.id,
+      content: assistantMessage.content,
+      sequence: assistantMessage.sequence,
+      createdAt: assistantMessage.createdAt,
+    },
+    meta: {
+      iterations: agentResult.iterations,
+      toolCallsExecuted: agentResult.toolCallsExecuted,
+      model: agentResult.model,
+      finishReason: agentResult.finishReason,
+      ...(agentResult.truncatedBy !== undefined ? { truncatedBy: agentResult.truncatedBy } : {}),
+      usage: agentResult.usage,
+      context: {
+        historyCount: context.meta.historyCount,
+        injectedMemoryCount: context.meta.injectedMemoryCount,
+        approxTokens: context.meta.approxTokens,
+      },
+    },
+  };
+}
+
+// ============================================================
+// 业务错误
+// ============================================================
+
+/**
+ * 用专门的错误类型而不是字符串匹配：
+ * Controller 需要据此选 HTTP 状态码，靠 message 文本判断会在文案改动时静默失效。
+ *
+ * 命名沿用 docs/04 §5 的错误码，Controller 只做一层映射。
+ */
+export class ConversationNotFoundError extends Error {
+  readonly conversationId: string;
+  constructor(conversationId: string) {
+    super(`会话不存在：${conversationId}`);
+    this.name = 'ConversationNotFoundError';
+    this.conversationId = conversationId;
+  }
+}
+
+export class ConversationDeletedError extends Error {
+  readonly conversationId: string;
+  constructor(conversationId: string) {
+    super(`会话已删除，无法继续对话：${conversationId}`);
+    this.name = 'ConversationDeletedError';
+    this.conversationId = conversationId;
+  }
+}
+
+// ============================================================
+// 内部
+// ============================================================
+
+/** 延迟导入以避免在不需要 LLM 的路径上加载 env 校验 */
+async function defaultProvider(): Promise<LLMProvider> {
+  const mod = await import('../llm/index.js');
+  return mod.getLLMProvider();
+}
+
+/**
+ * 生成可安全记录的简短错误描述。
+ *
+ * ⚠️ 只取 message，不打印整个 error 对象：LLM 客户端库的异常里
+ *    常带上请求体（含用户消息）与请求头（含 API Key）。
+ */
+function describeError(err: unknown): string {
+  if (err instanceof LLMError) return `${err.name}: ${err.message}`;
+  if (err instanceof Error) return `${err.name}: ${err.message}`;
+  return '未知错误';
+}
