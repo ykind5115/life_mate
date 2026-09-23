@@ -1281,10 +1281,63 @@ docker compose exec postgres psql -U lifemate -d lifemate -c `
 
 ```text
 PostgreSQL   postgresql://lifemate:<password>@127.0.0.1:5432/lifemate
+测试库       postgresql://lifemate:<password>@127.0.0.1:5432/lifemate_test
 Embedding    http://127.0.0.1:8080
 TEI 健康检查 http://127.0.0.1:8080/health
 TEI 模型信息 http://127.0.0.1:8080/info
 ```
+
+---
+
+## 9.6 测试库（必须单独建一个）
+
+**为什么不能复用开发库：**
+
+集成测试的夹具会**删除数据**（为了让列表断言不依赖历史数据）。
+若测试连的是开发库，每跑一次 `pnpm test` 就会清掉一批真实记忆。
+
+> 🔴 **已实际发生（2026-09-23）：** HTTP 集成测试跑在开发库上，
+> 把抽取出来的 14 条记忆连同向量一起清空，另积累 324 个测试会话。
+> 因此现在有两道防线：
+>
+> ```text
+> ① src/shared/test-guard.ts
+>    写数据的测试夹具入口处断言「库名必须含 test」，否则直接抛错终止。
+>    默认拒绝，而不是默认允许。
+>
+> ② package.json 的 test 脚本指定 --env-file=.env.test
+>    测试根本不读 .env，即使有人绕过①也碰不到开发库。
+> ```
+
+**首次创建（执行一次即可）：**
+
+```powershell
+# 1) 建库
+docker compose exec postgres createdb -U lifemate lifemate_test
+
+# 2) 建扩展（迁移脚本也会建，这里显式执行便于确认权限）
+docker compose exec postgres psql -U lifemate -d lifemate_test -c `
+  "CREATE EXTENSION IF NOT EXISTS vector; CREATE EXTENSION IF NOT EXISTS pg_trgm; CREATE EXTENSION IF NOT EXISTS btree_gist;"
+
+# 3) 跑迁移（注意 --env-file 指向 .env.test）
+node --env-file=.env.test --import tsx src/database/migrate.ts
+```
+
+**日常运行：**
+
+```powershell
+pnpm test          # 自动使用 .env.test → lifemate_test
+```
+
+**验证防线有效（可选，确认误配时会被拦住）：**
+
+```powershell
+# 故意用开发库配置跑集成测试，应当全部失败并提示"拒绝在非测试数据库上..."
+node --env-file=.env --import tsx --test src/api/memory-routes.test.ts
+```
+
+**注意：** `.env.test` 里 `LLM_API_KEY` 是占位值，测试注入假 Provider，
+不会真的调用模型。不要把真实密钥写进 `.env.test`。
 
 ---
 

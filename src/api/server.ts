@@ -28,6 +28,7 @@ import { HttpError, internalError, ok, validationError } from './errors.js';
 import { IdempotencyConflictError } from './idempotency.js';
 import { registerChatRoutes, type ChatRouteDeps } from './routes/chat.js';
 import { registerConversationRoutes } from './routes/conversations.js';
+import { registerMemoryRoutes } from './routes/memories.js';
 import type { IdempotencyStore } from './idempotency.js';
 import type { ChatResult } from '../conversation/chat-service.js';
 
@@ -158,6 +159,7 @@ export async function buildServer(options: BuildServerOptions = {}): Promise<Fas
           : {}),
       });
       await registerConversationRoutes(v1);
+      await registerMemoryRoutes(v1);
     },
     { prefix: '/api/v1' }
   );
@@ -232,6 +234,25 @@ export function mapError(err: unknown): HttpError {
     return new HttpError('CONFLICT', err.message);
   }
 
+  /**
+   * 数据库约束冲突 → 409。
+   *
+   * ⚠️ 这一类曾经漏掉：POST /memories 在同槽位重复时返回了 500，
+   *    而 uq_memories_current_slot 拦下它是**设计意图**（§13.11），
+   *    不是服务端故障。500 会让前端以为系统坏了，也不会提示用户
+   *    「这个槽位已有记忆，应走替代语义」。
+   *
+   * 只映射「唯一约束 / 排他约束」，不把 CHECK 与 NOT NULL 也算进来 ——
+   * 那些属于**调用方传了非法值**，应该走 422 而不是 409；
+   * 但它们在当前实现里会先被 Zod 拦下，因此这里不额外处理。
+   */
+  const pgCode = postgresErrorCode(err);
+  if (pgCode === '23505' || pgCode === '23P01') {
+    return new HttpError('CONFLICT', '该操作与已有数据冲突', {
+      constraint: postgresConstraintName(err),
+    });
+  }
+
   // Fastify 的 JSON 解析错误 → 400（请求格式本身就不对）
   if (isFastifyError(err) && typeof err.statusCode === 'number' && err.statusCode < 500) {
     return new HttpError('BAD_REQUEST', err.message);
@@ -247,4 +268,44 @@ function isFastifyError(err: unknown): err is Error & { statusCode: number } {
     'statusCode' in err &&
     typeof (err as { statusCode?: unknown }).statusCode === 'number'
   );
+}
+
+/**
+ * 从错误链里取 PostgreSQL 的 SQLSTATE 码。
+ *
+ * 为什么要顺着 cause 链找：Drizzle 会把驱动抛出的错误包一层
+ *   Error: Failed query: insert into ...
+ *     [cause]: error: duplicate key value violates unique constraint "..."
+ * 直接看最外层是拿不到 code 的。
+ *
+ * 23xxx 是完整性约束冲突类：
+ *   23505 unique_violation
+ *   23P01 exclusion_violation
+ */
+function postgresErrorCode(err: unknown): string | undefined {
+  let cur: unknown = err;
+  for (let depth = 0; cur && depth < 5; depth++) {
+    if (typeof cur === 'object' && cur !== null) {
+      const code = (cur as { code?: unknown }).code;
+      if (typeof code === 'string' && /^23\d{3}$/.test(code)) return code;
+      cur = (cur as { cause?: unknown }).cause;
+    } else {
+      return undefined;
+    }
+  }
+  return undefined;
+}
+
+function postgresConstraintName(err: unknown): string | undefined {
+  let cur: unknown = err;
+  for (let depth = 0; cur && depth < 5; depth++) {
+    if (typeof cur === 'object' && cur !== null) {
+      const name = (cur as { constraint?: unknown }).constraint;
+      if (typeof name === 'string') return name;
+      cur = (cur as { cause?: unknown }).cause;
+    } else {
+      return undefined;
+    }
+  }
+  return undefined;
 }

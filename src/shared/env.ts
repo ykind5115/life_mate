@@ -87,7 +87,14 @@ const envSchema = z.object({
 
   // ---------- 日志 ----------
   // docs/03 §29.1：日志禁止记录消息正文与记忆内容
-  LOG_LEVEL: z.enum(['fatal', 'error', 'warn', 'info', 'debug', 'trace']).default('info'),
+  //
+  // 'silent' 是 Fastify/Pino 支持的级别，用途：
+  //   · 测试：不刷屏，也不让日志断言受干扰
+  //   · 特殊排查：需要完全静默时
+  // 它不改变隐私口径 —— 任何级别都不打印正文。
+  LOG_LEVEL: z
+    .enum(['fatal', 'error', 'warn', 'info', 'debug', 'trace', 'silent'])
+    .default('info'),
 });
 
 export type Env = z.infer<typeof envSchema>;

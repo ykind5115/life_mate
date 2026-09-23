@@ -12,8 +12,17 @@
 import { buildServer } from './server.js';
 import { env } from '../shared/env.js';
 import { closePool } from '../database/client.js';
+import { ensureDefaultUser } from '../database/repository/user-store.js';
 
 async function main(): Promise<void> {
+  /**
+   * 启动时确保默认用户存在。
+   *
+   * 把「用户记录什么时候出现」变成确定的一步，而不是第一次聊天时隐式出现。
+   * 失败直接退出：连不上库时服务本来也不可用，早失败比晚失败好定位。
+   */
+  const user = await ensureDefaultUser();
+
   const app = await buildServer();
 
   /**
@@ -45,7 +54,7 @@ async function main(): Promise<void> {
    * 只说明监听地址 —— 这句话本身对排查「端口被占」是必需的。
    */
   app.log.info(
-    `LifeMate 已启动：http://${env.HOST}:${env.PORT}（环境 ${env.NODE_ENV}）`
+    `LifeMate 已启动：http://${env.HOST}:${env.PORT}（环境 ${env.NODE_ENV}，用户 ${user.name}）`
   );
 
   if (env.HOST !== '127.0.0.1' && env.HOST !== 'localhost') {

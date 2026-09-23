@@ -13,7 +13,7 @@
  *
  *   ⚠️ 若后续要做多用户，这两处都需要改：本函数与调用点。
  */
-import { asc, eq } from 'drizzle-orm';
+import { eq } from 'drizzle-orm';
 
 import { db } from '../client.js';
 import { users, type User } from '../schema/users.js';
@@ -25,12 +25,14 @@ export const DEFAULT_USER_NAME = 'me';
 /**
  * 取当前用户；不存在则创建。
  *
- * V1.0 单用户约定：**用户表里最多一条记录**。
- * 因此实现是「取第一条」而不是「按 id 取」—— 没有 id 可传。
+ * V1.0 单用户约定：**用户表里只应有一条 name = 'me' 的记录**。
+ * 按 name 查而不是「取 created_at 最早的一条」——
+ * 后者在库里有历史脏数据（或测试建过别的用户）时会静默指向错误的人，
+ * 而且「哪条最早」还依赖时钟。name 是固定常量，确定性更强。
  *
- * ⚠️ 并发说明：两个请求同时进来时可能都走到 insert，生成两条用户记录。
- *    单用户本地部署不会发生，且没有唯一约束拦它（name 不是唯一键）。
- *    要彻底堵住需要在 name 上加唯一索引 —— 那是表结构变更，
+ * ⚠️ 并发说明：两个请求同时进来时可能都走到 insert，生成两条记录。
+ *    单用户本地部署不会发生，且当前没有唯一约束拦它。
+ *    要彻底堵住需在 name 上加唯一索引 —— 那是表结构变更，
  *    按 AGENTS.md §4.1 应先改 docs/03 再改 schema，因此这里不动。
  */
 export async function getOrCreateDefaultUser(
@@ -41,7 +43,7 @@ export async function getOrCreateDefaultUser(
   const existing = await exec
     .select()
     .from(users)
-    .orderBy(asc(users.createdAt))
+    .where(eq(users.name, DEFAULT_USER_NAME))
     .limit(1);
 
   if (existing[0]) return existing[0];
@@ -54,6 +56,20 @@ export async function getOrCreateDefaultUser(
   const user = created[0];
   if (!user) throw new Error('创建默认用户后未返回记录');
   return user;
+}
+
+/**
+ * 幂等地确保默认用户存在，返回它。
+ *
+ * 供服务启动时调用：把「用户记录什么时候出现」变成**确定的一步**，
+ * 而不是「第一次有人聊天时隐式出现」。
+ * 好处是运维与测试都有明确的前置条件可依赖。
+ *
+ * 与 getOrCreateDefaultUser 的关系：本函数是它在启动期的语义化别名，
+ * 存在的目的是让调用点读到「我在做初始化」而不是「我在查用户」。
+ */
+export async function ensureDefaultUser(options: ExecutorOption = {}): Promise<User> {
+  return getOrCreateDefaultUser(options);
 }
 
 /** 按 id 取用户。找不到返回 undefined */

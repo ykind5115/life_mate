@@ -1,7 +1,11 @@
 # AGENTS.md — 编码 Agent 工作规则
 
 > 本文件面向在本仓库中执行编码任务的 AI Agent（DSH / Claude Code / Codex / Cursor 等）。
-> 项目当前状态：**设计阶段已完成，工程代码尚未开始**（`src/` 为空，无 `package.json`）。
+> 项目当前状态：**设计阶段已完成，工程实现进行中**。
+> 已完成：数据库 Schema + 迁移、Repository 层、LLM Provider、Agent Loop、
+> 记忆抽取流水线、**记忆召回**、HTTP 层（chat / SSE / conversations / memories）。
+> 未完成：Timeline、Life Review、Settings 接口、离线评测集、Web UI。
+> 详见 `docs/README.md` 与最近若干次提交。
 > 本文件的规则优先级高于 Agent 的个人习惯；与本文档冲突的"通常做法"一律以本文档为准。
 
 ---
@@ -148,6 +152,31 @@ Agent Tool      不直接操作数据库，与 API 共享 Application Service
 • 不要为了调试把真实记忆数据打印到控制台或提交到仓库
 ```
 
+### 4.4 测试必须连独立的测试库
+
+```text
+🔴 这条是事故换来的，不要绕过。
+
+2026-09-23：HTTP 集成测试原先跑在开发库上（DATABASE_URL 指向 lifemate），
+而测试夹具为了让列表断言稳定会删除「默认用户」名下的记忆 ——
+结果是每跑一次 pnpm test 就清空一次真实记忆。
+发现时库里的记忆与向量全没了，另有 324 个测试会话堆积。
+
+两道防线（改测试时必须保持有效）：
+
+① src/shared/test-guard.ts
+   任何会写数据的测试夹具，入口处调用 assertTestDatabase('调用点')。
+   库名不含 "test" 就抛错终止 —— 默认拒绝，不是默认允许。
+
+② package.json 的 test 脚本指定 --env-file=.env.test
+   测试根本不读 .env，即使有人绕过①也碰不到开发库。
+
+新增写数据的测试时：
+  □ 在夹具入口加 assertTestDatabase('文件名 / 夹具名')
+  □ 确认清理逻辑只删自己造的数据，或至少限制在测试库内
+  □ 不要把断言写成「全表 count == N」——那依赖执行顺序（见 §5 的同类教训）
+```
+
 ---
 
 ## 5. 交付前自检清单
@@ -185,16 +214,26 @@ Agent Tool      不直接操作数据库，与 API 共享 Application Service
 ✅ C31  附录 A 补 event_id / goal_id 外键（后置 ALTER TABLE）
 ✅ C32  附录 A 补 EXCLUDE 约束；btree_gist 已在初始化脚本中
 ✅ C33  §19 约束清单与附录 A 逐列对齐
+✅ C35  memories.status 新增 'conflict'；记忆召回不返回它（已实现并用真实数据验证）
+✅ C37  events.category / conversation_summaries.status 的 CHECK 已加
+✅ C38  会话删除时 title 置 '[已删除的对话]'、summary 清空（已实现并测试）
 ```
 
 **仍未解决（实现到对应位置时先提出问题，不要自行发明方案）：**
 
 | 位置 | 问题 | 影响 |
 | ---- | ---- | ---- |
-| §13.7 vs §13.11 | "真正冲突 → 标记待用户确认"与 `uq_memories_current_slot` 部分唯一索引冲突（同槽位不允许两条 active），且状态枚举里没有 `conflict` | 冲突分支无法落库；需要产品决策：加 `conflict` 状态、还是把冲突记忆写进独立的待确认队列 |
 | §4.2 / §14.2 | 声称 `(memory_id, model)` 多行支持未来平滑换模型，但 `VECTOR(1024)` 写死列类型，非 1024 维模型无法入库 | 换模型时"双写 → 回填 → 切换"四步走目前不成立；需要先决定是否放宽该承诺 |
-| §19 vs 附录 A | `events.category`、`conversation_summaries.status` 有文档枚举但库层无 CHECK（其余约束已在 C33 对齐） | 约束未下沉，与 §19「约束下沉」的目标不一致；补 CHECK 前先确认枚举是否会扩展 |
-| §24.2 | 会话软删除时 `conversations.title` 仍是用户可见内容，未规定是否清空 | 隐私口径问题，需产品决策 |
+| §24.2 | 会话删除已按 C38 清空 title/summary，但**「删派生记忆」这条路要在 HTTP 层显式传参**才生效（`?delete_derived_memories=true`）。文档说"前端需明确提示两种语义的差异"，前端尚未实现 | 前端未做，用户暂时只有保守语义（保留记忆）可用 |
+
+**文档之间口径不一致、已按保守方案实现并回报（需人类决策）：**
+
+| 位置 | 冲突 | 当前实现 |
+| ---- | ---- | ---- |
+| docs/04 §23 vs Q1 | §23 允许 `PATCH /memories/:id` 改 `content` 并重算 embedding；Q1 与 docs/03 §13.1 禁止就地改正文 | 按 Q1 拒绝（422）。改内容应走「新建 + 替代」语义，那个端点尚未实现 |
+| docs/04 §46 | 只规定"V1.0 纳入 Idempotency-Key"，未定存储方案 | 进程内存储（docs/06 P2-6 给的候选之一）。代价：重启后失效 |
+| docs/04 §48 | 推荐维护 OpenAPI 3.x | 未引入类型 provider，Zod 校验是手写的，没有生成 schema |
+| docs/02 §9 | Context Builder 的结构含"User Profile" | 未实现（users.settings 目前无人读） |
 
 ---
 

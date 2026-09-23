@@ -16,6 +16,7 @@ import { and, asc, count, desc, eq, inArray, isNull, sql } from 'drizzle-orm';
 import { db } from '../client.js';
 import { memories, type Memory } from '../schema/memories.js';
 import { memorySources, type MemorySource } from '../schema/memory-sources.js';
+import { messages } from '../schema/messages.js';
 import {
   conflictMemoryCondition,
   currentMemoryCondition,
@@ -349,6 +350,33 @@ export async function findSourcesByMemoryId(
     .from(memorySources)
     .where(eq(memorySources.memoryId, memoryId))
     .orderBy(asc(memorySources.createdAt));
+}
+
+/**
+ * 查询一组来源消息各自属于哪个会话。
+ *
+ * ⚠️ 为什么需要它：C22 之后 memory_sources 没有 conversation_id，
+ *    「这条记忆来自哪些会话」必须 JOIN messages 反查（§15.4）。
+ *    返回 Map 而不是数组，是为了让调用方一次查完再逐个取 ——
+ *    否则前端要么拿到 200 条来源却不知道会话，要么为每条来源发一个请求。
+ *
+ * 已被物理删除的消息不会出现在结果里（JOIN 不到）。
+ * 调用方据此显示「原始对话已删除」（§24.2 末尾的要求）。
+ */
+export async function findConversationIdsByMessageIds(
+  messageIds: string[],
+  options: ReadOptions = {}
+): Promise<Map<string, string>> {
+  const exec = options.executor ?? db;
+
+  if (messageIds.length === 0) return new Map();
+
+  const rows = await exec
+    .select({ messageId: messages.id, conversationId: messages.conversationId })
+    .from(messages)
+    .where(inArray(messages.id, messageIds));
+
+  return new Map(rows.map((r) => [r.messageId, r.conversationId]));
 }
 
 /** 统计当前有效记忆数量，用于容量监控与评测 */

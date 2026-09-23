@@ -129,6 +129,62 @@ export async function mergeDuplicate(
 }
 
 // ============================================================
+// 更新「系统认知」类字段（C25 允许的那一组）
+// ============================================================
+
+/**
+ * 更新记忆的**系统认知**类字段。
+ *
+ * 【为什么只开放这几个字段】
+ *   C25 划的界是：改这些不改变「用户说的是什么事实」，
+ *   只改变「系统对它的判断」。
+ *
+ *   ❌ 绝不允许通过本函数修改：
+ *      content / type / subject_key / predicate_key / object_value /
+ *      polarity / valid_from / created_at
+ *      改它们等于改写历史（§13.1），「用户过去住在广州」这条事实会消失。
+ *      type 也在禁止之列 —— 它由抽取契约决定，人工改会让槽位与类型不自洽。
+ *
+ *   需要「改内容」的正确路径是 supersedeMemory：新建 + 失效旧的。
+ */
+export async function updateMemoryScores(
+  params: {
+    memoryId: string;
+    importanceScore?: number;
+    confidenceScore?: number;
+  },
+  options: ExecutorOption = {}
+): Promise<Memory> {
+  const exec = options.executor ?? db;
+
+  /**
+   * 两者都没给时**显式报错**而不是「更新 0 个字段然后返回原记录」。
+   * 后者会让调用方以为更新成功了。
+   */
+  if (params.importanceScore === undefined && params.confidenceScore === undefined) {
+    throw new Error('updateMemoryScores 至少需要一个待更新字段');
+  }
+
+  const rows = await exec
+    .update(memories)
+    .set({
+      ...(params.importanceScore !== undefined
+        ? { importanceScore: params.importanceScore }
+        : {}),
+      ...(params.confidenceScore !== undefined
+        ? { confidenceScore: params.confidenceScore }
+        : {}),
+      updatedAt: sql`now()`,
+    })
+    .where(eq(memories.id, params.memoryId))
+    .returning();
+
+  const memory = rows[0];
+  if (!memory) throw new Error(`记忆不存在：${params.memoryId}`);
+  return memory;
+}
+
+// ============================================================
 // 替代（信息发生变化）
 // ============================================================
 

@@ -22,6 +22,7 @@ import type { FastifyInstance } from 'fastify';
 import type { LightMyRequestResponse } from 'fastify';
 
 import { closePool } from '../database/client.js';
+import { assertTestDatabase } from '../shared/test-guard.js';
 import { buildServer } from './server.js';
 import { IdempotencyStore } from './idempotency.js';
 import type { ChatRouteDeps } from './routes/chat.js';
@@ -129,6 +130,13 @@ async function withServer(
     retrieveMemories?: ChatRouteDeps['retrieveMemories'];
   } = {}
 ): Promise<void> {
+  /**
+   * ⚠️ 这些用例会**写库**（聊天会落会话与消息）。
+   *    必须连测试库 —— 2026-09-23 实测踩到：测试跑在开发库上，
+   *    除了污染数据，还积累了 300 多个测试会话。
+   */
+  assertTestDatabase('server.test.ts / withServer');
+
   const provider = new FakeProvider(options.answer ?? '这是测试回答。', options.failure);
   const app = await buildServer({
     logLevel: 'silent',

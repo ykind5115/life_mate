@@ -12,6 +12,7 @@ import { sql } from 'drizzle-orm';
 
 import { db } from '../client.js';
 import { users } from '../schema/users.js';
+import { assertTestDatabase } from '../../shared/test-guard.js';
 
 /** 事务内外通用的执行器类型 */
 export type TestExecutor = Parameters<Parameters<typeof db.transaction>[0]>[0];
@@ -34,6 +35,13 @@ class RollbackSignal extends Error {
 export async function withTestContext(
   fn: (ctx: { exec: TestExecutor; userId: string }) => Promise<void>
 ): Promise<void> {
+  /**
+   * ⚠️ 本函数会写库（虽然会回滚，但回滚本身也依赖连对了库 ——
+   *    若连的是开发库，任何一次意外提交都会落进真实数据）。
+   *    守卫在此，防止测试连错库。
+   */
+  assertTestDatabase('_test-helpers.ts / withTestContext');
+
   try {
     await db.transaction(async (tx) => {
       const userId = await seedUser(tx);

@@ -12,7 +12,7 @@
     "dev": "node --env-file=.env --watch --import tsx src/api/main.ts",
     "start": "node --env-file=.env --import tsx src/api/main.ts",
     "typecheck": "tsc --noEmit",
-    "test": "node --env-file=.env --import tsx --test \"src/**/*.test.ts\"",
+    "test": "node --env-file=.env.test --import tsx --test \"src/**/*.test.ts\"",
     "db:generate": "drizzle-kit generate",
     "db:migrate": "node --env-file=.env --import tsx src/database/migrate.ts",
     "db:check": "node --env-file=.env --import tsx src/database/check-connection.ts",
