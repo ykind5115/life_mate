@@ -11,8 +11,9 @@
 import { sql } from 'drizzle-orm';
 
 import { db } from '../client.js';
-import { users } from '../schema/users.js';
-import { assertTestDatabase } from '../../shared/test-guard.js';
+import { users, type User } from '../schema/users.js';
+import { assertIsolatedUser, assertTestDatabase } from '../../shared/test-guard.js';
+import { ensureDefaultUser, resolveUserName } from './user-store.js';
 
 /** 事务内外通用的执行器类型 */
 export type TestExecutor = Parameters<Parameters<typeof db.transaction>[0]>[0];
@@ -65,6 +66,32 @@ export async function seedUser(exec: TestExecutor, name = 'repo-test'): Promise<
   const id = rows[0]?.id;
   if (!id) throw new Error('创建测试用户失败');
   return id;
+}
+
+/**
+ * 取本次测试要用的用户，**并保证它不是真实用户**。
+ *
+ * 🔴 【为什么夹具必须用这个，而不是直接调 ensureDefaultUser】
+ *   多个 HTTP 测试夹具的写法是「取当前用户 → 清空它名下的数据」：
+ *
+ *     const user = await ensureDefaultUser();
+ *     await db.delete(memories).where(eq(memories.userId, user.id));
+ *
+ *   也就是说它们删的是「当前用户」的全部数据。而当前用户默认是 **'me'** ——
+ *   那是用户从 2026-09-24 起真实使用的账号，且他明确要求
+ *   「对话记录必须保留」（对话不可再生：记忆/事件/摘要都能从它重新生成，
+ *   它本身不能）。
+ *
+ *   因此这里在返回之前先断言用户名不是 'me'。
+ *   隔离靠 .env.test 里的 LIFEMATE_USER_NAME=test-agent 落地，
+ *   守卫只负责「万一没生效就报错而不是删数据」。
+ *
+ * @param context 调用点描述，出现在错误信息里便于定位
+ */
+export async function resolveTestUser(context: string): Promise<User> {
+  const name = resolveUserName();
+  assertIsolatedUser(name, context);
+  return ensureDefaultUser();
 }
 
 /** 仓库方法的执行器选项快捷构造 */

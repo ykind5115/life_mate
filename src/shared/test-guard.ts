@@ -71,3 +71,45 @@ export function assertTestDatabase(context: string): void {
       `  ③ 测试库不存在时先创建：见 docs/05-environment-setup.md`
   );
 }
+
+/**
+ * 断言当前解析到的用户**不是真实用户**。
+ *
+ * 🔴 【为什么需要第二道守卫 —— 2026-09-24】
+ *   上面的 assertTestDatabase 只挡住「连错库」，
+ *   但挡不住「连对了库、却清错了人」。而多个 HTTP 测试夹具的写法是：
+ *
+ *     const user = await ensureDefaultUser();
+ *     await db.delete(memories).where(eq(memories.userId, user.id));   // 清空该用户
+ *
+ *   也就是说：**它们删的是「当前用户」的全部数据**。
+ *   用户从 2026-09-24 开始真实使用，并明确要求「对话记录必须保留」——
+ *   对话是不可再生的（记忆/事件/摘要都能从它重新生成，它本身不能）。
+ *
+ *   只要有一次「用户误用自己的 .env 跑了 pnpm test」，
+ *   或在开发库上跑了某个脚本，数据就没了。
+ *   因此再加一道：**测试夹具只允许操作非 'me' 用户**。
+ *
+ * 隔离方式（写入时就成立，不靠事后筛选）：
+ *   .env.test 里设 LIFEMATE_USER_NAME=test-agent
+ *   → 所有测试的「当前用户」都是 test-agent
+ *   → 夹具清空的是 test-agent 的数据
+ *   → 真实用户 'me' 的数据在数据库层面碰不到
+ *
+ * @param userName 当前解析到的用户名（来自 user-store 的 resolveUserName）
+ */
+export function assertIsolatedUser(userName: string, context: string): void {
+  if (userName !== 'me') return;
+
+  throw new Error(
+    `拒绝在真实用户（me）上执行会删除数据的测试操作。\n` +
+      `  调用点：${context}\n` +
+      `  当前用户：${userName}（来自 LIFEMATE_USER_NAME，未设置时为 'me'）\n\n` +
+      `测试夹具会清空「当前用户」名下的全部数据。若当前用户是 me，\n` +
+      `那删的就是**真实使用数据** —— 其中对话记录不可再生。\n\n` +
+      `正确做法：\n` +
+      `  ① 确认 .env.test 里有 LIFEMATE_USER_NAME=test-agent\n` +
+      `  ② 用 pnpm test 运行（脚本已指定 --env-file=.env.test）\n\n` +
+      `若你确实要在 me 上跑，那是危险操作，请显式改这里的守卫并说清理由。`
+  );
+}

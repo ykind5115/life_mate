@@ -21,7 +21,7 @@ import { closePool, db } from '../database/client.js';
 import { goals } from '../database/schema/goals.js';
 import { memories } from '../database/schema/memories.js';
 import { memorySources } from '../database/schema/memory-sources.js';
-import { ensureDefaultUser } from '../database/repository/user-store.js';
+import { resolveTestUser } from '../database/repository/_test-helpers.js';
 import { assertTestDatabase } from '../shared/test-guard.js';
 import { buildServer } from './server.js';
 import { IdempotencyStore } from './idempotency.js';
@@ -79,7 +79,7 @@ async function withGoals(fn: (f: GoalFixture) => Promise<void>): Promise<void> {
     retrieveMemories: null,
   });
 
-  const user = await ensureDefaultUser();
+  const user = await resolveTestUser('goal-routes.test.ts');
 
   /**
    * 前置清理顺序不可调换：

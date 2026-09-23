@@ -208,12 +208,42 @@ Agent Tool      不直接操作数据库，与 API 共享 Application Service
 
 新增写数据的测试时：
   □ 在夹具入口加 assertTestDatabase('文件名 / 夹具名')
+  □ 取用户用 `resolveTestUser('文件名')`，**不要**直接调 ensureDefaultUser
+    （前者会断言用户名不是 'me'，见下方 §4.4.1）
   □ 确认清理逻辑只删自己造的数据，或至少限制在测试库内
   □ 不要把断言写成「全表 count == N」——那依赖执行顺序（见 §5 的同类教训）
 ```
 
-### 4.5 测试串行执行（不要改成并发）
+### 4.4.1 测试用户隔离（2026-09-24 起必须保持）
 
+```text
+🔴 用户开始真实使用，并明确要求「对话记录必须保留」。
+   对话记录不可再生 —— 记忆/事件/摘要都能从它重新生成，它本身不能。
+
+风险在哪：
+  多个 HTTP 测试夹具的写法是「取当前用户 → 清空它名下的数据」：
+      const user = await ensureDefaultUser();
+      await db.delete(memories).where(eq(memories.userId, user.id));
+  而「当前用户」默认是 'me' —— 真实数据所属账号。
+  只靠 §4.4 的库名守卫挡不住这种「连对了库、却清错了人」。
+
+三道防线（缺一不可）：
+  ① .env.test 里 LIFEMATE_USER_NAME=test-agent
+     → 测试的「当前用户」是 test-agent，真实用户在数据库层面碰不到
+  ② src/shared/test-guard.ts 的 assertIsolatedUser
+     → 万一 ① 失效（那行被删、或用户误用 .env 跑测试），
+       夹具直接报错而不是删数据。已实测：去掉那行后 30/30 用例立刻失败，
+       一条数据都没删。
+  ③ 夹具统一用 resolveTestUser('文件名') 取代 ensureDefaultUser()
+     → 让 ② 无法被绕过（直接调 ensureDefaultUser 就绕过了）
+
+配套清理脚本：
+  audit/reset-test-user.sql    只清测试用户的数据（安全，日常用这个）
+  audit/reset-dev-data.sql     清默认用户（危险，已加守卫：
+                               默认用户有会话时直接中止事务）
+```
+
+### 4.5 测试串行执行（不要改成并发）
 ```text
 test 脚本带了 --test-isolation=process --test-concurrency=1。
 

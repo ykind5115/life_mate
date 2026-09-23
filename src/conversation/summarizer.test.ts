@@ -17,7 +17,7 @@ import { closePool, db } from '../database/client.js';
 import { conversations } from '../database/schema/conversations.js';
 import { messages } from '../database/schema/messages.js';
 import { conversationSummaries } from '../database/schema/conversation-summaries.js';
-import { ensureDefaultUser } from '../database/repository/user-store.js';
+import { resolveTestUser } from '../database/repository/_test-helpers.js';
 import { maxSummarizedSequence } from '../database/repository/summary-store.js';
 import { assertTestDatabase } from '../shared/test-guard.js';
 import { maybeSummarize, SUMMARY_BATCH_SIZE, SUMMARY_THRESHOLD } from './summarizer.js';
@@ -66,7 +66,7 @@ async function withConversation(
 ): Promise<void> {
   assertTestDatabase('summarizer.test.ts / withConversation');
 
-  const user = await ensureDefaultUser();
+  const user = await resolveTestUser('summarizer.test.ts');
 
   const rows = await db
     .insert(conversations)

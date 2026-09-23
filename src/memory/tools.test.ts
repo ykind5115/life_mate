@@ -20,7 +20,7 @@ import { memories } from '../database/schema/memories.js';
 import { goals } from '../database/schema/goals.js';
 import { memorySources } from '../database/schema/memory-sources.js';
 import { events } from '../database/schema/events.js';
-import { ensureDefaultUser } from '../database/repository/user-store.js';
+import { resolveTestUser } from '../database/repository/_test-helpers.js';
 import { assertTestDatabase } from '../shared/test-guard.js';
 import { createMemoryTools } from './tools.js';
 import type { ToolContext } from '../agent/loop.js';
@@ -66,7 +66,7 @@ test('Q3：工具集只包含只读工具，**不含任何写工具**', async ()
 test('Q3：工具的 execute 只做读操作（用「不产生新记忆」间接验证）', async () => {
   assertTestDatabase('tools.test.ts / 只读验证');
 
-  const user = await ensureDefaultUser();
+  const user = await resolveTestUser('tools.test.ts');
   await cleanup(user.id);
 
   const tools = createMemoryTools({ userId: user.id });
@@ -94,7 +94,7 @@ test('Q3：工具的 execute 只做读操作（用「不产生新记忆」间接
 test('search_memory：参数缺失时返回可读错误，不抛异常', async () => {
   assertTestDatabase('tools.test.ts / search_memory');
 
-  const user = await ensureDefaultUser();
+  const user = await resolveTestUser('tools.test.ts');
   const tools = createMemoryTools({ userId: user.id });
   const search = tools.find((t) => t.name === 'search_memory')!;
 
@@ -115,7 +115,7 @@ test('search_memory：参数缺失时返回可读错误，不抛异常', async (
 test('search_memory：工具结果不含 id 与分数', async () => {
   assertTestDatabase('tools.test.ts / search_memory 输出');
 
-  const user = await ensureDefaultUser();
+  const user = await resolveTestUser('tools.test.ts');
   await cleanup(user.id);
 
   await db.insert(memories).values({
@@ -150,7 +150,7 @@ test('search_memory：工具结果不含 id 与分数', async () => {
 test('get_memory：找不到时返回可读结果，并提示不要断言「不存在」', async () => {
   assertTestDatabase('tools.test.ts / get_memory');
 
-  const user = await ensureDefaultUser();
+  const user = await resolveTestUser('tools.test.ts');
   const get = createMemoryTools({ userId: user.id }).find((t) => t.name === 'get_memory')!;
 
   const r = (await get.execute(
@@ -170,7 +170,7 @@ test('get_memory：找不到时返回可读结果，并提示不要断言「不�
 test('get_memory：已删除的记忆查不到（尊重删除意图）', async () => {
   assertTestDatabase('tools.test.ts / get_memory 删除');
 
-  const user = await ensureDefaultUser();
+  const user = await resolveTestUser('tools.test.ts');
   await cleanup(user.id);
 
   const inserted = await db
@@ -194,7 +194,7 @@ test('get_memory：已删除的记忆查不到（尊重删除意图）', async (
 test('get_timeline：返回事件并标注分类与日期', async () => {
   assertTestDatabase('tools.test.ts / get_timeline');
 
-  const user = await ensureDefaultUser();
+  const user = await resolveTestUser('tools.test.ts');
   await cleanup(user.id);
 
   await db.insert(events).values({
@@ -222,7 +222,7 @@ test('get_timeline：返回事件并标注分类与日期', async () => {
 test('get_timeline：参数非法时不崩（返回空结果）', async () => {
   assertTestDatabase('tools.test.ts / get_timeline 参数');
 
-  const user = await ensureDefaultUser();
+  const user = await resolveTestUser('tools.test.ts');
   const tool = createMemoryTools({ userId: user.id }).find((t) => t.name === 'get_timeline')!;
 
   const r = (await tool.execute({ start: '不是日期' }, CTX)) as { events: unknown[] };

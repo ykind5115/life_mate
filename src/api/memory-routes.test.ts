@@ -24,7 +24,7 @@ import { eq } from 'drizzle-orm';
 
 import { closePool, db } from '../database/client.js';
 import { memories } from '../database/schema/memories.js';
-import { ensureDefaultUser } from '../database/repository/user-store.js';
+import { resolveTestUser } from '../database/repository/_test-helpers.js';
 import { assertTestDatabase } from '../shared/test-guard.js';
 import { emptyDiagnostics } from '../memory/extraction-schema.js';
 import { buildServer } from './server.js';
@@ -109,7 +109,7 @@ async function withMemoryFixture(fn: (f: MemoryFixture) => Promise<void>): Promi
     retrieveMemories: null,
   });
 
-  const user = await ensureDefaultUser();
+  const user = await resolveTestUser('memory-routes.test.ts');
 
   // 前置：清空该用户名下的记忆，让断言不依赖此前遗留的数据
   await db.delete(memories).where(eq(memories.userId, user.id));

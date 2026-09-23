@@ -17,7 +17,7 @@ import { eq } from 'drizzle-orm';
 
 import { closePool, db } from '../database/client.js';
 import { users } from '../database/schema/users.js';
-import { ensureDefaultUser } from '../database/repository/user-store.js';
+import { resolveTestUser } from '../database/repository/_test-helpers.js';
 import { assertTestDatabase } from '../shared/test-guard.js';
 import { emptyDiagnostics } from '../memory/extraction-schema.js';
 import { buildServer } from './server.js';
@@ -117,7 +117,7 @@ async function withSettings(
     retrieveMemories: null,
   });
 
-  const user = await ensureDefaultUser();
+  const user = await resolveTestUser('settings-routes.test.ts');
 
   const resetSettings = async (): Promise<void> => {
     await db

@@ -21,7 +21,7 @@ import { events } from '../database/schema/events.js';
 import { memories } from '../database/schema/memories.js';
 import { goals } from '../database/schema/goals.js';
 import { memorySources } from '../database/schema/memory-sources.js';
-import { ensureDefaultUser } from '../database/repository/user-store.js';
+import { resolveTestUser } from '../database/repository/_test-helpers.js';
 import { assertTestDatabase } from '../shared/test-guard.js';
 import { buildServer } from './server.js';
 import { IdempotencyStore } from './idempotency.js';
@@ -85,7 +85,7 @@ async function withTimeline(fn: (f: TimelineFixture) => Promise<void>): Promise<
     retrieveMemories: null,
   });
 
-  const user = await ensureDefaultUser();
+  const user = await resolveTestUser('timeline-routes.test.ts');
   /**
    * 前置：清空该用户名下的**事件、记忆与目标**。
    *
