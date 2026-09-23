@@ -16,7 +16,12 @@ import { test } from 'node:test';
 import { runAgent, type ToolDefinition } from './loop.js';
 import type { GenerateInput, LLMProvider } from '../llm/provider.js';
 import { LLMError } from '../llm/provider.js';
-import type { LLMGenerateResult, LLMMessage } from '../llm/types.js';
+import type {
+  LLMGenerateResult,
+  LLMMessage,
+  LLMStreamChunk,
+  LLMToolCall,
+} from '../llm/types.js';
 
 // ============================================================
 // 测试用假 Provider
@@ -334,4 +339,139 @@ test('usage 在多轮之间累加，便于成本核算', async () => {
   });
 
   assert.deepEqual(res.usage, { inputTokens: 30, outputTokens: 13, reasoningTokens: 0 });
+});
+
+// ============================================================
+// 流式路径（onToken）
+// ============================================================
+
+/**
+ * 会真正产出 token 的假 Provider。
+ *
+ * ScriptedProvider 的 stream 直接抛错，覆盖不到 onToken 分支 ——
+ * 而这是一个**独立代码路径**（走 provider.stream 而不是 generate），
+ * 不测就等于没验证。SSE 端点是它唯一的生产用途。
+ */
+class StreamingProvider implements LLMProvider {
+  readonly providerName = 'streaming';
+  readonly defaultModel = 'streaming-model';
+
+  constructor(
+    private readonly script: { tokens: string[]; toolCalls?: LLMToolCall[] }[]
+  ) {}
+
+  generate(): Promise<LLMGenerateResult> {
+    return Promise.reject(new Error('本测试只走 stream 路径'));
+  }
+
+  async *stream(): AsyncIterable<LLMStreamChunk> {
+    const next = this.script.shift();
+    if (!next) throw new Error('测试脚本已用尽，但 Loop 仍在调用 stream');
+
+    for (const t of next.tokens) {
+      yield { type: 'token', content: t };
+    }
+
+    yield {
+      type: 'done',
+      result: {
+        content: next.tokens.join(''),
+        toolCalls: next.toolCalls ?? [],
+        usage: { inputTokens: 1, outputTokens: next.tokens.length, reasoningTokens: 0 },
+        model: 'streaming-model',
+        finishReason: next.toolCalls?.length ? 'tool_calls' : 'stop',
+      },
+    };
+  }
+}
+
+test('onToken: 每个 token 按序回调，累积结果与一次性生成一致', async () => {
+  const provider = new StreamingProvider([{ tokens: ['你', '好', '，', '世界'] }]);
+
+  const received: string[] = [];
+  const res = await runAgent({
+    provider,
+    messages: [{ role: 'user', content: '打个招呼' }],
+    onToken: (t) => received.push(t),
+  });
+
+  assert.deepEqual(received, ['你', '好', '，', '世界'], '每个 token 都应按顺序回调');
+  assert.equal(res.content, '你好，世界');
+});
+
+test('onToken: 多轮工具调用时，每一轮的 token 都被回调', async () => {
+  const provider = new StreamingProvider([
+    {
+      tokens: ['让我查一下'],
+      toolCalls: [{ id: 'c1', name: 'echo', arguments: '{"v":"x"}' }],
+    },
+    { tokens: ['查到了'] },
+  ]);
+
+  const received: string[] = [];
+  const res = await runAgent({
+    provider,
+    messages: [{ role: 'user', content: '开始' }],
+    tools: [echoTool],
+    onToken: (t) => received.push(t),
+  });
+
+  assert.deepEqual(received, ['让我查一下', '查到了'], '两轮的 token 都应回调');
+  assert.equal(res.content, '查到了');
+  assert.equal(res.toolCallsExecuted, 1);
+});
+
+test('onToken: 不传 onToken 时仍走 generate，不误用 stream', async () => {
+  // ScriptedProvider 的 stream 会抛错，因此这里能跑通即证明走的是 generate
+  const provider = new ScriptedProvider([result({ content: '一次性', finishReason: 'stop' })]);
+
+  const res = await runAgent({
+    provider,
+    messages: [{ role: 'user', content: 'x' }],
+  });
+
+  assert.equal(res.content, '一次性');
+});
+
+test('onToken: 流里的 error 块转成 LLMError，并保留 retryable 标记', async () => {
+  const provider: LLMProvider = {
+    providerName: 'failing-stream',
+    defaultModel: 'm',
+    generate: () => Promise.reject(new Error('unused')),
+    async *stream(): AsyncIterable<LLMStreamChunk> {
+      yield { type: 'token', content: '部分' };
+      yield { type: 'error', error: '流中断了', retryable: false };
+    },
+  };
+
+  await assert.rejects(
+    () =>
+      runAgent({
+        provider,
+        messages: [{ role: 'user', content: 'x' }],
+        onToken: () => undefined,
+      }),
+    (err: unknown) => err instanceof LLMError && err.options.retryable === false
+  );
+});
+
+test('onToken: 流没有 done 块就结束 → 视为可重试错误，而不是当成空回答', async () => {
+  const provider: LLMProvider = {
+    providerName: 'no-done',
+    defaultModel: 'm',
+    generate: () => Promise.reject(new Error('unused')),
+    async *stream(): AsyncIterable<LLMStreamChunk> {
+      yield { type: 'token', content: '只有内容没有收尾' };
+    },
+  };
+
+  await assert.rejects(
+    () =>
+      runAgent({
+        provider,
+        messages: [{ role: 'user', content: 'x' }],
+        onToken: () => undefined,
+      }),
+    /没有 done 块/
+  );
 });

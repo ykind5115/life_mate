@@ -16,7 +16,7 @@
  */
 import type { GenerateInput, LLMProvider } from '../llm/provider.js';
 import { LLMError } from '../llm/provider.js';
-import type { LLMMessage, LLMTokenUsage, LLMToolCall } from '../llm/types.js';
+import type { LLMMessage, LLMGenerateResult, LLMTokenUsage, LLMToolCall } from '../llm/types.js';
 import { env } from '../shared/env.js';
 
 /** 循环上限。集中在这里，便于按实测调整（评审 P0-7 要求写进文档并集中配置） */
@@ -77,6 +77,22 @@ export interface RunAgentOptions {
   limits?: Partial<Record<keyof typeof AGENT_LIMITS, number>>;
   /** 日志回调。实现方需保证不打印消息正文（docs/03 §29.1） */
   onEvent?: (e: AgentEvent) => void;
+  /**
+   * 逐 token 回调。**只有当需要流式输出（SSE）时才传**。
+   *
+   * 传了它会改走 provider.stream()，每收到一个 token 调用一次；
+   * 不传则走 provider.generate()（一次性返回）。
+   *
+   * 为什么用一个开关而不是两个循环实现：
+   *   循环逻辑（边界检查、工具累积、截断收尾）必须只有一份 ——
+   *   两份实现迟早会漂移，而且漂移点恰恰在最少被测试的分支上。
+   *   provider 接口本身同时提供 generate 与 stream，切换成本很低。
+   *
+   * ⚠️ 回调是同步的。实现方若需异步处理（如写 SSE），
+   *    应在回调内尽快入队，不要在回调里 await 慢操作 ——
+   *    那会阻塞上游的流式读取。
+   */
+  onToken?: (token: string) => void;
 }
 
 export type AgentEvent =
@@ -152,7 +168,8 @@ export async function runAgent(options: RunAgentOptions): Promise<RunAgentResult
     try {
       response = await generateWithRetry(
         options.provider,
-        buildLLMInput(options, messages, toolDefs)
+        buildLLMInput(options, messages, toolDefs),
+        options.onToken
       );
     } catch (err) {
       const retryable = err instanceof LLMError && err.options.retryable;
@@ -260,8 +277,10 @@ export async function runAgent(options: RunAgentOptions): Promise<RunAgentResult
       '不要再请求调用工具，并说明哪些信息可能不完整。）',
   });
 
-  const final = await options.provider.generate(
-    buildLLMInput(options, messages, [], { noTools: true })
+  const final = await callLLM(
+    options.provider,
+    buildLLMInput(options, messages, [], { noTools: true }),
+    options.onToken
   );
 
   usage.inputTokens += final.usage.inputTokens;
@@ -316,13 +335,14 @@ function buildLLMInput(
 async function generateWithRetry(
   provider: LLMProvider,
   input: GenerateInput,
+  onToken: ((token: string) => void) | undefined,
   maxAttempts = 2
 ): Promise<Awaited<ReturnType<LLMProvider['generate']>>> {
   let lastErr: unknown;
 
   for (let attempt = 1; attempt <= maxAttempts; attempt++) {
     try {
-      return await provider.generate(input);
+      return await callLLM(provider, input, onToken);
     } catch (err) {
       lastErr = err;
 
@@ -336,6 +356,45 @@ async function generateWithRetry(
   }
 
   throw lastErr;
+}
+
+/**
+ * 调用 LLM，按需选择流式或一次性。
+ *
+ * 两者返回同一个 LLMGenerateResult，因此循环的其余部分无需感知差异。
+ */
+async function callLLM(
+  provider: LLMProvider,
+  input: GenerateInput,
+  onToken: ((token: string) => void) | undefined
+): Promise<LLMGenerateResult> {
+  if (!onToken) {
+    return provider.generate(input);
+  }
+
+  // 流式：消费全部 chunk，累积出与 generate 等价的完整结果
+  let done: LLMGenerateResult | undefined;
+  let streamError: { error: string; retryable: boolean } | undefined;
+
+  for await (const chunk of provider.stream(input)) {
+    if (chunk.type === 'token') {
+      onToken(chunk.content);
+    } else if (chunk.type === 'done') {
+      done = chunk.result;
+    } else if (chunk.type === 'error') {
+      streamError = { error: chunk.error, retryable: chunk.retryable };
+    }
+    // tool_call_delta 无需处理：done 里的 result 已含累积完整的 toolCalls
+  }
+
+  if (streamError) {
+    throw new LLMError(streamError.error, { retryable: streamError.retryable });
+  }
+  if (!done) {
+    throw new LLMError('流式响应结束但没有 done 块', { retryable: true });
+  }
+
+  return done;
 }
 
 async function executeTool(
