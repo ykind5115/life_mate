@@ -29,8 +29,10 @@
 import type { LLMProvider } from '../llm/provider.js';
 import { listEventsChronological } from '../database/repository/event-store.js';
 import { findValidAt } from '../database/repository/memory-queries.js';
+import { listGoals } from '../database/repository/goal-store.js';
 import type { Event } from '../database/schema/events.js';
 import type { Memory } from '../database/schema/memories.js';
+import type { Goal } from '../database/schema/goals.js';
 
 const REVIEW_SYSTEM_PROMPT = `你是 LifeMate，正在帮用户回顾一段时间的生活。
 
@@ -89,18 +91,22 @@ export interface LifeReviewResult {
   /** 供前端展示原始材料，也让用户能核对"它是不是照着我说的写的" */
   events: Event[];
   memories: Memory[];
+  /** 这段时间内活跃的目标（docs/04 §32 的四条来源之一） */
+  goals: Goal[];
   /**
-   * 实际用到的数据来源。
+   * 实际用到的数据来源与条数。
    *
-   * ⚠️ 显式列出而不是省略：goals 与 summaries 目前没有数据
-   *    （goals 无写入路径、摘要未实现），
-   *    不说清楚的话「回顾怎么不提我的目标」会被当成 bug 排查很久。
+   * ⚠️ 显式列出而不是省略：docs/04 §32 画了四条来源
+   *    （Timeline / Memories / Goals / Summaries），
+   *    当前只接入了三条 —— 摘要还没接进回顾。
+   *    不说清楚的话「回顾怎么没提我之前的对话」会被当成 bug 排查很久。
    */
   sourcesAvailable: {
     events: number;
     memories: number;
+    goals: number;
     /** 未接入的来源及原因 */
-    unavailable: { source: 'goals' | 'summaries'; reason: string }[];
+    unavailable: { source: 'summaries'; reason: string }[];
   };
 }
 
@@ -122,13 +128,18 @@ export async function generateLifeReview(
   });
 
   const memories = await loadMemoriesForPeriod(input);
+  const goals = await loadGoalsForPeriod(input);
 
   const unavailable: LifeReviewResult['sourcesAvailable']['unavailable'] = [
-    { source: 'goals', reason: 'goals 表尚无写入路径（抽取器不产出 Goal 实体）' },
-    { source: 'summaries', reason: '会话摘要功能未实现（docs/02 §24）' },
+    {
+      source: 'summaries',
+      reason:
+        '会话摘要已生成并用于对话上下文，但尚未接入 Life Review 的材料' +
+        '（docs/04 §32 把它列为来源之一，接它需要按区间关联会话，尚未实现）',
+    },
   ];
 
-  if (events.length === 0 && memories.length === 0) {
+  if (events.length === 0 && memories.length === 0 && goals.length === 0) {
     return {
       period: { from: input.from, to: input.to },
       review: {
@@ -138,7 +149,8 @@ export async function generateLifeReview(
       },
       events,
       memories,
-      sourcesAvailable: { events: 0, memories: 0, unavailable },
+      goals,
+      sourcesAvailable: { events: 0, memories: 0, goals: 0, unavailable },
     };
   }
 
@@ -147,7 +159,10 @@ export async function generateLifeReview(
   const res = await provider.generate({
     messages: [
       { role: 'system', content: REVIEW_SYSTEM_PROMPT },
-      { role: 'user', content: buildReviewMaterials(input.from, input.to, events, memories) },
+      {
+        role: 'user',
+        content: buildReviewMaterials(input.from, input.to, events, memories, goals),
+      },
     ],
     maxOutputTokens: 4096,
   });
@@ -159,7 +174,13 @@ export async function generateLifeReview(
     review,
     events,
     memories,
-    sourcesAvailable: { events: events.length, memories: memories.length, unavailable },
+    goals,
+    sourcesAvailable: {
+      events: events.length,
+      memories: memories.length,
+      goals: goals.length,
+      unavailable,
+    },
   };
 }
 
@@ -170,15 +191,20 @@ export async function generateLifeReview(
 /**
  * 拼装给模型看的材料。
  *
- * ⚠️ 事件带 id，记忆不带 —— 因为 highlights 要能引用事件 id。
- *    给记忆 id 没有用（回顾里不需要指向某条记忆），
+ * ⚠️ 事件带 id，记忆与目标不带 —— 因为 highlights 要能引用事件 id。
+ *    给记忆/目标 id 没有用（回顾里不需要指向某条记忆或某个目标），
  *    反而会让模型倾向于输出 id 而挤占正文。
+ *
+ * ⚠️ 目标单独成段而不是混进记忆：目标是**仍在进行**的东西，
+ *    与「发生过的事」在时态上不同。混在一起会让模型把
+ *    「想学吉他」写成「学了吉他」。
  */
 export function buildReviewMaterials(
   from: Date,
   to: Date,
   events: Event[],
-  memories: Memory[]
+  memories: Memory[],
+  goals: Goal[] = []
 ): string {
   const range = `${formatDate(from)} 至 ${formatDate(to)}`;
 
@@ -199,6 +225,19 @@ export function buildReviewMaterials(
       ? memories.map((m) => `- [${m.type}] ${m.content}`).join('\n')
       : '（无）';
 
+  const goalLines =
+    goals.length > 0
+      ? goals
+          .map(
+            (g) =>
+              `- ${g.title}（${goalStatusText(g.status)}` +
+              (g.targetAt ? `，目标时间 ${formatDate(g.targetAt)}` : '') +
+              '）' +
+              (g.description ? `：${g.description}` : '')
+          )
+          .join('\n')
+      : '（无）';
+
   return [
     `回顾区间：${range}`,
     '',
@@ -208,8 +247,22 @@ export function buildReviewMaterials(
     '## 这段时间有效的长期记忆',
     memoryLines,
     '',
+    '## 用户当前的目标（仍在进行中，不是已经完成的事）',
+    goalLines,
+    '',
     '请按契约输出 JSON。',
   ].join('\n');
+}
+
+function goalStatusText(status: string): string {
+  const map: Record<string, string> = {
+    active: '进行中',
+    paused: '已搁置',
+    completed: '已完成',
+    cancelled: '已放弃',
+    archived: '已归档',
+  };
+  return map[status] ?? status;
 }
 
 /**
@@ -224,6 +277,29 @@ export function buildReviewMaterials(
 async function loadMemoriesForPeriod(input: LifeReviewInput): Promise<Memory[]> {
   const all = await findValidAt({ userId: input.userId, at: input.to });
   return all.slice(0, input.maxMemories ?? 50);
+}
+
+/**
+ * 取该区间内活跃的目标。
+ *
+ * 【为什么按「创建时间 ≤ 区间终点」筛，而不是要求它在这段时间内创建】
+ *   回顾的目的是「这段时间我的生活是什么样」——
+ *   一个三个月前立下、至今仍在推进的目标，**属于**这段回顾。
+ *   只取「在这段时间内新建的」会漏掉持续进行中的主线。
+ *
+ * 【为什么排除已终结的状态】
+ *   completed / cancelled / archived 的目标属于「已经结束的事」，
+ *   它们在这段时间里没有"进行"的部分，列进去会让回顾显得杂乱。
+ *   若用户想回顾「我完成过哪些目标」，那是另一个视角（按 completed_at 查）。
+ */
+async function loadGoalsForPeriod(input: LifeReviewInput): Promise<Goal[]> {
+  const page = await listGoals({
+    userId: input.userId,
+    status: ['active', 'paused'],
+    limit: 30,
+  });
+
+  return page.items.filter((g) => g.createdAt.getTime() <= input.to.getTime());
 }
 
 // ============================================================

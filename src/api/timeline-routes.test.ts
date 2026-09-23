@@ -14,11 +14,13 @@
 import assert from 'node:assert/strict';
 import { after, test } from 'node:test';
 import type { FastifyInstance, InjectOptions, LightMyRequestResponse } from 'fastify';
-import { eq } from 'drizzle-orm';
+import { eq, inArray } from 'drizzle-orm';
 
 import { closePool, db } from '../database/client.js';
 import { events } from '../database/schema/events.js';
 import { memories } from '../database/schema/memories.js';
+import { goals } from '../database/schema/goals.js';
+import { memorySources } from '../database/schema/memory-sources.js';
 import { ensureDefaultUser } from '../database/repository/user-store.js';
 import { assertTestDatabase } from '../shared/test-guard.js';
 import { buildServer } from './server.js';
@@ -85,14 +87,18 @@ async function withTimeline(fn: (f: TimelineFixture) => Promise<void>): Promise<
 
   const user = await ensureDefaultUser();
   /**
-   * 前置：清空该用户名下的**事件与记忆**。
+   * 前置：清空该用户名下的**事件、记忆与目标**。
    *
-   * ⚠️ 记忆也必须清 —— Life Review 的材料是「事件 + 该区间内有效的记忆」，
-   *    而 findValidAt 会扫到库里其他用例留下的记忆。
-   *    实测踩到：只清事件时，「无材料」用例因为仍有遗留记忆而真的调了 LLM。
+   * ⚠️ 三者都要清，因为 Life Review 的材料是「事件 + 该区间内有效的记忆 + 活跃目标」。
+   *    实测踩到两次：
+   *      ① 只清事件时，「无材料」用例因为仍有遗留记忆而真的调了 LLM
+   *      ② 只清事件与记忆时，上个用例留下的目标仍然计入材料
+   *
+   * ⚠️ 清理顺序不可调换：memory_sources.goal_id 引用 goals，
+   *    goals 引用 users（RESTRICT）。先删来源行 → 记忆 → 目标。
    */
   await db.delete(events).where(eq(events.userId, user.id));
-  await db.delete(memories).where(eq(memories.userId, user.id));
+  await cleanupMemoriesAndGoals(user.id);
 
   const seedEvent: TimelineFixture['seedEvent'] = async (e) => {
     const rows = await db
@@ -113,7 +119,27 @@ async function withTimeline(fn: (f: TimelineFixture) => Promise<void>): Promise<
   } finally {
     await app.close();
     await db.delete(events).where(eq(events.userId, user.id));
-    await db.delete(memories).where(eq(memories.userId, user.id));
+    await cleanupMemoriesAndGoals(user.id);
+  }
+}
+
+/**
+ * 清掉某用户名下的记忆与目标。
+ *
+ * ⚠️ 顺序不可调换：memory_sources.goal_id 引用 goals，
+ *    而 chk_sources_has_origin 要求来源行至少有一个指针。
+ *    直接删 goals 会被外键挡住；先删来源行再删记忆、最后删 goals。
+ */
+async function cleanupMemoriesAndGoals(userId: string): Promise<void> {
+  const userGoals = await db.select({ id: goals.id }).from(goals).where(eq(goals.userId, userId));
+  const goalIds = userGoals.map((g) => g.id);
+
+  if (goalIds.length > 0) {
+    await db.delete(memorySources).where(inArray(memorySources.goalId, goalIds));
+  }
+  await db.delete(memories).where(eq(memories.userId, userId));
+  if (goalIds.length > 0) {
+    await db.delete(goals).where(inArray(goals.id, goalIds));
   }
 }
 
@@ -534,22 +560,61 @@ test('POST /life-review 无材料时**不调用 LLM**，直接返回说明', asy
   });
 });
 
-test('POST /life-review 显式报告 goals / summaries 未接入', async () => {
-  await withTimeline(async ({ app }) => {
+test('POST /life-review 已接入 goals，并显式报告 summaries 未接入', async () => {
+  await withTimeline(async ({ app, userId }) => {
+    // 造一个进行中的目标，确认它进了回顾材料
+    await db.insert(goals).values({
+      userId,
+      title: '学会弹吉他',
+      status: 'active',
+      priority: 0.8,
+    });
+
     const res = await req(app, {
       method: 'POST',
       url: '/api/v1/life-review',
-      payload: { start: '2026-08-01', end: '2026-08-31' },
+      /**
+       * ⚠️ 区间终点必须在目标创建时间**之后**。
+       *    loadGoalsForPeriod 会按「创建时间 ≤ 区间终点」筛 ——
+       *    回顾 8 月时，9 月才立的目标不该出现（那时它还不存在）。
+       *    本用例刚插入的目标是「现在」创建的，因此区间要往后放。
+       */
+      payload: { start: '2026-08-01', end: '2027-12-31' },
     });
 
     const sources = res.json().data.sources_available;
+
     /**
-     * 显式列出未接入的来源，而不是假装聚合了四条（docs/04 §32 的流程图）。
-     * 不说清楚的话「回顾怎么不提我的目标」会被当成 bug 排查很久。
+     * goals 已接入（本次新增的 Goal 管理给了它数据源）。
+     * summaries 仍未接入 —— 摘要已生成并用于对话上下文，
+     * 但按区间关联会话尚未实现。显式报告而不是假装聚合了四条来源。
      */
-    assert.equal(sources.unavailable.length, 2);
-    assert.ok(sources.unavailable.some((s: { source: string }) => s.source === 'goals'));
-    assert.ok(sources.unavailable.some((s: { source: string }) => s.source === 'summaries'));
+    assert.equal(sources.goals, 1, '进行中的目标应计入材料');
+    assert.equal(sources.unavailable.length, 1);
+    assert.equal(sources.unavailable[0].source, 'summaries');
+
+    // 目标应出现在材料里，供用户核对
+    assert.equal(res.json().data.materials.goals.length, 1);
+    assert.equal(res.json().data.materials.goals[0].title, '学会弹吉他');
+  });
+});
+
+test('Life Review 不纳入区间终点之后才创建的目标', async () => {
+  await withTimeline(async ({ app, userId }) => {
+    await db.insert(goals).values({ userId, title: '未来才立的目标', status: 'active' });
+
+    // 回顾一段很久以前的时间：那时这个目标还不存在
+    const res = await req(app, {
+      method: 'POST',
+      url: '/api/v1/life-review',
+      payload: { start: '2020-01-01', end: '2020-12-31' },
+    });
+
+    assert.equal(
+      res.json().data.sources_available.goals,
+      0,
+      '回顾过去时不该出现当时还不存在的目标'
+    );
   });
 });
 

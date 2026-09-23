@@ -82,6 +82,12 @@ export async function registerLifeReviewRoutes(
           type: m.type,
           content: m.content,
         })),
+        goals: result.goals.map((g) => ({
+          id: g.id,
+          title: g.title,
+          status: g.status,
+          target_at: g.targetAt,
+        })),
       },
       sources_available: result.sourcesAvailable,
     });

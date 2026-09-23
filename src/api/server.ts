@@ -32,6 +32,7 @@ import { registerMemoryRoutes } from './routes/memories.js';
 import { registerSettingsRoutes } from './routes/settings.js';
 import { registerTimelineRoutes } from './routes/timeline.js';
 import { registerLifeReviewRoutes } from './routes/life-review.js';
+import { registerGoalRoutes } from './routes/goals.js';
 import type { IdempotencyStore } from './idempotency.js';
 import type { ChatResult } from '../conversation/chat-service.js';
 
@@ -168,6 +169,7 @@ export async function buildServer(options: BuildServerOptions = {}): Promise<Fas
       await registerLifeReviewRoutes(v1, {
         ...(options.provider !== undefined ? { provider: options.provider } : {}),
       });
+      await registerGoalRoutes(v1);
     },
     { prefix: '/api/v1' }
   );

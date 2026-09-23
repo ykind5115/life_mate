@@ -326,6 +326,93 @@ export const lifeReviewRequestSchema = z
   );
 
 // ============================================================
+// Goals（docs/03 §21、§13.10）
+// ============================================================
+
+/**
+ * Goal 状态。取值来自 enums.ts，与库层 chk_goals_status 同源。
+ *
+ * docs/04 §50 的接口清单里**没有** goals 端点 ——
+ * 那是文档的遗漏：§13.10 明确要求「用户不可直接新建 type='goal' 的记忆
+ * （必须通过 Goal 实体）」，若没有 Goal 的 API，
+ * 用户就**完全没有**创建目标的途径，而 PRD §7.4 的「我的记忆」
+ * 把「目标」列为一类。
+ *
+ * 因此本组端点是「补齐文档遗漏」而非发明新功能。已记入交付说明。
+ */
+export const GOAL_STATUS_ENUM = [
+  'active',
+  'paused',
+  'completed',
+  'cancelled',
+  'archived',
+] as const;
+
+export const listGoalsQuerySchema = paginationSchema.extend({
+  /** 逗号分隔，如 status=active,paused */
+  status: z
+    .string()
+    .optional()
+    .transform((v) =>
+      v === undefined
+        ? undefined
+        : v
+            .split(',')
+            .map((s) => s.trim())
+            .filter((s) => s.length > 0)
+    )
+    .pipe(z.array(z.enum(GOAL_STATUS_ENUM)).optional()),
+});
+
+export const goalIdParamSchema = z.object({ id: uuidSchema });
+
+export const createGoalSchema = z
+  .object({
+    title: z.string().min(1, '目标名称不能为空').max(MAX_TITLE_LENGTH),
+    description: z.string().max(2000).nullish(),
+    /** 优先级 0~1。缺省 0.5 */
+    priority: z.number().min(0).max(1).optional(),
+    /** 开始时间。缺省为 null（未记录起点） */
+    started_at: z.string().min(1).nullish(),
+    /** 目标时间 */
+    target_at: z.string().min(1).nullish(),
+  })
+  .strict();
+
+/**
+ * 更新目标。
+ *
+ * ⚠️ 允许改 title / description：
+ *    Goal 与记忆不同，它不是「不可变事实」——
+ *    目标名称写错了就该能改。改标题时 service 会重建投影记忆
+ *    （不是就地改记忆正文，那违反 Q1）。
+ */
+export const updateGoalSchema = z
+  .object({
+    title: z.string().min(1).max(MAX_TITLE_LENGTH).optional(),
+    description: z.string().max(2000).nullish(),
+    status: z.enum(GOAL_STATUS_ENUM).optional(),
+    priority: z.number().min(0).max(1).optional(),
+    started_at: z.string().min(1).nullish(),
+    target_at: z.string().min(1).nullish(),
+    completed_at: z.string().min(1).nullish(),
+  })
+  .strict();
+
+export const deleteGoalQuerySchema = z.object({
+  /**
+   * 是否物理删除。缺省软删除（可恢复）。
+   *
+   * ⚠️ 与记忆的删除口径一致：默认走安全的那条。
+   *    物理删除会连带失效投影记忆（C24 的顺序），不可逆。
+   */
+  hard: z
+    .enum(['true', 'false'])
+    .default('false')
+    .transform((v) => v === 'true'),
+});
+
+// ============================================================
 // 内部再导出，供 route 做枚举校验
 // ============================================================
 
