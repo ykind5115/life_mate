@@ -23,7 +23,13 @@ import {
   decay,
   typeAwareRecency,
 } from './retrieval-fusion.js';
-import { NORM_VECTOR_MIN, RRF_K, RERANK_WEIGHTS, SOURCE_COUNT_SATURATION } from './retrieval-config.js';
+import {
+  NORM_VECTOR_MAX,
+  NORM_VECTOR_MIN,
+  RRF_K,
+  RERANK_WEIGHTS,
+  SOURCE_COUNT_SATURATION,
+} from './retrieval-config.js';
 
 // ============================================================
 // 测试数据构造
@@ -113,21 +119,30 @@ test('fuseByRrf：空输入返回空 Map，不抛错', () => {
 
 test('normalizeVector：低于下界的相似度归零，不按 [-1,1] 线性映射', () => {
   /**
-   * 这是关键的一条。真实短文本的无关内容余弦相似度常在 0.3~0.6，
-   * 若按 [-1,1] 映射，0.5 会得到 0.75 的高分 ——
+   * 这是关键的一条。bge-m3 在短文本上的实际相似度集中在 0.3~0.65，
+   * 若按 [-1,1] 映射，一个 0.45 的「无关」结果会得到 0.72 的高分 ——
    * 占权重 0.55 的那一项就变成了噪音源。
    */
-  assert.equal(normalizeVector(0.5), 0);
-  assert.equal(normalizeVector(0.3), 0);
+  assert.equal(normalizeVector(NORM_VECTOR_MIN), 0);
+  assert.equal(normalizeVector(NORM_VECTOR_MIN - 0.1), 0);
   assert.equal(normalizeVector(-0.2), 0);
+
+  /**
+   * ⚠️ 断言用常量而不是硬编码 0.5：
+   *    NORM_VECTOR_MIN 是**实测校准值**（2026-09-23 从 0.5 改为 0.35，
+   *    因为它把 87.5% 的相似度都归零了）。硬编码会让每次校准都误报失败。
+   */
+  assert.ok(NORM_VECTOR_MIN < 0.45, '下界应低于「无关」内容的相似度区间上界');
 });
 
 test('normalizeVector：下界之上线性映射到 [0,1]，上界封顶', () => {
-  assert.equal(normalizeVector(1.0), 1);
+  assert.equal(normalizeVector(NORM_VECTOR_MAX), 1);
   assert.equal(normalizeVector(1.5), 1, '超过理论上界也封顶');
   assert.equal(normalizeVector(NORM_VECTOR_MIN), 0);
-  // 0.75 恰好在 0.5 与 1.0 的中点
-  assert.equal(normalizeVector(0.75), 0.5);
+
+  // 下界与上界的中点应映射到 0.5
+  const mid = (NORM_VECTOR_MIN + NORM_VECTOR_MAX) / 2;
+  assert.ok(Math.abs(normalizeVector(mid) - 0.5) < 1e-9);
 });
 
 test('normalizeVector：没有向量分（undefined）得 0，不抛错', () => {

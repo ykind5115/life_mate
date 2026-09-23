@@ -25,7 +25,7 @@ import { memories, type Memory } from '../schema/memories.js';
 import { memoryEmbeddings } from '../schema/memory-embeddings.js';
 import { currentMemoryCondition } from './conditions.js';
 import type { ExecutorOption } from './types.js';
-import { buildBigrams, MIN_BIGRAM_HIT_RATIO } from '../../memory/chinese-ngram.js';
+import { buildBigrams, idf, idfWeightedScore, MIN_IDF_SCORE } from '../../memory/chinese-ngram.js';
 
 /** 单通道候选数。§18.2 规定各通道取 Top-50 再融合 */
 export const DEFAULT_CHANNEL_LIMIT = 50;
@@ -104,7 +104,7 @@ export interface KeywordCandidate {
 }
 
 /**
- * 关键词通道：应用层字符 bigram（**不是 pg_trgm**）
+ * 关键词通道：应用层字符 bigram + IDF 加权（**不是 pg_trgm**）
  *
  * 🔴 【为什么不用 pg_trgm —— 实测确认它不支持中文】
  *   docs/03 §17.4 的 C16 决定用 pg_trgm，理由写的是「按字符三元组匹配，
@@ -113,34 +113,33 @@ export interface KeywordCandidate {
  *     SELECT show_trgm('用户住在杭州');   -- → {}    空集
  *     SELECT show_trgm('hello world');    -- → {"  h"," he",...}
  *
- *   pg_trgm 的默认解析器只把字母与数字当词，CJK 全被忽略
- *   → 中文不产生任何三元组 → similarity() 恒为 0 →
- *   **关键词通道对中文完全失效**，混合检索退化成单路向量检索。
+ *   解析器只把字母与数字当词，CJK 全被忽略 → similarity() 恒为 0 →
+ *   关键词通道对中文完全失效。替代方案（tsvector / pg_bigm / pgroonga）
+ *   也都不可用，详见 memory/chinese-ngram.ts 的文件头。
  *
- *   替代方案也排除了：tsvector 把整句当一个词元；
- *   pg_bigm / pgroonga / zhparser 不在 pg_available_extensions 里
- *   （镜像 pgvector/pgvector:pg18 只带 pg_trgm）。
+ * 🔴 【为什么用 IDF 加权而不是纯命中率 —— 实测数据】
+ *   纯命中率（命中数/查询 bigram 总数）在中文上不可用：
+ *     查询「我现在住在哪个城市？」→ 8 个 bigram，
+ *       我现 现在 在住 住在 在哪 哪个 个城 城市
+ *     记忆「用户居住在杭州」只命中「住在」→ 1/8 = 0.13。
+ *   但「住在」恰恰是内容词，分母里七个虚词本就不该命中。
+ *   实测 16 个查询只有 2 个能过 0.3 阈值 —— 通道基本没在工作。
  *
- * 【本实现】
- *   在应用层把查询切成字符 bigram，用 LIKE 在库里筛，
- *   按「命中的不同 bigram 数 / 总数」打分。细节见 memory/chinese-ngram.ts。
+ *   改为 IDF 加权后：
+ *     · 「什么」「我有」这类几乎人人皆有的 bigram 权重趋近 0
+ *     · 「城市」「雅思」这类少见的 bigram 权重高，单命中即可入选
  *
- * 【性能】与 §18.1 不建向量索引同理：接受顺序扫描。
- *   数据量 < 5 万条短文本，LIKE 全表扫在几十毫秒级。
- *   真要优化应换镜像装 pg_bigm，而不是回到 pg_trgm。
- *
- * ⚠️ memories 上那个 gin_trgm_ops 索引（idx_memories_content_trgm）
- *    对中文无用（索引里没有任何中文三元组）。它现在只是写入开销，
- *    应随 C16 的修订一起删除 —— 那需要改 docs/03 走 Schema 变更流程，
- *    因此本次**保留不动**，已记入交付说明。
+ * 【成本】每条查询多一次 df 统计（一次全表聚合）。
+ *   与 §18.1 不建向量索引同理：数据量 < 5 万条短文本，可接受。
+ *   bigram 数量受 MAX_BIGRAMS 限制，因此是「一次聚合 + 一个带 N 个 CASE 的扫描」。
  */
 export async function searchByKeyword(
   params: {
     userId: string;
     query: string;
     limit?: number;
-    /** 命中率下限。缺省 MIN_BIGRAM_HIT_RATIO（见 chinese-ngram.ts） */
-    minRatio?: number;
+    /** IDF 分数下限。缺省 MIN_IDF_SCORE */
+    minScore?: number;
     extra?: SQL | undefined;
   },
   options: ExecutorOption = {}
@@ -151,48 +150,126 @@ export async function searchByKeyword(
   const bigrams = buildBigrams(params.query);
   if (bigrams.length === 0) return [];
 
-  const minRatio = params.minRatio ?? MIN_BIGRAM_HIT_RATIO;
+  const minScore = params.minScore ?? MIN_IDF_SCORE;
 
   /**
-   * 命中率在 SQL 里算，而不是把所有候选拉回 Node 再筛。
+   * 文档频率统计。
    *
-   * 为什么不「先 LIKE 任一 bigram 拉回来再算」：
-   * 单字重合的记忆可能很多（「的」「用」这类），
-   * 全量拉回会浪费带宽与内存。让库先按命中数过滤一轮更省。
+   * 与候选查询分开两次查询而不是一次 CTE：
+   * df 是**全语料**统计（不含候选过滤），候选是带条件的扫描。
+   * 合成一条会让 SQL 难读，且优化器未必更优。
    */
+  const { docCount, docFreq } = await computeDocFreq(params.userId, bigrams, options);
+
+  /**
+   * ⚠️ 语料很小时的退化处理。
+   *
+   * idf 是相对值：只有 1 条记忆时，「钢琴」的 idf 也只有 0.1，
+   * 达不到 MIN_IDF_SCORE=1.0 —— 于是关键词通道在极小语料上完全不出结果。
+   * 那不是「没有字面命中」，而是「统计量算不出来」，两者不该混为一谈。
+   *
+   * 因此：语料少于 10 条时改用「是否命中」做判据（分数用命中数），
+   * 统计意义要等语料够大才成立。
+   */
+  const useRawCount = docCount < 10;
+
+  const maxPossible = bigrams.reduce((s, g) => s + idf(docCount, docFreq.get(g) ?? 0), 0);
+  if (!useRawCount && maxPossible < minScore) return [];
+
   const hitExpr = sql.join(
     bigrams.map((g) => sql`(CASE WHEN ${memories.content} LIKE ${'%' + g + '%'} THEN 1 ELSE 0 END)`),
     sql` + `
   );
 
-  const hits = sql<number>`(${hitExpr})`;
-
+  // 候选筛选：至少命中一个 bigram，避免全表返回
   const rows = await exec
-    .select({ memory: memories, hits })
+    .select({ memory: memories })
     .from(memories)
     .where(
       and(
         eq(memories.userId, params.userId),
         currentMemoryCondition(),
-        // 至少命中一个 bigram（避免全表返回）
         sql`(${hitExpr}) > 0`,
         ...(params.extra ? [params.extra] : [])
       )
     )
-    // 按命中数降序；命中数相同时按长度短的优先（短正文里的命中更有信息量）
-    .orderBy(desc(hits), sql`length(${memories.content})`)
-    .limit(limit);
+    // 命中数只用于**粗排**（真正排序在 Node 侧按 IDF 算），
+    // 因此这里取一个宽松的上限：IDF 重排需要看到足够多的候选
+    .orderBy(desc(sql`(${hitExpr})`), sql`length(${memories.content})`)
+    .limit(limit * 3);
 
-  const total = bigrams.length;
+  /**
+   * IDF 加权打分在 Node 侧做。
+   *
+   * 为什么不在 SQL 里算：idf 需要每个 bigram 的 df，
+   * 那会变成一长串内联常量表达式，SQL 会变得无法阅读与调试。
+   * 候选已被粗排限制在 limit*3，Node 侧算的成本可忽略。
+   */
+  const scored = rows
+    .map((r) => {
+      const { score, matched } = idfWeightedScore(bigrams, docFreq, docCount, r.memory.content);
+      /**
+       * 小语料下用命中数当分数（见上面的 useRawCount 说明）。
+       * matched.length 是「命中了几个不同 bigram」，足以排序。
+       */
+      return { memory: r.memory, score: useRawCount ? matched.length : score, matched };
+    })
+    .filter((c) => (useRawCount ? c.score > 0 : c.score >= minScore))
+    .sort((a, b) => b.score - a.score)
+    .slice(0, limit);
 
-  return rows
-    .map((r) => ({
-      memory: r.memory,
-      // 归一化到 [0,1]，与原先 pg_trgm 的 similarity 语义一致，
-      // 这样上层（RRF 融合）不需要知道通道实现换了
-      similarity: Number(r.hits) / total,
-    }))
-    .filter((c) => c.similarity >= minRatio);
+  if (scored.length === 0) return [];
+
+  /**
+   * 归一化到 [0,1] 供 RRF 与重排使用。
+   *
+   * 除以**本批最高分**而不是理论最大值：
+   *   IDF 分数的理论上限依赖查询长度，用它做分母会让长查询被系统性压低，
+   *   而 RRF 只看排名、重排的向量项也另有归一化 ——
+   *   这里只需要一个单调的 [0,1] 分数。
+   */
+  const top = scored[0]!.score;
+
+  return scored.map((c) => ({
+    memory: c.memory,
+    similarity: top > 0 ? c.score / top : 0,
+  }));
+}
+
+/**
+ * 统计每个 bigram 的文档频率。
+ *
+ * 一条聚合查询搞定，而不是每个 bigram 查一次 —— 那样 N 个 bigram
+ * 就是 N 次全表扫描。
+ */
+async function computeDocFreq(
+  userId: string,
+  bigrams: string[],
+  options: ExecutorOption
+): Promise<{ docCount: number; docFreq: Map<string, number> }> {
+  const exec = options.executor ?? db;
+
+  const rows = await exec
+    .select({
+      total: sql<number>`count(*)::int`,
+      // 每个 bigram 一个 SUM(CASE...)，一次扫描拿到全部 df
+      ...Object.fromEntries(
+        bigrams.map((g, i) => [
+          `df${i}`,
+          sql<number>`sum(CASE WHEN ${memories.content} LIKE ${'%' + g + '%'} THEN 1 ELSE 0 END)::int`,
+        ])
+      ),
+    })
+    .from(memories)
+    .where(and(eq(memories.userId, userId), currentMemoryCondition()));
+
+  const row = rows[0] as Record<string, number> | undefined;
+  const docFreq = new Map<string, number>();
+  bigrams.forEach((g, i) => {
+    docFreq.set(g, Number(row?.[`df${i}`] ?? 0));
+  });
+
+  return { docCount: Number(row?.['total'] ?? 0), docFreq };
 }
 
 /**

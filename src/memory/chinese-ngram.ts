@@ -52,13 +52,79 @@
 export const MAX_BIGRAMS = 12;
 
 /**
- * 命中率下限。
+ * bigram 命中率下限。
  *
- * 0.3 的含义：查询里至少三成的 bigram 出现在记忆正文里才算候选。
- * 太低会让单字重合的记忆混进来，太高会漏掉换了说法的表述。
- * ⚠️ 这个值与检索权重一样属于**待评测校准**的参数。
+ * ⚠️ **已被 IDF 加权取代，不再用于筛选**。
+ *    保留这个常量只为让历史测试仍可引用它（见 chinese-ngram.test.ts
+ *    里「换了说法的查询拿低分」那条 —— 它测的是纯比率函数本身）。
+ *
+ * 【为什么纯比率不可用 —— 实测数据（2026-09-23）】
+ *   查询「我现在住在哪个城市？」切成 8 个 bigram：
+ *     我现 现在 在住 住在 在哪 哪个 个城 城市
+ *   记忆「用户居住在杭州」只命中「住在」→ 1/8 = 0.13 < 0.3 → 不入选。
+ *   但「住在」**恰恰就是内容词**，而分母里七个虚词（我现/现在/在哪/哪个…）
+ *   本就不该指望命中。
+ *
+ *   实测 16 个查询里只有 2 个能过 0.3 阈值 —— 关键词通道基本没在工作。
+ *   根因是「所有 bigram 权重相等」，而中文疑问句里虚词占多数。
  */
 export const MIN_BIGRAM_HIT_RATIO = 0.3;
+
+/**
+ * IDF 加权的命中分数下限（相对值）。
+ *
+ * 定义：score = Σ idf(g) over 命中的 bigram，其中
+ *   idf(g) = log(N / df(g))，df 是含该 bigram 的记忆数。
+ *
+ * 这样「什么」「我有」这类几乎所有记忆都含的 bigram 权重趋近 0，
+ * 而「城市」「雅思」这类少见的 bigram 权重高 —— 单命中一个罕见 bigram
+ * 就能入选，正是我们想要的。
+ *
+ * 阈值 1.0 的含义：至少要有一个「比较罕见」的 bigram 命中
+ * （df/N ≤ 1/e ≈ 0.37 时 idf = 1）。纯虚词命中达不到。
+ *
+ * ⚠️ 这是**待评测校准**的参数，与检索权重同性质。
+ */
+export const MIN_IDF_SCORE = 1.0;
+
+/**
+ * 计算一个 bigram 的逆文档频率。
+ *
+ * @param docCount   语料总条数
+ * @param docFreq    含该 bigram 的条数（≥1，否则不该被调用）
+ */
+export function idf(docCount: number, docFreq: number): number {
+  if (docFreq <= 0 || docCount <= 0) return 0;
+  // +1 平滑：避免 df = N 时 log(1) = 0 让该 bigram 完全失效
+  return Math.log((docCount + 1) / (docFreq + 1)) + 0.1;
+}
+
+/**
+ * 按 IDF 加权计算查询对某条内容的匹配分数。
+ *
+ * @param queryBigrams 查询切出的 bigram
+ * @param docFreq      每个 bigram 的文档频率（由调用方查库得到）
+ * @param docCount     语料总条数
+ * @param content      被匹配的正文
+ */
+export function idfWeightedScore(
+  queryBigrams: string[],
+  docFreq: Map<string, number>,
+  docCount: number,
+  content: string
+): { score: number; matched: string[] } {
+  const haystack = content.toLowerCase();
+  const matched: string[] = [];
+  let score = 0;
+
+  for (const g of queryBigrams) {
+    if (!haystack.includes(g)) continue;
+    matched.push(g);
+    score += idf(docCount, docFreq.get(g) ?? 0);
+  }
+
+  return { score, matched };
+}
 
 /**
  * 切出字符 bigram。

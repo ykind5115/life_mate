@@ -20,6 +20,7 @@
     "llm:check": "node --env-file=.env --import tsx src/llm/check.ts",
     "llm:e2e": "node --env-file=.env --import tsx src/memory/verify-extraction.ts",
     "eval:extraction": "node --env-file=.env --env-file-if-exists=.env.eval --import tsx src/evaluation/run-extraction-eval.ts",
+    "eval:retrieval": "node --env-file=.env --env-file-if-exists=.env.eval --import tsx src/evaluation/run-retrieval-eval.ts",
     "db:studio": "drizzle-kit studio"
   },
   "dependencies": {
