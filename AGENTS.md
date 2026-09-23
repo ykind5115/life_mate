@@ -1,11 +1,11 @@
 # AGENTS.md — 编码 Agent 工作规则
 
 > 本文件面向在本仓库中执行编码任务的 AI Agent（DSH / Claude Code / Codex / Cursor 等）。
-> 项目当前状态：**设计阶段已完成，工程实现接近 V1.0 功能齐备**。
+> 项目当前状态：**设计阶段已完成，V1.0 功能面齐备，等待真实使用与调优**。
 > 已完成：数据库 Schema + 迁移、Repository 层、LLM Provider、Agent Loop、
 > 记忆抽取流水线、记忆召回、HTTP 层（chat / SSE / conversations / memories /
-> settings / timeline / life-review）、会话摘要、离线评测。
-> 未完成：Agent 只读记忆工具、Web UI、goals 数据源、检索质量评测。
+> settings / timeline / life-review / goals）、会话摘要、离线评测。
+> 未完成：Agent 只读记忆工具、Web UI、检索质量评测、摘要接入 Life Review。
 > 详见 `docs/README.md`、`docs/09-evaluation-baseline.md` 与最近若干次提交。
 > 本文件的规则优先级高于 Agent 的个人习惯；与本文档冲突的"通常做法"一律以本文档为准。
 
