@@ -12,7 +12,7 @@
  */
 import { createHash } from 'node:crypto';
 
-import type { StoreExecutor } from '../database/repository/memory-store.js';
+import type { StoreExecutor } from '../database/repository/types.js';
 import type { Memory } from '../database/schema/memories.js';
 import type { PredicateKey } from '../database/schema/enums.js';
 import {

@@ -27,28 +27,9 @@ import { memoryEmbeddings } from '../schema/memory-embeddings.js';
 import { memorySources } from '../schema/memory-sources.js';
 import { currentMemoryCondition } from './conditions.js';
 import type { CreateMemoryInput, MemorySourceInput } from './memory-types.js';
+import type { ExecutorOption, StoreExecutor } from './types.js';
 
-/**
- * 事务内外通用的执行器类型。
- *
- * 为什么带上 transaction：Drizzle 的事务对象自身也有 .transaction()
- * （在已有事务内会生成 SAVEPOINT），因此仓库方法既能在事务外开新事务，
- * 也能被调用方传入一个外层事务，从而组合成更大的原子操作，
- * 或在测试里整体回滚。
- *
- * 显式导出（而非让调用方用条件类型推导）：推导版本既脆弱又难读，
- * 实测会推出 never、把类型检查变成假通过。
- */
-export type StoreExecutor = Pick<
-  typeof db,
-  'select' | 'insert' | 'update' | 'delete' | 'transaction'
->;
 
-/** 所有写操作都接受可选的执行器，默认使用全局 db */
-export interface ExecutorOption {
-  /** 传入外层事务以组合原子操作；不传则在自身事务内执行 */
-  executor?: StoreExecutor;
-}
 
 // ============================================================
 // 新建
@@ -540,6 +521,82 @@ export async function hardDeleteMemory(
     .returning({ id: memories.id });
 
   return rows.length > 0;
+}
+
+// ============================================================
+// Embedding 写入
+// ============================================================
+
+/**
+ * 写入或更新一条记忆的向量。
+ *
+ * ⚠️ 本函数**必须在记忆落库之后、且在独立事务中调用**（§25.2）：
+ *    生成向量的外部调用不能在事务内做，写入则是独立的一步。
+ *    这样即使 embedding 失败，记忆本体也已保存 ——
+ *    该记忆仍可被关键词通道（pg_trgm）召回，功能降级但不丢失。
+ *
+ * 用 upsert 而非 insert：重算向量的场景（content_hash 变化触发的重嵌入）
+ * 会命中 uq_embeddings_memory_model，此时应更新而不是报错。
+ *
+ * @param contentHash hash(embedded_text)，用于检测向量是否陈旧（§14.6）
+ */
+export async function upsertMemoryEmbedding(
+  params: {
+    memoryId: string;
+    model: string;
+    dim: number;
+    embeddedText: string;
+    contentHash: string;
+    /** 向量字面量，形如 '[0.1,0.2,...]'。由调用方负责格式化 */
+    embeddingLiteral: string;
+  },
+  options: ExecutorOption = {}
+): Promise<void> {
+  const exec = options.executor ?? db;
+
+  await exec
+    .insert(memoryEmbeddings)
+    .values({
+      memoryId: params.memoryId,
+      model: params.model,
+      dim: params.dim,
+      embeddedText: params.embeddedText,
+      contentHash: params.contentHash,
+      // pgvector 不接受普通数组，需用 SQL 字面量转型
+      embedding: sql`${params.embeddingLiteral}::vector`,
+      status: 'ready',
+    })
+    .onConflictDoUpdate({
+      target: [memoryEmbeddings.memoryId, memoryEmbeddings.model],
+      set: {
+        dim: params.dim,
+        embeddedText: params.embeddedText,
+        contentHash: params.contentHash,
+        embedding: sql`${params.embeddingLiteral}::vector`,
+        // 重算成功后回到 ready —— 从 stale/failed 恢复
+        status: 'ready',
+      },
+    });
+}
+
+/**
+ * 把某条记忆的向量标记为指定状态。
+ *
+ * 用途：
+ *   · 正文变化 → 置 'stale'，检索时不再召回（§14.6）
+ *   · 记忆删除 → 置 'deleted'，与记忆状态保持一致
+ */
+export async function setEmbeddingStatus(
+  memoryId: string,
+  status: 'ready' | 'stale' | 'failed' | 'deleted',
+  options: ExecutorOption = {}
+): Promise<void> {
+  const exec = options.executor ?? db;
+
+  await exec
+    .update(memoryEmbeddings)
+    .set({ status })
+    .where(eq(memoryEmbeddings.memoryId, memoryId));
 }
 
 // ============================================================

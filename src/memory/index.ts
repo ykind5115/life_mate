@@ -37,5 +37,19 @@ export {
   slotFingerprint,
   type CandidateOutcome,
   type ProcessCandidateOptions,
+  type ExecutorLike,
   type SlotAdjudicator,
 } from './candidate-processor.js';
+
+export {
+  runExtraction,
+  EXTRACTOR_VERSION,
+  type RunExtractionParams,
+  type ExtractionSummary,
+} from './extraction-pipeline.js';
+
+export {
+  LlmSlotAdjudicator,
+  parseVerdict,
+  type SlotVerdict,
+} from './slot-adjudicator.js';
