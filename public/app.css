@@ -146,6 +146,61 @@ html, body {
 
 /* ---------- 对话 ---------- */
 
+/* 会话列表 + 对话区 的两栏布局 */
+.chat-layout {
+  display: grid;
+  grid-template-columns: 240px 1fr;
+  height: 100vh;
+  overflow: hidden;
+}
+
+.conv-list {
+  border-right: 1px solid var(--border);
+  background: var(--bg-soft);
+  display: flex;
+  flex-direction: column;
+  overflow: hidden;
+}
+
+.conv-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  padding: 14px 12px 10px;
+  border-bottom: 1px solid var(--border);
+  font-size: 12px;
+}
+
+#conversations {
+  overflow-y: auto;
+  padding: 8px;
+  display: flex;
+  flex-direction: column;
+  gap: 3px;
+}
+
+.conv-item {
+  padding: 8px 10px;
+  border-radius: 7px;
+  cursor: pointer;
+  border: 1px solid transparent;
+  transition: background 0.12s;
+}
+.conv-item:hover { background: var(--bg-card); }
+.conv-item.current { background: var(--bg-card); border-color: var(--accent-dim); }
+
+.conv-title {
+  font-size: 13px;
+  color: var(--text);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.conv-meta { font-size: 11px; color: var(--text-faint); margin-top: 2px; }
+
+.chat-main { display: flex; flex-direction: column; overflow: hidden; }
+
 .messages {
   flex: 1;
   overflow-y: auto;
@@ -289,4 +344,18 @@ html, body {
   .sidebar-foot { margin-top: 0; margin-left: auto; }
   .messages, .list { padding: 14px; }
   .composer { padding: 11px 14px 15px; }
+
+  /* 窄屏时会话列表收起为横向条，不占整列 */
+  .chat-layout { grid-template-columns: 1fr; }
+  .conv-list {
+    flex-direction: row;
+    align-items: center;
+    border-right: none;
+    border-bottom: 1px solid var(--border);
+    overflow-x: auto;
+    max-height: 62px;
+  }
+  .conv-head { border-bottom: none; flex-shrink: 0; }
+  #conversations { flex-direction: row; overflow-x: auto; overflow-y: hidden; }
+  .conv-item { flex-shrink: 0; max-width: 170px; }
 }

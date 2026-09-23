@@ -37,31 +37,48 @@
       <main class="main">
         <!-- ==================== 对话 ==================== -->
         <section class="view" id="view-chat">
-          <header class="view-head">
-            <h1>对话</h1>
-            <div class="head-actions">
-              <span id="chat-hint" class="hint"></span>
-              <button id="btn-new-chat" class="btn">新会话</button>
-            </div>
-          </header>
+          <!--
+            左侧会话列表。
+            后端一直有 GET /conversations，但之前界面上没有入口 ——
+            等于「聊完就找不回来了」。会话是长期使用的主要资产之一，
+            没有它用户不敢开新会话。
+          -->
+          <div class="chat-layout">
+            <aside class="conv-list">
+              <div class="conv-head">
+                <span class="dim">历史会话</span>
+                <button id="btn-new-chat" class="btn small">+ 新会话</button>
+              </div>
+              <div id="conversations"></div>
+            </aside>
 
-          <div id="messages" class="messages">
-            <div class="empty">
-              <p>聊点什么吧。</p>
-              <p class="dim">
-                你说的话会被后台整理成长期记忆。下次相关的时候它会自己想起来。
-              </p>
+            <div class="chat-main">
+              <header class="view-head">
+                <h1 id="chat-title">对话</h1>
+                <div class="head-actions">
+                  <span id="chat-hint" class="hint"></span>
+                </div>
+              </header>
+
+              <div id="messages" class="messages">
+                <div class="empty">
+                  <p>聊点什么吧。</p>
+                  <p class="dim">
+                    你说的话会被后台整理成长期记忆。下次相关的时候它会自己想起来。
+                  </p>
+                </div>
+              </div>
+
+              <form id="composer" class="composer">
+                <textarea
+                  id="input"
+                  rows="1"
+                  placeholder="说点什么…（Enter 发送，Shift+Enter 换行）"
+                ></textarea>
+                <button type="submit" id="btn-send" class="btn primary">发送</button>
+              </form>
             </div>
           </div>
-
-          <form id="composer" class="composer">
-            <textarea
-              id="input"
-              rows="1"
-              placeholder="说点什么…（Enter 发送，Shift+Enter 换行）"
-            ></textarea>
-            <button type="submit" id="btn-send" class="btn primary">发送</button>
-          </form>
         </section>
 
         <!-- ==================== 记忆 ==================== -->

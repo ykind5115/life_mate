@@ -133,7 +133,126 @@ async function checkHealth() {
 let conversationId = null;
 let streaming = false;
 
-function addMessage(role, text) {
+/**
+ * 加载历史会话列表。
+ *
+ * ⚠️ 每次发完消息、切换会话都要重新加载 —— 因为 updated_at 变了，
+ *    顺序会变（最近聊的排最前）。不刷新的话列表顺序会「卡住」，
+ *    用户找不到刚聊过的那个。
+ */
+async function loadConversations() {
+  const box = $('#conversations');
+  try {
+    const data = await api('GET', '/conversations?page_size=50');
+    const items = data.items ?? [];
+
+    if (items.length === 0) {
+      box.replaceChildren(el('div', { class: 'dim', style: 'padding:8px 10px', text: '还没有会话' }));
+      return;
+    }
+
+    box.replaceChildren(
+      ...items.map((c) => {
+        const node = el('div', {
+          class: `conv-item ${c.id === conversationId ? 'current' : ''}`,
+          onclick: () => openConversation(c.id),
+        }, [
+          // 标题为空时给个占位 —— 空条目看起来像 bug
+          el('div', { class: 'conv-title', text: c.title || '（未命名会话）' }),
+          el('div', { class: 'conv-meta', text: relTime(c.updated_at) }),
+        ]);
+
+        // 删除按钮：hover 才显眼，但一直存在（触屏没有 hover）
+        const del = el('button', {
+          class: 'btn small danger',
+          text: '×',
+          title: '删除这个会话',
+          style: 'float:right;margin-top:-20px;padding:1px 7px;opacity:.55',
+          onclick: async (ev) => {
+            // 阻止冒泡，否则会同时触发「打开会话」
+            ev.stopPropagation();
+            if (!confirm('删除这个会话？\n\n消息会被彻底删除，但已整理出的长期记忆会保留。')) return;
+            try {
+              await api('DELETE', `/conversations/${c.id}`);
+              // 删掉的正是当前打开的 → 回到新会话状态
+              if (c.id === conversationId) startNewChat();
+              loadConversations();
+            } catch (err) {
+              alert(`删除失败：${err.message}`);
+            }
+          },
+        });
+        node.appendChild(del);
+        return node;
+      })
+    );
+  } catch (err) {
+    box.replaceChildren(el('div', { class: 'dim', style: 'padding:8px 10px', text: `加载失败：${err.message}` }));
+  }
+}
+
+/**
+ * 打开一个历史会话：把消息读回来渲染，并把它设为当前会话。
+ *
+ * 打开之后可以**继续在这个会话里聊** —— 后端会把新消息追加进去，
+ * 而且模型能看到该会话之前的历史（最近 20 条原文）。
+ *
+ * ⚠️ 用 /conversations/:id 而不是 /conversations/:id/messages：
+ *    前者返回 title 与 status，后者只有消息数组。
+ *    分页接口更适合「加载更多」，而打开一个会话需要标题。
+ */
+async function openConversation(id) {
+  const box = $('#messages');
+  box.replaceChildren(el('div', { class: 'dim', text: '加载中…' }));
+
+  try {
+    const data = await api('GET', `/conversations/${id}`);
+    const items = data.messages ?? [];
+
+    conversationId = id;
+    $('#chat-title').textContent = data.title || '对话';
+
+    if (items.length === 0) {
+      // 已删除的会话其消息是物理删除的（C29），因此这里为空是正常状态
+      box.replaceChildren(
+        el('div', { class: 'empty' }, [
+          el('p', { text: data.status === 'deleted' ? '这个会话已被删除。' : '这个会话还没有消息。' }),
+          ...(data.status === 'deleted'
+            ? [el('p', { class: 'dim', text: '消息已彻底删除，但从中整理出的长期记忆按删除规则保留。' })]
+            : []),
+        ])
+      );
+    } else {
+      box.replaceChildren();
+      for (const m of items) {
+        // 只渲染 user / assistant；system 与 tool 是 Agent 内部协议，不该给用户看
+        if (m.role !== 'user' && m.role !== 'assistant') continue;
+        addMessage(m.role, m.content, { skipScroll: true });
+      }
+    }
+
+    scrollToBottom();
+    loadConversations(); // 刷新高亮
+  } catch (err) {
+    box.replaceChildren(el('div', { class: 'dim', text: `加载失败：${err.message}` }));
+  }
+}
+
+/** 回到「新会话」状态。不删数据，只是把当前指针清掉 */
+function startNewChat() {
+  conversationId = null;
+  $('#chat-title').textContent = '对话';
+  $('#messages').replaceChildren(
+    el('div', { class: 'empty' }, [
+      el('p', { text: '新会话。' }),
+      el('p', { class: 'dim', text: '记忆是跨会话共享的 —— 换个会话它也记得你。' }),
+    ])
+  );
+  loadConversations();
+  $('#input').focus();
+}
+
+function addMessage(role, text, opts = {}) {
   const wrap = el('div', { class: `msg ${role === 'user' ? 'me' : ''}` }, [
     el('div', { class: 'msg-role', text: role === 'user' ? '你' : 'LifeMate' }),
     el('div', { class: 'msg-body' }),
@@ -149,7 +268,7 @@ function addMessage(role, text) {
   if (empty) empty.remove();
 
   $('#messages').appendChild(wrap);
-  scrollToBottom();
+  if (!opts.skipScroll) scrollToBottom();
   return wrap;
 }
 
@@ -250,6 +369,16 @@ async function sendMessage(text) {
     }
   }
   scrollToBottom();
+
+  /**
+   * 刷新会话列表。
+   *
+   * 两个原因：
+   *   ① 首轮对话会**新建**会话，不刷新的话它不在列表里 ——
+   *      用户会以为「聊了半天怎么没记录」
+   *   ② updated_at 变了，顺序应重排（最近聊的排最前）
+   */
+  loadConversations();
 }
 
 /** 让侧栏/输入框附近显示「已记住多少条」，给后台抽取一个可见的反馈 */
@@ -652,16 +781,7 @@ function bindEvents() {
     await sendMessage(text);
   });
 
-  $('#btn-new-chat').addEventListener('click', () => {
-    conversationId = null;
-    $('#messages').replaceChildren(
-      el('div', { class: 'empty' }, [
-        el('p', { text: '新会话。' }),
-        el('p', { class: 'dim', text: '记忆是跨会话共享的 —— 换个会话它也记得你。' }),
-      ])
-    );
-    input.focus();
-  });
+  $('#btn-new-chat').addEventListener('click', startNewChat);
 
   // ---------- 记忆 ----------
   $('#mem-view').addEventListener('change', loadMemories);
@@ -719,6 +839,7 @@ bindEvents();
 showView(currentView());
 checkHealth();
 updateMemoryHint();
+loadConversations();
 
 // 定期查服务状态：后端挂了应该能一眼看出来，而不是每次发消息才失败
 setInterval(checkHealth, 30000);
