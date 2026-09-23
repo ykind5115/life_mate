@@ -187,6 +187,17 @@ export const updateMemorySchema = z
 // Settings（docs/04 §34–§36）
 // ============================================================
 
+/**
+ * ⚠️ 枚举值必须与 docs/03 §8.4 的白名单一致：
+ *      response_style  → direct | gentle | detailed
+ *      response_length → short | medium | long
+ *    本文件第一版把 response_style 写成了 `concise | detailed` —— 那是臆造的，
+ *    会让前端按文档传 `direct` 时被 422 拒掉。
+ *    settings 里的键值以 §8.4 为唯一依据。
+ *
+ * `.strict()`：白名单模式（§16.3），多传未知键应报错而不是静默丢弃 ——
+ * 静默丢弃会让调用方以为设置生效了。
+ */
 export const updateSettingsSchema = z
   .object({
     memory: z
@@ -195,9 +206,12 @@ export const updateSettingsSchema = z
       })
       .strict()
       .optional(),
+    /** IANA 时区名，如 Asia/Shanghai。对应 users.timezone 列 */
     timezone: z.string().min(1).max(64).optional(),
-    /** docs/03 §8.4 的白名单键之一 */
-    response_style: z.enum(['concise', 'detailed']).optional(),
+    response_style: z.enum(['direct', 'gentle', 'detailed']).optional(),
+    response_length: z.enum(['short', 'medium', 'long']).optional(),
+    display_name: z.string().min(1).max(100).optional(),
+    locale: z.string().min(1).max(20).optional(),
   })
   .strict();
 

@@ -48,6 +48,7 @@ import {
   type MemoryRetrieval,
 } from './context-builder.js';
 import type { ExtractionTrigger } from './extraction-trigger.js';
+import { isAutoExtractEnabled } from './settings-service.js';
 
 /** 从历史消息中排除的角色：system / tool 不属于「短期对话上下文」 */
 const CONTEXT_ROLES = new Set(['user', 'assistant']);
@@ -298,7 +299,19 @@ export async function chat(
   const { conversationId, userMessage, assistantMessage } = saved;
 
   // ---------- ⑥ 触发后台抽取（不 await 结果）----------
-  deps.extractionTrigger?.schedule(conversationId);
+  /**
+   * auto_extract 关掉时**不触发**抽取（docs/04 §36 的开关语义）。
+   *
+   * ⚠️ 这里是这个开关唯一有实际效果的地方。若只在设置页显示、
+   *    不在这里判断，用户会以为关了但它照抽不误 ——
+   *    那是彻头彻尾的假开关。
+   *
+   * 注意语义：关掉只是「不再自动抽」，**已经记住的内容不受影响**，
+   * 也不会删除。用户想清理得走记忆管理接口。
+   */
+  if (isAutoExtractEnabled(user)) {
+    deps.extractionTrigger?.schedule(conversationId);
+  }
 
   return {
     conversation: { id: conversationId, created, title },

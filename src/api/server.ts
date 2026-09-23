@@ -29,6 +29,7 @@ import { IdempotencyConflictError } from './idempotency.js';
 import { registerChatRoutes, type ChatRouteDeps } from './routes/chat.js';
 import { registerConversationRoutes } from './routes/conversations.js';
 import { registerMemoryRoutes } from './routes/memories.js';
+import { registerSettingsRoutes } from './routes/settings.js';
 import type { IdempotencyStore } from './idempotency.js';
 import type { ChatResult } from '../conversation/chat-service.js';
 
@@ -160,6 +161,7 @@ export async function buildServer(options: BuildServerOptions = {}): Promise<Fas
       });
       await registerConversationRoutes(v1);
       await registerMemoryRoutes(v1);
+      await registerSettingsRoutes(v1);
     },
     { prefix: '/api/v1' }
   );
@@ -224,8 +226,7 @@ export function mapError(err: unknown): HttpError {
     // 语义上属于「与当前资源状态冲突」（docs/06 的 P2-6 同样把这类归 409）
     return new HttpError('CONFLICT', err.message);
   }
-  if (err instanceof IdempotencyConflictError) {
-    /**
+  if (err instanceof IdempotencyConflictError) {    /**
      * 同一个键被用于不同内容。
      *
      * 这里返回 409 而不是「重放上一个结果」：后者会让用户以为新消息发出去了，
