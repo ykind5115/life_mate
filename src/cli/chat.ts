@@ -1,13 +1,15 @@
 /**
  * 终端聊天客户端
  *
- * 【为什么需要它】
- *   V1.0 还没有 Web UI（Phase 7 未开始），而 API 只能靠 curl 调 ——
- *   那不是能日常使用的形态。这个脚本让你现在就能真的用起来。
+ * 【本文件与 Web 界面的关系】
+ *   Web 界面（public/）已经是日常使用的主入口。
+ *   这个 CLI 现在的定位是**辅助工具**：
+ *     · 想在终端里快速问一句、或脚本化调用时
+ *     · Web 界面出问题时的备用入口（排查时它更直接）
+ *   因此它保持极简，不再往上面加功能。
  *
  * 【零新增依赖】
  *   用 Node 内置的 readline + fetch（Node 18+ 自带），不引入任何包。
- *   AGENTS.md §2 要求新增依赖前说明理由 —— 这里根本没新增。
  *
  * 【用法】
  *   先启动服务：pnpm dev        （另开一个终端窗口）
@@ -18,7 +20,17 @@
 import { createInterface } from 'node:readline';
 import { stdin, stdout } from 'node:process';
 
-const BASE = process.env['LIFEMATE_URL'] ?? 'http://127.0.0.1:3000';
+import { env } from '../shared/env.js';
+
+/**
+ * 服务地址。
+ *
+ * ⚠️ 从 env 读，不硬编码 —— 改 .env 里的端口后 CLI 应当自动跟上。
+ *    实测踩到过：改了 PORT 但 CLI 还在连旧端口，
+ *    报的却是「连不上服务」，排查方向完全错了。
+ *    仍可用 LIFEMATE_URL 整体覆盖（例如服务跑在另一台机器上）。
+ */
+const BASE = process.env['LIFEMATE_URL'] ?? `http://${env.HOST}:${env.PORT}`;
 
 // ============================================================
 // 终端着色（不引依赖，直接写 ANSI）
