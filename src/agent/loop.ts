@@ -88,11 +88,19 @@ export interface RunAgentOptions {
    *   两份实现迟早会漂移，而且漂移点恰恰在最少被测试的分支上。
    *   provider 接口本身同时提供 generate 与 stream，切换成本很低。
    *
+   * ⚠️ 收到的不一定是「最终回答」的一部分。
+   *    第 N 轮若模型决定调用工具，那一轮产出的文字是**中间说明**
+   *    （如「让我查一下」），不是给用户的答案；最终回答在最后一轮。
+   *    因此回调带 turn 参数，由调用方决定如何处置：
+   *      · 直接转发 → 用户可以实时看到「正在做什么」，但会包含中间文字
+   *      · 只转发最后一轮 → 拿到的是干净的最终回答
+   *    不要假设「回调收到的就是答案」—— 这个假设只在无工具时才成立。
+   *
    * ⚠️ 回调是同步的。实现方若需异步处理（如写 SSE），
    *    应在回调内尽快入队，不要在回调里 await 慢操作 ——
    *    那会阻塞上游的流式读取。
    */
-  onToken?: (token: string) => void;
+  onToken?: (token: string, turn: number) => void;
 }
 
 export type AgentEvent =
@@ -169,7 +177,8 @@ export async function runAgent(options: RunAgentOptions): Promise<RunAgentResult
       response = await generateWithRetry(
         options.provider,
         buildLLMInput(options, messages, toolDefs),
-        options.onToken
+        options.onToken,
+        iterations
       );
     } catch (err) {
       const retryable = err instanceof LLMError && err.options.retryable;
@@ -180,6 +189,9 @@ export async function runAgent(options: RunAgentOptions): Promise<RunAgentResult
 
     usage.inputTokens += response.usage.inputTokens;
     usage.outputTokens += response.usage.outputTokens;
+    // ⚠️ 必须一起累加：漏掉这行会让多轮执行的推理开销全部消失，
+    //    「回答很短却花了很多 token」在账上无处可查（见 LLMTokenUsage 的说明）
+    usage.reasoningTokens += response.usage.reasoningTokens;
     lastModel = response.model;
     lastFinishReason = response.finishReason;
 
@@ -280,7 +292,9 @@ export async function runAgent(options: RunAgentOptions): Promise<RunAgentResult
   const final = await callLLM(
     options.provider,
     buildLLMInput(options, messages, [], { noTools: true }),
-    options.onToken
+    options.onToken,
+    // 收尾轮用 iterations+1 编号：让调用方能认出「这一轮才是最终回答」
+    iterations + 1
   );
 
   usage.inputTokens += final.usage.inputTokens;
@@ -335,14 +349,15 @@ function buildLLMInput(
 async function generateWithRetry(
   provider: LLMProvider,
   input: GenerateInput,
-  onToken: ((token: string) => void) | undefined,
+  onToken: RunAgentOptions['onToken'],
+  turn: number,
   maxAttempts = 2
 ): Promise<Awaited<ReturnType<LLMProvider['generate']>>> {
   let lastErr: unknown;
 
   for (let attempt = 1; attempt <= maxAttempts; attempt++) {
     try {
-      return await callLLM(provider, input, onToken);
+      return await callLLM(provider, input, onToken, turn);
     } catch (err) {
       lastErr = err;
 
@@ -366,7 +381,8 @@ async function generateWithRetry(
 async function callLLM(
   provider: LLMProvider,
   input: GenerateInput,
-  onToken: ((token: string) => void) | undefined
+  onToken: RunAgentOptions['onToken'],
+  turn: number
 ): Promise<LLMGenerateResult> {
   if (!onToken) {
     return provider.generate(input);
@@ -378,7 +394,7 @@ async function callLLM(
 
   for await (const chunk of provider.stream(input)) {
     if (chunk.type === 'token') {
-      onToken(chunk.content);
+      onToken(chunk.content, turn);
     } else if (chunk.type === 'done') {
       done = chunk.result;
     } else if (chunk.type === 'error') {

@@ -399,7 +399,7 @@ test('onToken: 每个 token 按序回调，累积结果与一次性生成一致'
   assert.equal(res.content, '你好，世界');
 });
 
-test('onToken: 多轮工具调用时，每一轮的 token 都被回调', async () => {
+test('onToken: 多轮工具调用时，每一轮的 token 都被回调，且带轮次编号', async () => {
   const provider = new StreamingProvider([
     {
       tokens: ['让我查一下'],
@@ -408,17 +408,73 @@ test('onToken: 多轮工具调用时，每一轮的 token 都被回调', async (
     { tokens: ['查到了'] },
   ]);
 
-  const received: string[] = [];
+  const received: { token: string; turn: number }[] = [];
   const res = await runAgent({
     provider,
     messages: [{ role: 'user', content: '开始' }],
     tools: [echoTool],
-    onToken: (t) => received.push(t),
+    onToken: (token, turn) => received.push({ token, turn }),
   });
 
-  assert.deepEqual(received, ['让我查一下', '查到了'], '两轮的 token 都应回调');
+  /**
+   * 轮次编号是给 SSE 层用的：第 1 轮的文字是「中间说明」
+   * （模型当时打算调工具），不是给用户的答案。
+   * 调用方靠 turn 判断哪些 token 属于最终回答。
+   */
+  assert.deepEqual(received, [
+    { token: '让我查一下', turn: 1 },
+    { token: '查到了', turn: 2 },
+  ]);
   assert.equal(res.content, '查到了');
   assert.equal(res.toolCallsExecuted, 1);
+});
+
+test('onToken: 触达上限的收尾回答带 iterations+1 的轮次，可被识别', async () => {
+  const forever: LLMToolCall[] = [{ id: 'cx', name: 'echo', arguments: '{"v":"x"}' }];
+  const provider = new StreamingProvider([
+    { tokens: ['第1轮'], toolCalls: structuredClone(forever) },
+    { tokens: ['第2轮'], toolCalls: structuredClone(forever) },
+    { tokens: ['收尾回答'] },
+  ]);
+
+  const turns = new Map<string, number>();
+  const res = await runAgent({
+    provider,
+    messages: [{ role: 'user', content: '开始' }],
+    tools: [echoTool],
+    limits: { MAX_ITERATIONS: 2, MAX_TOOL_CALLS: 99, LOOP_TIMEOUT_MS: 60_000 },
+    onToken: (token, turn) => turns.set(token, turn),
+  });
+
+  assert.equal(res.truncatedBy, 'max_iterations');
+  assert.equal(turns.get('第1轮'), 1);
+  assert.equal(turns.get('第2轮'), 2);
+  assert.equal(turns.get('收尾回答'), 3, '收尾轮应为 iterations+1，从而与循环内的轮次区分开');
+});
+
+test('usage.reasoningTokens 在多轮之间也被累加', async () => {
+  const provider = new ScriptedProvider([
+    result({
+      toolCalls: [{ id: 'r1', name: 'echo', arguments: '{}' }],
+      usage: { inputTokens: 10, outputTokens: 100, reasoningTokens: 90 },
+      finishReason: 'tool_calls',
+    }),
+    result({
+      content: '完成',
+      usage: { inputTokens: 20, outputTokens: 30, reasoningTokens: 25 },
+      finishReason: 'stop',
+    }),
+  ]);
+
+  const res = await runAgent({
+    provider,
+    messages: [{ role: 'user', content: '开始' }],
+    tools: [echoTool],
+  });
+
+  // 推理开销在多轮里同样发生，漏加会让「回答很短却花了大量 token」无法解释
+  assert.equal(res.usage.reasoningTokens, 115);
+  assert.equal(res.usage.outputTokens, 130);
 });
 
 test('onToken: 不传 onToken 时仍走 generate，不误用 stream', async () => {
