@@ -1,0 +1,143 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>LifeMate</title>
+    <link rel="stylesheet" href="/app.css" />
+  </head>
+  <body>
+    <!--
+      单页应用：由 app.js 按 hash 切换视图。
+      不用框架也不用构建步骤 —— V1.0 的页面数量少，
+      引入 React/Next.js 的收益要到页面复杂起来才体现得出来。
+      将来要换成 Next.js 时，这一层整体替换即可，API 不用动。
+    -->
+    <div class="shell">
+      <aside class="sidebar">
+        <div class="brand">
+          <span class="brand-dot"></span>
+          <span>LifeMate</span>
+        </div>
+
+        <nav class="nav">
+          <a href="#/chat" data-nav="chat">对话</a>
+          <a href="#/memories" data-nav="memories">记忆</a>
+          <a href="#/timeline" data-nav="timeline">时间线</a>
+          <a href="#/goals" data-nav="goals">目标</a>
+          <a href="#/review" data-nav="review">回顾</a>
+          <a href="#/settings" data-nav="settings">设置</a>
+        </nav>
+
+        <div class="sidebar-foot">
+          <div id="health" class="health">检查中…</div>
+        </div>
+      </aside>
+
+      <main class="main">
+        <!-- ==================== 对话 ==================== -->
+        <section class="view" id="view-chat">
+          <header class="view-head">
+            <h1>对话</h1>
+            <div class="head-actions">
+              <span id="chat-hint" class="hint"></span>
+              <button id="btn-new-chat" class="btn">新会话</button>
+            </div>
+          </header>
+
+          <div id="messages" class="messages">
+            <div class="empty">
+              <p>聊点什么吧。</p>
+              <p class="dim">
+                你说的话会被后台整理成长期记忆。下次相关的时候它会自己想起来。
+              </p>
+            </div>
+          </div>
+
+          <form id="composer" class="composer">
+            <textarea
+              id="input"
+              rows="1"
+              placeholder="说点什么…（Enter 发送，Shift+Enter 换行）"
+            ></textarea>
+            <button type="submit" id="btn-send" class="btn primary">发送</button>
+          </form>
+        </section>
+
+        <!-- ==================== 记忆 ==================== -->
+        <section class="view" id="view-memories">
+          <header class="view-head">
+            <h1>记忆</h1>
+            <div class="head-actions">
+              <input id="mem-search" class="input" placeholder="语义搜索…" />
+              <select id="mem-view" class="input">
+                <option value="current">当前有效</option>
+                <option value="management">全部（含冲突/已归档）</option>
+              </select>
+            </div>
+          </header>
+          <div id="mem-list" class="list"></div>
+        </section>
+
+        <!-- ==================== 时间线 ==================== -->
+        <section class="view" id="view-timeline">
+          <header class="view-head">
+            <h1>时间线</h1>
+            <div class="head-actions">
+              <select id="tl-category" class="input">
+                <option value="">全部分类</option>
+              </select>
+            </div>
+          </header>
+          <div id="tl-list" class="list"></div>
+        </section>
+
+        <!-- ==================== 目标 ==================== -->
+        <section class="view" id="view-goals">
+          <header class="view-head">
+            <h1>目标</h1>
+            <div class="head-actions">
+              <button id="btn-new-goal" class="btn primary">新增目标</button>
+            </div>
+          </header>
+
+          <form id="goal-form" class="card form hidden">
+            <label>目标<input id="goal-title" class="input" required maxlength="200" /></label>
+            <label>说明（可选）<textarea id="goal-desc" class="input" rows="2"></textarea></label>
+            <label>目标时间（可选）<input id="goal-target" class="input" type="date" /></label>
+            <div class="form-actions">
+              <button type="submit" class="btn primary">创建</button>
+              <button type="button" id="btn-cancel-goal" class="btn">取消</button>
+            </div>
+          </form>
+
+          <div id="goal-list" class="list"></div>
+        </section>
+
+        <!-- ==================== 回顾 ==================== -->
+        <section class="view" id="view-review">
+          <header class="view-head">
+            <h1>回顾</h1>
+            <div class="head-actions">
+              <select id="review-kind" class="input">
+                <option value="week">这一周</option>
+                <option value="month">这个月</option>
+                <option value="day">今天</option>
+              </select>
+              <button id="btn-review" class="btn primary">生成回顾</button>
+            </div>
+          </header>
+          <div id="review-out" class="list"></div>
+        </section>
+
+        <!-- ==================== 设置 ==================== -->
+        <section class="view" id="view-settings">
+          <header class="view-head"><h1>设置</h1></header>
+          <div id="settings-out" class="list"></div>
+        </section>
+      </main>
+    </div>
+
+    <script src="/app.js" type="module"></script>
+  </body>
+</html>

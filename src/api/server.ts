@@ -13,8 +13,10 @@
  *   默认 HOST=127.0.0.1。放到 0.0.0.0 会让整个记忆库在局域网内可读写。
  */
 import { randomUUID } from 'node:crypto';
+import { fileURLToPath } from 'node:url';
 
 import Fastify, { type FastifyInstance } from 'fastify';
+import fastifyStatic from '@fastify/static';
 import { ZodError } from 'zod';
 
 import { env } from '../shared/env.js';
@@ -146,6 +148,38 @@ export async function buildServer(options: BuildServerOptions = {}): Promise<Fas
    * 依赖状态由 /api/v1/settings 这类实际调用暴露。
    */
   app.get('/health', async () => ok({ status: 'ok' }));
+
+  // ---------- 前端静态文件 ----------
+  /**
+   * 单页界面（public/）。
+   *
+   * 【为什么用 @fastify/static 而不是自己读文件返回】
+   *   路径穿越防护、Range 请求、ETag、缓存头这些都要自己写，
+   *   而写错任一项就是安全问题。官方插件只有 21 个传递依赖，值得。
+   *
+   * 【与 docs/02 §6 的关系】
+   *   §6 规定前端是 Next.js + React + Tailwind（Phase 7 的目标形态）。
+   *   当前是「现在就能用」的最小界面：原生 HTML/CSS/JS，无构建步骤。
+   *   将来换 Next.js 时替换这一层即可，API 与后端不用动。
+   *
+   * ⚠️ 注册顺序：必须在业务路由**之前**作为独立插件注册，
+   *    但只在根路径提供文件 —— /api/v1 的前缀不会被它截获。
+   */
+  const publicDir = fileURLToPath(new URL('../../public', import.meta.url));
+
+  await app.register(fastifyStatic, {
+    root: publicDir,
+    // 根路径返回 index.html
+    index: ['index.html'],
+    // 不暴露目录列表
+    list: false,
+  });
+
+  /**
+   * 前端是 hash 路由（#/memories 这类），因此不需要 history fallback ——
+   * 所有导航都发生在同一个文档内，服务端只需提供 /。
+   * 若将来改成 path 路由，这里要加一个 /* → index.html 的兜底。
+   */
 
   // ---------- 业务路由 ----------
   await app.register(
