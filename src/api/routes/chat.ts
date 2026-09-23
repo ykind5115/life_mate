@@ -25,6 +25,10 @@ import {
   getDefaultExtractionTrigger,
   type ExtractionTrigger,
 } from '../../conversation/extraction-trigger.js';
+import {
+  getDefaultSummaryTrigger,
+  type SummaryTrigger,
+} from '../../conversation/summary-trigger.js';
 import { ok } from '../errors.js';
 import { chatRequestSchema, toChatParams } from '../schemas.js';
 import { fingerprintChat, IdempotencyStore } from '../idempotency.js';
@@ -35,6 +39,8 @@ export interface ChatRouteDeps {
   idempotency?: IdempotencyStore<ChatResult>;
   /** 抽取触发器。缺省为进程单例 */
   extractionTrigger?: ExtractionTrigger;
+  /** 摘要触发器。缺省为进程单例；测试传一个不真跑的 */
+  summaryTrigger?: SummaryTrigger | null;
   /** 覆盖 LLM Provider。生产不传，测试注入假实现 */
   provider?: LLMProvider;
   /**
@@ -103,6 +109,21 @@ export async function registerChatRoutes(
   const extractionTrigger = deps.extractionTrigger ?? getDefaultExtractionTrigger();
 
   /**
+   * 摘要触发器。与 retrieveMemories 一样是三态：
+   *   显式 null（关闭）/ 显式实例（覆盖）/ 缺省（用进程单例）
+   *
+   * ⚠️ 缺省单例**必须**带上 provider：否则它会用 env 里的真实 Provider，
+   *    测试里就会真调模型（慢、花钱、结果不确定）。
+   */
+  const summaryTrigger =
+    deps.summaryTrigger === null
+      ? undefined
+      : (deps.summaryTrigger ??
+        getDefaultSummaryTrigger(
+          deps.provider !== undefined ? { provider: deps.provider } : {}
+        ));
+
+  /**
    * ChatService 的依赖。抽成常量避免两个 route 里各写一份而漂移。
    *
    * retrieveMemories 的三态：显式 null（关闭）/ 显式函数（覆盖）/ 缺省（用真实检索）
@@ -112,6 +133,7 @@ export async function registerChatRoutes(
 
   const serviceDeps: ChatServiceDeps = {
     extractionTrigger,
+    ...(summaryTrigger !== undefined ? { summaryTrigger } : {}),
     ...(deps.provider !== undefined ? { provider: deps.provider } : {}),
     ...(retrieveMemories !== undefined ? { retrieveMemories } : {}),
   };

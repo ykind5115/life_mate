@@ -1,11 +1,12 @@
 # AGENTS.md — 编码 Agent 工作规则
 
 > 本文件面向在本仓库中执行编码任务的 AI Agent（DSH / Claude Code / Codex / Cursor 等）。
-> 项目当前状态：**设计阶段已完成，工程实现进行中**。
+> 项目当前状态：**设计阶段已完成，工程实现接近 V1.0 功能齐备**。
 > 已完成：数据库 Schema + 迁移、Repository 层、LLM Provider、Agent Loop、
-> 记忆抽取流水线、**记忆召回**、HTTP 层（chat / SSE / conversations / memories）。
-> 未完成：Timeline、Life Review、Settings 接口、离线评测集、Web UI。
-> 详见 `docs/README.md` 与最近若干次提交。
+> 记忆抽取流水线、记忆召回、HTTP 层（chat / SSE / conversations / memories /
+> settings / timeline / life-review）、会话摘要、离线评测。
+> 未完成：Agent 只读记忆工具、Web UI、goals 数据源、检索质量评测。
+> 详见 `docs/README.md`、`docs/09-evaluation-baseline.md` 与最近若干次提交。
 > 本文件的规则优先级高于 Agent 的个人习惯；与本文档冲突的"通常做法"一律以本文档为准。
 
 ---
@@ -175,6 +176,24 @@ Agent Tool      不直接操作数据库，与 API 共享 Application Service
   □ 在夹具入口加 assertTestDatabase('文件名 / 夹具名')
   □ 确认清理逻辑只删自己造的数据，或至少限制在测试库内
   □ 不要把断言写成「全表 count == N」——那依赖执行顺序（见 §5 的同类教训）
+```
+
+### 4.5 测试串行执行（不要改成并发）
+
+```text
+test 脚本带了 --test-isolation=process --test-concurrency=1。
+
+原因：多个 HTTP 集成测试文件共用**同一个默认用户**（单用户系统只有一条
+users 记录），而为了断言稳定，夹具会在用例开始时清空该用户名下的数据。
+并发跑时 A 文件的清理会删掉 B 文件正在用的数据 ——
+
+  实测踩到两次：
+    ① timeline-routes 的清理删掉了 memory-routes 正在断言的记忆
+    ② 反过来，memory-routes 留下的记忆让「无材料时不调 LLM」用例误判
+
+代价是测试变慢（约多几秒），换来的是确定性。
+要恢复并发，得先让各文件用**不同的用户** —— 那需要给路由加 userId 注入点，
+而单用户系统不该为测试改 API。因此当前选择串行。
 ```
 
 ---

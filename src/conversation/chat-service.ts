@@ -38,6 +38,7 @@ import {
   findConversationById,
   findRecentMessages,
   getOrCreateDefaultUser,
+  listActiveSummaries,
   touchConversation,
   type Message,
 } from '../database/repository/index.js';
@@ -48,6 +49,7 @@ import {
   type MemoryRetrieval,
 } from './context-builder.js';
 import type { ExtractionTrigger } from './extraction-trigger.js';
+import type { SummaryTrigger } from './summary-trigger.js';
 import { isAutoExtractEnabled } from './settings-service.js';
 
 /** 从历史消息中排除的角色：system / tool 不属于「短期对话上下文」 */
@@ -115,6 +117,15 @@ export interface ChatServiceDeps {
   tools?: ToolDefinition[];
   /** 抽取触发器。不传则不触发抽取（测试用） */
   extractionTrigger?: ExtractionTrigger;
+  /**
+   * 摘要触发器（docs/03 §12.3）。
+   *
+   * 与抽取分开而不是合成一个触发器：两者的触发条件与成本都不同 ——
+   * 抽取按「有没有新消息」触发，摘要按「未摘要消息是否超过阈值」触发，
+   * 而阈值很高（默认 30），绝大多数请求不会真的生成摘要。
+   * 合成一个会让「这次到底做了什么」变得难查。
+   */
+  summaryTrigger?: SummaryTrigger;
   /**
    * 逐 token 回调，透传给 Agent Loop。
    * 传了它就走流式（provider.stream）。
@@ -202,6 +213,16 @@ export async function chat(
     : [];
 
   /**
+   * 更早对话的摘要（docs/03 §12.4）。
+   *
+   * 只读已生成的摘要，**不在这里生成** —— 生成要调 LLM（慢且花钱），
+   * 而用户此刻在等回答。生成放在响应之后（见步骤⑥）。
+   */
+  const summaries = existingConversationId
+    ? (await listActiveSummaries(existingConversationId)).map((s) => s.summary)
+    : [];
+
+  /**
    * 记忆检索（docs/03 §18.5：检索与注入分离）。
    *
    * ⚠️ 缺省行为分两种，不要混淆：
@@ -233,6 +254,7 @@ export async function chat(
     recentMessages: history,
     userMessage: params.message,
     retrieval,
+    summaries,
     ...(deps.injectLimit !== undefined ? { injectLimit: deps.injectLimit } : {}),
   });
 
@@ -312,6 +334,17 @@ export async function chat(
   if (isAutoExtractEnabled(user)) {
     deps.extractionTrigger?.schedule(conversationId);
   }
+
+  /**
+   * 摘要生成（docs/03 §12.3）。
+   *
+   * 同样放在响应之后：它要调 LLM（慢且花钱），而用户此刻在等回答。
+   * 失败不影响聊天 —— 摘要只是上下文优化，不是完成对话的必要条件。
+   *
+   * ⚠️ 与抽取一样是 fire-and-forget，进程重启会丢掉待生成的摘要。
+   *    代价可接受：没生成就下次消息再触发（幂等由区间唯一索引保证）。
+   */
+  deps.summaryTrigger?.schedule(conversationId, assistantMessage.sequence);
 
   return {
     conversation: { id: conversationId, created, title },

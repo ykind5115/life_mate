@@ -68,6 +68,17 @@ export interface BuildChatContextParams {
   recentMessages: ContextMessage[];
   /** 当前用户消息。**不需要**调用方预先塞进 recentMessages */
   userMessage: string;
+  /**
+   * 更早对话的摘要（docs/03 §12.4）。
+   *
+   * ⚠️ 位置固定：必须插在**最近消息之前**。
+   *    §12.4 明确写了「摘要必须位于最近消息之前，否则模型会误判时间顺序」——
+   *    摘要说的是较早的事，放在最近消息后面会被当成刚发生的。
+   *
+   * 空数组表示这段会话还没长到需要摘要 —— 此时**不插入任何段落**，
+   * 而不是插一句「（无更早的对话）」：那会浪费 token 且暗示信息缺失。
+   */
+  summaries?: string[];
   /** 检索到的长期记忆。缺省视为「未检索」 */
   retrieval?: MemoryRetrieval;
   /** 覆盖系统提示词（测试与实验用） */
@@ -85,6 +96,8 @@ export interface BuiltChatContext {
   meta: {
     messageCount: number;
     historyCount: number;
+    /** 纳入的摘要段数 */
+    summaryCount: number;
     injectedMemoryCount: number;
     /** 因预算或条数被裁掉的记忆数 */
     droppedMemoryCount: number;
@@ -130,6 +143,18 @@ export function buildChatContext(params: BuildChatContextParams): BuiltChatConte
     messages.push({ role: 'system', content: knownFacts });
   }
 
+  /**
+   * 更早对话的摘要（§12.4）。
+   *
+   * 位置不可调换：必须在最近消息**之前**。
+   * 摘要讲的是较早的事，放到最近消息之后会被模型当成刚发生的 ——
+   * §12.4 专门强调了这一点。
+   */
+  const summaries = params.summaries ?? [];
+  if (summaries.length > 0) {
+    messages.push({ role: 'system', content: buildSummarySection(summaries) });
+  }
+
   for (const m of params.recentMessages) {
     messages.push({ role: m.role, content: m.content });
   }
@@ -141,6 +166,7 @@ export function buildChatContext(params: BuildChatContextParams): BuiltChatConte
     meta: {
       messageCount: messages.length,
       historyCount: params.recentMessages.length,
+      summaryCount: summaries.length,
       injectedMemoryCount: kept.length,
       droppedMemoryCount: dropped,
       retrievalPerformed: retrieval.performed,
@@ -150,6 +176,24 @@ export function buildChatContext(params: BuildChatContextParams): BuiltChatConte
       approxTokens: messages.reduce((n, m) => n + estimateTokens(m.content), 0),
     },
   };
+}
+
+/**
+ * 组装摘要段落。
+ *
+ * 显式标注「以下是更早对话的摘要」并说明**后面的才是原文** ——
+ * 否则模型会把摘要与原文一视同仁，在细节问题上引用摘要里被压缩掉的信息
+ * （摘要是有损的，用它回答细节会出错）。
+ */
+function buildSummarySection(summaries: string[]): string {
+  return [
+    '以下是本次会话更早部分的摘要（按时间正序，内容经过压缩）：',
+    ...summaries.map((s, i) => `【第 ${i + 1} 段】${s}`),
+    '',
+    '注意：摘要是有损压缩，细节可能不准确。',
+    '若用户追问具体细节而摘要里没有，请说明你不确定，不要凭摘要推断。',
+    '摘要之后的消息是原文，以原文为准。',
+  ].join('\n');
 }
 
 // ============================================================

@@ -18,6 +18,7 @@ import { eq } from 'drizzle-orm';
 
 import { closePool, db } from '../database/client.js';
 import { events } from '../database/schema/events.js';
+import { memories } from '../database/schema/memories.js';
 import { ensureDefaultUser } from '../database/repository/user-store.js';
 import { assertTestDatabase } from '../shared/test-guard.js';
 import { buildServer } from './server.js';
@@ -83,8 +84,15 @@ async function withTimeline(fn: (f: TimelineFixture) => Promise<void>): Promise<
   });
 
   const user = await ensureDefaultUser();
-  // 前置：清空该用户名下的事件，让断言不依赖遗留数据
+  /**
+   * 前置：清空该用户名下的**事件与记忆**。
+   *
+   * ⚠️ 记忆也必须清 —— Life Review 的材料是「事件 + 该区间内有效的记忆」，
+   *    而 findValidAt 会扫到库里其他用例留下的记忆。
+   *    实测踩到：只清事件时，「无材料」用例因为仍有遗留记忆而真的调了 LLM。
+   */
   await db.delete(events).where(eq(events.userId, user.id));
+  await db.delete(memories).where(eq(memories.userId, user.id));
 
   const seedEvent: TimelineFixture['seedEvent'] = async (e) => {
     const rows = await db
@@ -105,6 +113,7 @@ async function withTimeline(fn: (f: TimelineFixture) => Promise<void>): Promise<
   } finally {
     await app.close();
     await db.delete(events).where(eq(events.userId, user.id));
+    await db.delete(memories).where(eq(memories.userId, user.id));
   }
 }
 
