@@ -229,10 +229,10 @@ export async function runExtraction(
       ...(params.thinking !== undefined ? { thinking: params.thinking } : {}),
     });
 
-// 用带诊断的解析：丢弃与降级的事实必须被记录，
-// 否则槽位命中率下降这类质量退化会静默发生（见 extraction-schema 的分级策略）
-const parsed = parseExtractionResultWithDiagnostics(res.content);
-const extraction = parsed.result;
+    // 用带诊断的解析：丢弃与降级的事实必须被记录，
+    // 否则槽位命中率下降这类质量退化会静默发生（见 extraction-schema 的分级策略）
+    const parsed = parseExtractionResultWithDiagnostics(res.content);
+    const extraction = parsed.result;
     const candidates = extraction.memories.map(normalizeCandidate);
 
     // ---------- ⑤ 逐条判定并落库（事务 A：每条一个事务）----------

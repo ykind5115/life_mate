@@ -98,11 +98,3 @@ export interface ListMemoriesFilter {
   limit?: number;
   offset?: number;
 }
-
-/** 分页结果 */
-export interface Paginated<T> {
-  items: T[];
-  total: number;
-  limit: number;
-  offset: number;
-}

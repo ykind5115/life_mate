@@ -38,3 +38,6 @@ export const users = pgTable('users', {
 export const usersIndexes = {
   // 占位：当前无索引需求
 };
+
+export type User = typeof users.$inferSelect;
+export type NewUser = typeof users.$inferInsert;

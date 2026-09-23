@@ -11,17 +11,19 @@
  *   本文件的「当前有效」查询返回的 Memory 一定满足 §13.6 的谓词。
  *   历史查询（findValidAt / findSupersedeChain）语义不同，注释中单独说明。
  */
-import { and, count, desc, eq, inArray, isNull, sql } from 'drizzle-orm';
+import { and, asc, count, desc, eq, inArray, isNull, sql } from 'drizzle-orm';
 
 import { db } from '../client.js';
 import { memories, type Memory } from '../schema/memories.js';
+import { memorySources, type MemorySource } from '../schema/memory-sources.js';
 import {
   conflictMemoryCondition,
   currentMemoryCondition,
   memoryValidAtCondition,
   notDeletedCondition,
 } from './conditions.js';
-import type { ListMemoriesFilter, Paginated } from './memory-types.js';
+import type { ListMemoriesFilter } from './memory-types.js';
+import type { Paginated } from './types.js';
 
 /** 列表查询的默认与上限，避免误传巨大 limit 拖垮查询 */
 const DEFAULT_LIMIT = 50;
@@ -324,6 +326,29 @@ export async function findSupersedeChain(
   if (chain.length >= MAX_DEPTH) mayBeIncomplete = true;
 
   return { chain, mayBeIncomplete };
+}
+
+/**
+ * 取某条记忆的全部来源指针。
+ *
+ * 用途：Memory Viewer 展示「这条记忆从哪来」（接口 §19 / §26），
+ * 以及删除会话时判断记忆是否还有其他来源（§24.3 步骤②）。
+ *
+ * ⚠️ C22 之后 memory_sources 没有 conversation_id，
+ *    「哪些会话贡献了这条记忆」必须 JOIN messages 反查，
+ *    不能用本函数的返回值直接当会话 id 用。
+ */
+export async function findSourcesByMemoryId(
+  memoryId: string,
+  options: ReadOptions = {}
+): Promise<MemorySource[]> {
+  const exec = options.executor ?? db;
+
+  return exec
+    .select()
+    .from(memorySources)
+    .where(eq(memorySources.memoryId, memoryId))
+    .orderBy(asc(memorySources.createdAt));
 }
 
 /** 统计当前有效记忆数量，用于容量监控与评测 */

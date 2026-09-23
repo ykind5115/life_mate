@@ -28,3 +28,18 @@ export interface ExecutorOption {
   /** 传入外层事务以组合原子操作；不传则在自身事务内执行 */
   executor?: StoreExecutor;
 }
+
+/**
+ * 分页结果。
+ *
+ * ⚠️ 用 limit/offset 而不是 page/page_size：
+ *    分页参数是 API 层的事（docs/04 §8 规定 `?page=&page_size=`），
+ *    仓库层只认偏移量。两者混用会让「第 3 页」这种语义渗进 SQL 里，
+ *    改页大小就会算错。转换在 Controller 做。
+ */
+export interface Paginated<T> {
+  items: T[];
+  total: number;
+  limit: number;
+  offset: number;
+}

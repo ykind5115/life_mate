@@ -12,15 +12,28 @@ export * from './memory-queries.js';
 export * from './memory-store.js';
 export * from './extraction-runs.js';
 export * from './conversation-queries.js';
+export * from './conversation-store.js';
+export * from './user-store.js';
 
 // Schema 类型在这里再导出一次，方便上层使用而不必深入 schema 目录
 export type { Memory, NewMemory } from '../schema/memories.js';
 export type { MemoryEmbedding } from '../schema/memory-embeddings.js';
 export type { MemorySource } from '../schema/memory-sources.js';
+export type { Conversation, NewConversation } from '../schema/conversations.js';
+export type { Message, NewMessage } from '../schema/messages.js';
+export type { User } from '../schema/users.js';
+export {
+  MESSAGE_ROLES,
+  CONVERSATION_STATUSES,
+  EVENT_CATEGORIES,
+} from '../schema/enums.js';
 export type {
   MemoryStatus,
   MemoryType,
   MemoryPolarity,
+  MessageRole,
+  ConversationStatus,
+  EventCategory,
   SourceType,
   PredicateKey,
 } from '../schema/enums.js';
