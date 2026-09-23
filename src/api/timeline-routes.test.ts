@@ -560,15 +560,16 @@ test('POST /life-review 无材料时**不调用 LLM**，直接返回说明', asy
   });
 });
 
-test('POST /life-review 已接入 goals，并显式报告 summaries 未接入', async () => {
-  await withTimeline(async ({ app, userId }) => {
-    // 造一个进行中的目标，确认它进了回顾材料
+test('POST /life-review 四条来源都已接入（docs/04 §32）', async () => {
+  await withTimeline(async ({ app, userId, seedEvent }) => {
+    // 造材料：一个进行中的目标 + 一条事件
     await db.insert(goals).values({
       userId,
       title: '学会弹吉他',
       status: 'active',
       priority: 0.8,
     });
+    await seedEvent({ title: '开始学吉他', eventTime: new Date('2026-09-10T00:00:00Z') });
 
     const res = await req(app, {
       method: 'POST',
@@ -577,7 +578,6 @@ test('POST /life-review 已接入 goals，并显式报告 summaries 未接入', 
        * ⚠️ 区间终点必须在目标创建时间**之后**。
        *    loadGoalsForPeriod 会按「创建时间 ≤ 区间终点」筛 ——
        *    回顾 8 月时，9 月才立的目标不该出现（那时它还不存在）。
-       *    本用例刚插入的目标是「现在」创建的，因此区间要往后放。
        */
       payload: { start: '2026-08-01', end: '2027-12-31' },
     });
@@ -585,17 +585,21 @@ test('POST /life-review 已接入 goals，并显式报告 summaries 未接入', 
     const sources = res.json().data.sources_available;
 
     /**
-     * goals 已接入（本次新增的 Goal 管理给了它数据源）。
-     * summaries 仍未接入 —— 摘要已生成并用于对话上下文，
-     * 但按区间关联会话尚未实现。显式报告而不是假装聚合了四条来源。
+     * docs/04 §32 的四条来源：Timeline / Memories / Goals / Summaries。
+     * 现在全部接入，因此 unavailable 应为空数组。
+     * 保留这个字段是为了让「这次回顾用了什么材料」始终可核对。
      */
-    assert.equal(sources.goals, 1, '进行中的目标应计入材料');
-    assert.equal(sources.unavailable.length, 1);
-    assert.equal(sources.unavailable[0].source, 'summaries');
+    assert.equal(sources.events, 1);
+    assert.equal(sources.goals, 1);
+    assert.equal(
+      sources.unavailable.length,
+      0,
+      `四条来源都应接入，实际未接入：${JSON.stringify(sources.unavailable)}`
+    );
 
-    // 目标应出现在材料里，供用户核对
-    assert.equal(res.json().data.materials.goals.length, 1);
+    // 材料应可核对
     assert.equal(res.json().data.materials.goals[0].title, '学会弹吉他');
+    assert.ok(Array.isArray(res.json().data.materials.summaries));
   });
 });
 

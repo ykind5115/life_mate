@@ -141,6 +141,20 @@ export async function processCandidate(
     polarity: candidate.polarity,
     importanceScore: candidate.importanceScore,
     confidenceScore: candidate.confidenceScore,
+    /**
+     * 事实生效时间（业务时间）。
+     *
+     * ⚠️ 只有模型明确给出了时间线索时才传。
+     *    不传的语义是「自记录起有效」—— 那是诚实的表达。
+     *
+     *    刻意**不**在这里用「对话发生时间」兜底：
+     *    实测踩到过 —— 用户说「我上周三搬到杭州」，
+     *    事件记为 09-16，而记忆的 valid_from 被写成对话当天 09-23，
+     *    于是 Agent 把搬家日期说成了 09-23。
+     *    valid_from 属 C25 的不可变字段，写错只能重建记忆，
+     *    因此必须在写入时就留空而不是填一个近似值。
+     */
+    ...(candidate.validFrom !== null ? { validFrom: candidate.validFrom } : {}),
     sources,
   };
 

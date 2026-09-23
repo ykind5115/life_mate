@@ -25,6 +25,7 @@ import { memories, type Memory } from '../schema/memories.js';
 import { memoryEmbeddings } from '../schema/memory-embeddings.js';
 import { currentMemoryCondition } from './conditions.js';
 import type { ExecutorOption } from './types.js';
+import { buildBigrams, MIN_BIGRAM_HIT_RATIO } from '../../memory/chinese-ngram.js';
 
 /** 单通道候选数。§18.2 规定各通道取 Top-50 再融合 */
 export const DEFAULT_CHANNEL_LIMIT = 50;
@@ -103,51 +104,95 @@ export interface KeywordCandidate {
 }
 
 /**
- * 关键词通道：pg_trgm 三元组相似度。
+ * 关键词通道：应用层字符 bigram（**不是 pg_trgm**）
  *
- * 【为什么不用 tsvector / plainto_tsquery】
- *   PostgreSQL 默认全文检索不支持中文分词，`plainto_tsquery('中文句子')`
- *   会把整句当一个词元，关键词通道形同虚设（C16）。
- *   pg_trgm 按字符三元组匹配，无需分词器，适合记忆这种短文本。
+ * 🔴 【为什么不用 pg_trgm —— 实测确认它不支持中文】
+ *   docs/03 §17.4 的 C16 决定用 pg_trgm，理由写的是「按字符三元组匹配，
+ *   无需分词器，适合中文」。**实测（PostgreSQL 18 + pg_trgm 1.6）**：
  *
- * 【阈值的作用】
- *   `%` 操作符使用 pg_trgm.similarity_threshold（默认 0.3）。
- *   中文短句的三元组重叠通常很稀疏，0.3 会漏掉不少真实匹配，
- *   因此这里显式用 similarity() 排序并用一个更低的阈值过滤，
- *   避免「查询词换个说法就一条都召回不到」。
+ *     SELECT show_trgm('用户住在杭州');   -- → {}    空集
+ *     SELECT show_trgm('hello world');    -- → {"  h"," he",...}
+ *
+ *   pg_trgm 的默认解析器只把字母与数字当词，CJK 全被忽略
+ *   → 中文不产生任何三元组 → similarity() 恒为 0 →
+ *   **关键词通道对中文完全失效**，混合检索退化成单路向量检索。
+ *
+ *   替代方案也排除了：tsvector 把整句当一个词元；
+ *   pg_bigm / pgroonga / zhparser 不在 pg_available_extensions 里
+ *   （镜像 pgvector/pgvector:pg18 只带 pg_trgm）。
+ *
+ * 【本实现】
+ *   在应用层把查询切成字符 bigram，用 LIKE 在库里筛，
+ *   按「命中的不同 bigram 数 / 总数」打分。细节见 memory/chinese-ngram.ts。
+ *
+ * 【性能】与 §18.1 不建向量索引同理：接受顺序扫描。
+ *   数据量 < 5 万条短文本，LIKE 全表扫在几十毫秒级。
+ *   真要优化应换镜像装 pg_bigm，而不是回到 pg_trgm。
+ *
+ * ⚠️ memories 上那个 gin_trgm_ops 索引（idx_memories_content_trgm）
+ *    对中文无用（索引里没有任何中文三元组）。它现在只是写入开销，
+ *    应随 C16 的修订一起删除 —— 那需要改 docs/03 走 Schema 变更流程，
+ *    因此本次**保留不动**，已记入交付说明。
  */
 export async function searchByKeyword(
   params: {
     userId: string;
     query: string;
     limit?: number;
-    /** 相似度下限，低于它的候选直接丢弃 */
-    minSimilarity?: number;
+    /** 命中率下限。缺省 MIN_BIGRAM_HIT_RATIO（见 chinese-ngram.ts） */
+    minRatio?: number;
     extra?: SQL | undefined;
   },
   options: ExecutorOption = {}
 ): Promise<KeywordCandidate[]> {
   const exec = options.executor ?? db;
   const limit = params.limit ?? DEFAULT_CHANNEL_LIMIT;
-  const minSimilarity = params.minSimilarity ?? 0.05;
 
-  const sim = sql<number>`similarity(${memories.content}, ${params.query})::float8`;
+  const bigrams = buildBigrams(params.query);
+  if (bigrams.length === 0) return [];
+
+  const minRatio = params.minRatio ?? MIN_BIGRAM_HIT_RATIO;
+
+  /**
+   * 命中率在 SQL 里算，而不是把所有候选拉回 Node 再筛。
+   *
+   * 为什么不「先 LIKE 任一 bigram 拉回来再算」：
+   * 单字重合的记忆可能很多（「的」「用」这类），
+   * 全量拉回会浪费带宽与内存。让库先按命中数过滤一轮更省。
+   */
+  const hitExpr = sql.join(
+    bigrams.map((g) => sql`(CASE WHEN ${memories.content} LIKE ${'%' + g + '%'} THEN 1 ELSE 0 END)`),
+    sql` + `
+  );
+
+  const hits = sql<number>`(${hitExpr})`;
 
   const rows = await exec
-    .select({ memory: memories, similarity: sim })
+    .select({ memory: memories, hits })
     .from(memories)
     .where(
       and(
         eq(memories.userId, params.userId),
         currentMemoryCondition(),
-        sql`similarity(${memories.content}, ${params.query}) >= ${minSimilarity}`,
+        // 至少命中一个 bigram（避免全表返回）
+        sql`(${hitExpr}) > 0`,
         ...(params.extra ? [params.extra] : [])
       )
     )
-    .orderBy(desc(sim))
+    // 按命中数降序；命中数相同时按长度短的优先（短正文里的命中更有信息量）
+    .orderBy(desc(hits), sql`length(${memories.content})`)
     .limit(limit);
 
-  return rows.map((r) => ({ memory: r.memory, similarity: Number(r.similarity) }));
+  const total = bigrams.length;
+
+  return rows
+    .map((r) => ({
+      memory: r.memory,
+      // 归一化到 [0,1]，与原先 pg_trgm 的 similarity 语义一致，
+      // 这样上层（RRF 融合）不需要知道通道实现换了
+      similarity: Number(r.hits) / total,
+    }))
+    .filter((c) => c.similarity >= minRatio);
 }
 
 /**

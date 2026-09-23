@@ -51,6 +51,7 @@ import {
 import type { ExtractionTrigger } from './extraction-trigger.js';
 import type { SummaryTrigger } from './summary-trigger.js';
 import { isAutoExtractEnabled } from './settings-service.js';
+import { createMemoryTools } from '../memory/tools.js';
 
 /** 从历史消息中排除的角色：system / tool 不属于「短期对话上下文」 */
 const CONTEXT_ROLES = new Set(['user', 'assistant']);
@@ -115,6 +116,14 @@ export interface ChatServiceDeps {
   }) => Promise<ContextMemory[]>;
   /** Agent 可用的工具。V1.0 应为只读工具（Q3） */
   tools?: ToolDefinition[];
+  /**
+   * 是否注册记忆工具（docs/02 §21）。
+   *
+   * 缺省 true —— 生产就该有，否则 Agent 只能被动依赖注入的 8 条记忆。
+   * 测试常传 false：记忆工具会真调检索（连 embedding 服务），
+   * 让「聊天协议」这类用例依赖外部服务。
+   */
+  enableMemoryTools?: boolean;
   /** 抽取触发器。不传则不触发抽取（测试用） */
   extractionTrigger?: ExtractionTrigger;
   /**
@@ -259,10 +268,23 @@ export async function chat(
   });
 
   // ---------- ④ 运行 Agent ----------
+  /**
+   * 记忆工具（docs/02 §21）。
+   *
+   * ⚠️ 只注册**只读**的 search_memory / get_memory / get_timeline（Q3）。
+   *    save / update / delete 刻意不提供 —— 理由见 memory/tools.ts 的文件头。
+   *
+   * 为什么要给工具，而不是只靠上下文里自动注入的记忆：
+   *   注入的是「本次查询最相关的 8 条」，而用户可能问到 8 条之外的东西。
+   *   工具让 Agent 能主动再查一次，而不是只能回答「我这边没有」。
+   */
+  const tools =
+    deps.tools ?? (deps.enableMemoryTools === false ? [] : createMemoryTools({ userId: user.id }));
+
   const agentResult = await runAgent({
     provider,
     messages: context.messages,
-    ...(deps.tools !== undefined ? { tools: deps.tools } : {}),
+    tools,
     ...(params.signal !== undefined ? { signal: params.signal } : {}),
     ...(deps.onToken !== undefined ? { onToken: deps.onToken } : {}),
   });

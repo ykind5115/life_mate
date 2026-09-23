@@ -88,6 +88,7 @@ export async function registerLifeReviewRoutes(
           status: g.status,
           target_at: g.targetAt,
         })),
+        summaries: result.summaries,
       },
       sources_available: result.sourcesAvailable,
     });

@@ -121,6 +121,28 @@ export const candidateMemorySchema = z.object({
    *    （见 candidate-processor 的 source 参数说明）。
    */
   evidence: z.string().max(500).optional(),
+
+  /**
+   * 该事实**开始成立**的时间（业务时间），ISO 8601。
+   *
+   * 【为什么需要它 —— 实测发现的数据缺陷】
+   *   原先抽取契约没有这个字段，编排层只能把「对话发生时间」当作 valid_from。
+   *   实测（2026-09-23）：
+   *     用户说「我上周三从北京搬到杭州」
+   *     → 事件正确记为 2026-09-16（模型换算了「上周三」）
+   *     → 但记忆的 valid_from 被写成 2026-09-23（对话当天）
+   *   两者相差一周，而 valid_from 会被注入上下文并标注「X 起有效」——
+   *   Agent 于是把搬家日期说成了 09-23。它答错了，但**错在数据不在它**。
+   *
+   *   valid_from 属于 C25 的**不可变字段**，改不了，只能重建记忆。
+   *   因此必须在写入时就是对的。
+   *
+   * 【什么时候填】
+   *   仅当用户明确给出了时间线索（「上周三」「去年三月」「今年开始」）时填。
+   *   没给就**留空** —— 留空表示「自记录起有效」，这是诚实的表达。
+   *   不要为了填字段而编造日期：那比留空更糟，会让时间线错位。
+   */
+  validFrom: z.union([z.string().max(40), z.null(), z.undefined()]).catch(null),
 });
 
 /**
@@ -208,6 +230,8 @@ export interface CandidateMemory {
   importance?: number | undefined;
   confidence?: number | undefined;
   evidence?: string | undefined;
+  /** 事实开始成立的时间（ISO 字符串）。模型未给时为 null */
+  validFrom?: string | null | undefined;
 }
 
 /** 抽取器返回的完整结果 */
@@ -719,6 +743,13 @@ export interface NormalizedCandidate {
   importanceScore: number;
   confidenceScore: number;
   evidence: string | null;
+  /**
+   * 事实开始成立的时间。
+   *
+   * 已解析为 Date；null 表示用户没给时间线索
+   * （语义是「自记录起有效」，由调用方决定是否用记录时间兜底）。
+   */
+  validFrom: Date | null;
 }
 
 export function normalizeCandidate(c: CandidateMemory): NormalizedCandidate {
@@ -734,5 +765,49 @@ export function normalizeCandidate(c: CandidateMemory): NormalizedCandidate {
     importanceScore: c.importance ?? 0.5,
     confidenceScore: c.confidence ?? 1.0,
     evidence: c.evidence ?? null,
+    validFrom: parseFactTime(c.validFrom ?? null),
   };
+}
+
+/**
+ * 解析模型给出的事实时间。
+ *
+ * 与事件时间共用一套容错（中文日期、只有年月、拒绝明显不合理的值），
+ * 但**解析失败时返回 null 而不是让整条记忆失败**：
+ *   事实时间填错只是让「X 起有效」不精确，
+ *   而丢掉整条记忆是白丢一条有价值的信息。
+ *
+ * ⚠️ 这与事件的处理**刻意不同**：事件没有正确时间就无法在时间线上定位，
+ *    因此那里选择丢弃（见 parseCandidateEvents 的说明）。
+ *    两者的取舍依据是「错误的时间会造成多大伤害」。
+ */
+function parseFactTime(raw: string | null): Date | null {
+  if (raw === null) return null;
+  const text = raw.trim();
+  if (text.length === 0) return null;
+
+  const cn = /^(\d{4})年(\d{1,2})月(\d{1,2})日?$/.exec(text);
+  if (cn) {
+    const d = new Date(
+      `${cn[1]}-${String(cn[2]).padStart(2, '0')}-${String(cn[3]).padStart(2, '0')}T00:00:00Z`
+    );
+    return Number.isNaN(d.getTime()) ? null : d;
+  }
+
+  const cnMonth = /^(\d{4})年(\d{1,2})月$/.exec(text);
+  if (cnMonth) {
+    const d = new Date(`${cnMonth[1]}-${String(cnMonth[2]).padStart(2, '0')}-01T00:00:00Z`);
+    return Number.isNaN(d.getTime()) ? null : d;
+  }
+
+  const dateOnly = /^(\d{4})-(\d{2})-(\d{2})$/.exec(text);
+  const d = dateOnly ? new Date(`${text}T00:00:00Z`) : new Date(text);
+  if (Number.isNaN(d.getTime())) return null;
+
+  // 与事件同样的合理性检查：拒绝 1900 年前与一年后的未来
+  const year = d.getUTCFullYear();
+  if (year < 1900) return null;
+  if (d.getTime() > Date.now() + 365 * 24 * 3600 * 1000) return null;
+
+  return d;
 }

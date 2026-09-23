@@ -9,13 +9,14 @@
  *   没有 deleted_at —— 摘要由消息派生，消息没了摘要没有保留意义。
  *   删除会话时随 §24.3 步骤⑤ 一起物理删除。
  */
-import { and, asc, desc, eq, gt, lte } from 'drizzle-orm';
+import { and, asc, desc, eq, gt, gte, isNull, lte, ne } from 'drizzle-orm';
 
 import { db } from '../client.js';
 import {
   conversationSummaries,
   type ConversationSummary,
 } from '../schema/conversation-summaries.js';
+import { conversations } from '../schema/conversations.js';
 import type { ExecutorOption } from './types.js';
 
 /**
@@ -67,6 +68,51 @@ export async function maxSummarizedSequence(
 
   // bigint 列用 mode:'number'，驱动返回 number；这里不做转型
   return rows[0]?.maxSeq ?? 0;
+}
+
+/**
+ * 取某时间窗内的会话摘要，供 Life Review 使用（docs/04 §32 的来源之一）。
+ *
+ * 【为什么用 created_at 而不是消息时间】
+ *   摘要是「某段对话的压缩」，它本身没有业务时间。
+ *   用 created_at 近似「这段时间聊了什么」是合理且唯一的可用信号 ——
+ *   要精确到消息时间需要 JOIN messages 取区间内的最小/最大时间戳，
+ *   那是一次额外的聚合，而摘要的用途只是给回顾提供背景，精度要求不高。
+ *
+ * 【为什么 JOIN conversations 而不是只按时间筛】
+ *   单用户系统里所有摘要都属于同一个用户，看似不需要过滤。
+ *   但 conversations 有软删除 —— 用户删掉的会话其摘要应随 §24.3 步骤⑤
+ *   一起物理删除。这里 JOIN 是为了兜住「删除流程没走完」的异常情况：
+ *   宁可少给几条背景，也不要把已删会话的摘要喂给模型。
+ */
+export async function listSummariesInRange(
+  params: { from: Date; to: Date; limit?: number },
+  options: ExecutorOption = {}
+): Promise<ConversationSummary[]> {
+  const exec = options.executor ?? db;
+
+  const rows = await exec
+    .select({ summary: conversationSummaries })
+    .from(conversationSummaries)
+    .innerJoin(
+      conversations,
+      and(
+        eq(conversations.id, conversationSummaries.conversationId),
+        isNull(conversations.deletedAt),
+        ne(conversations.status, 'deleted')
+      )
+    )
+    .where(
+      and(
+        eq(conversationSummaries.status, 'active'),
+        gte(conversationSummaries.createdAt, params.from),
+        lte(conversationSummaries.createdAt, params.to)
+      )
+    )
+    .orderBy(asc(conversationSummaries.createdAt))
+    .limit(params.limit ?? 30);
+
+  return rows.map((r) => r.summary);
 }
 
 /**

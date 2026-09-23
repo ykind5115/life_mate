@@ -30,6 +30,7 @@ import type { LLMProvider } from '../llm/provider.js';
 import { listEventsChronological } from '../database/repository/event-store.js';
 import { findValidAt } from '../database/repository/memory-queries.js';
 import { listGoals } from '../database/repository/goal-store.js';
+import { listSummariesInRange } from '../database/repository/summary-store.js';
 import type { Event } from '../database/schema/events.js';
 import type { Memory } from '../database/schema/memories.js';
 import type { Goal } from '../database/schema/goals.js';
@@ -93,20 +94,22 @@ export interface LifeReviewResult {
   memories: Memory[];
   /** 这段时间内活跃的目标（docs/04 §32 的四条来源之一） */
   goals: Goal[];
+  /** 这段时间内的会话摘要（docs/04 §32 的四条来源之一） */
+  summaries: string[];
   /**
    * 实际用到的数据来源与条数。
    *
    * ⚠️ 显式列出而不是省略：docs/04 §32 画了四条来源
    *    （Timeline / Memories / Goals / Summaries），
-   *    当前只接入了三条 —— 摘要还没接进回顾。
-   *    不说清楚的话「回顾怎么没提我之前的对话」会被当成 bug 排查很久。
+   *    某条来源为空时用户需要知道是「确实没有」还是「没接上」。
    */
   sourcesAvailable: {
     events: number;
     memories: number;
     goals: number;
-    /** 未接入的来源及原因 */
-    unavailable: { source: 'summaries'; reason: string }[];
+    summaries: number;
+    /** 接入失败的来源及原因。空数组表示四条都正常 */
+    unavailable: { source: string; reason: string }[];
   };
 }
 
@@ -129,17 +132,22 @@ export async function generateLifeReview(
 
   const memories = await loadMemoriesForPeriod(input);
   const goals = await loadGoalsForPeriod(input);
+  const summaries = await loadSummariesForPeriod(input);
 
-  const unavailable: LifeReviewResult['sourcesAvailable']['unavailable'] = [
-    {
-      source: 'summaries',
-      reason:
-        '会话摘要已生成并用于对话上下文，但尚未接入 Life Review 的材料' +
-        '（docs/04 §32 把它列为来源之一，接它需要按区间关联会话，尚未实现）',
-    },
-  ];
+  /**
+   * 四条来源现在都接入了（docs/04 §32）。
+   *
+   * 保留这个字段而不是删掉：它让「这次回顾用了什么材料」可核对，
+   * 也让将来若某条来源出问题（例如摘要生成失败）时能立刻看出来。
+   */
+  const unavailable: LifeReviewResult['sourcesAvailable']['unavailable'] = [];
 
-  if (events.length === 0 && memories.length === 0 && goals.length === 0) {
+  if (
+    events.length === 0 &&
+    memories.length === 0 &&
+    goals.length === 0 &&
+    summaries.length === 0
+  ) {
     return {
       period: { from: input.from, to: input.to },
       review: {
@@ -150,7 +158,8 @@ export async function generateLifeReview(
       events,
       memories,
       goals,
-      sourcesAvailable: { events: 0, memories: 0, goals: 0, unavailable },
+      summaries,
+      sourcesAvailable: { events: 0, memories: 0, goals: 0, summaries: 0, unavailable },
     };
   }
 
@@ -161,7 +170,7 @@ export async function generateLifeReview(
       { role: 'system', content: REVIEW_SYSTEM_PROMPT },
       {
         role: 'user',
-        content: buildReviewMaterials(input.from, input.to, events, memories, goals),
+        content: buildReviewMaterials(input.from, input.to, events, memories, goals, summaries),
       },
     ],
     maxOutputTokens: 4096,
@@ -175,10 +184,12 @@ export async function generateLifeReview(
     events,
     memories,
     goals,
+    summaries,
     sourcesAvailable: {
       events: events.length,
       memories: memories.length,
       goals: goals.length,
+      summaries: summaries.length,
       unavailable,
     },
   };
@@ -204,7 +215,8 @@ export function buildReviewMaterials(
   to: Date,
   events: Event[],
   memories: Memory[],
-  goals: Goal[] = []
+  goals: Goal[] = [],
+  summaries: string[] = []
 ): string {
   const range = `${formatDate(from)} 至 ${formatDate(to)}`;
 
@@ -238,6 +250,11 @@ export function buildReviewMaterials(
           .join('\n')
       : '（无）';
 
+  const summaryLines =
+    summaries.length > 0
+      ? summaries.map((s, i) => `【${i + 1}】${s}`).join('\n\n')
+      : '（无）';
+
   return [
     `回顾区间：${range}`,
     '',
@@ -249,6 +266,15 @@ export function buildReviewMaterials(
     '',
     '## 用户当前的目标（仍在进行中，不是已经完成的事）',
     goalLines,
+    '',
+    /**
+     * 摘要放在最后而不是最前：它是最「模糊」的材料（有损压缩）。
+     * 放最后让模型先看到硬事实（事件、记忆、目标），
+     * 再用摘要补充过程性信息 —— 顺序反了容易让模型以摘要为主干去写，
+     * 而摘要的细节可靠性最低。
+     */
+    '## 这段时间的对话摘要（有损压缩，仅供了解过程，细节可能不准）',
+    summaryLines,
     '',
     '请按契约输出 JSON。',
   ].join('\n');
@@ -300,6 +326,22 @@ async function loadGoalsForPeriod(input: LifeReviewInput): Promise<Goal[]> {
   });
 
   return page.items.filter((g) => g.createdAt.getTime() <= input.to.getTime());
+}
+
+/**
+ * 取该区间内生成的会话摘要。
+ *
+ * ⚠️ 这是最「模糊」的一类材料 —— 摘要是对摘要（消息已被压缩一次），
+ *    因此在使用时单独成段并标注「有损压缩」，
+ *    且放在材料的最后（见 buildReviewMaterials 的说明）。
+ */
+async function loadSummariesForPeriod(input: LifeReviewInput): Promise<string[]> {
+  const rows = await listSummariesInRange({
+    from: input.from,
+    to: input.to,
+    limit: 20,
+  });
+  return rows.map((s) => s.summary);
 }
 
 // ============================================================
