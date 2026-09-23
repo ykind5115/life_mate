@@ -12,6 +12,7 @@
  */
 import { createHash } from 'node:crypto';
 
+import type { StoreExecutor } from '../database/repository/memory-store.js';
 import type { Memory } from '../database/schema/memories.js';
 import type { PredicateKey } from '../database/schema/enums.js';
 import {
@@ -23,9 +24,14 @@ import {
 import { findCurrentBySlot } from '../database/repository/memory-queries.js';
 import type { NormalizedCandidate } from './extraction-schema.js';
 
-/** 事务内外通用执行器，与 repository 保持一致 */
-type Executor = Parameters<Parameters<typeof import('../database/client.js').db.transaction>[0]>[0];
-type ExecutorLike = Parameters<typeof createMemory>[1] extends { executor?: infer E } ? E : never;
+/**
+ * 执行器类型。
+ *
+ * 直接复用仓库导出的 StoreExecutor，**不在这里重新定义或推导** ——
+ * 曾试过用条件类型从仓库签名推导，结果推出了 never，
+ * 使测试里的 `as never` 变成假通过。类型要么显式，要么别写。
+ */
+export type ExecutorLike = StoreExecutor;
 
 /**
  * 槽位确认相同、取值不同时，由 LLM 做的「三选一」窄任务。
@@ -51,6 +57,27 @@ export type CandidateOutcome =
 export interface ProcessCandidateOptions {
   userId: string;
   candidate: NormalizedCandidate;
+
+  /**
+   * 来源消息。**由调用方提供，不由 LLM 提供**。
+   *
+   * ⚠️ 为什么要显式传入而不是靠候选里的 evidence：
+   *    evidence 是 LLM 摘录的**文本**，不是可解析的指针。
+   *    用它无法回答「这条记忆来自哪条消息」，也就无法实现
+   *    §15 的来源追踪与「点击记忆跳转到原始对话」。
+   *    来源必须是**确定性的 message_id**，而只有调用方（抽取编排层）
+   *    知道本次抽取覆盖了哪些消息。
+   *
+   * ⚠️ 这个字段是**必填**的。此前它是隐式的（写死 sourceType='system'
+   *    且所有指针为 null），导致抽取产出的记忆全部无法追溯 ——
+   *    而这类缺口不会报错，只会让产品承诺静默失效。
+   *    设为必填后，调用方必须在编译期就决定来源。
+   *
+   * 允许空数组：表示「确无消息来源」（如用户手工创建）。
+   * 但那时 sourceType 应相应设为 'manual'。
+   */
+  source: { messageIds: string[] };
+
   /** 判定器。缺省时「取值不同」一律按冲突处理（保守：不擅自覆盖用户已有事实） */
   adjudicator?: SlotAdjudicator;
   executor?: ExecutorLike;
@@ -85,9 +112,24 @@ export async function processCandidate(
     objectValue: candidate.objectValue,
   };
 
-  const sources = candidate.evidence
-    ? [{ sourceType: 'system' as const }]
-    : [{ sourceType: 'system' as const }];
+  /**
+   * 来源指针。
+   *
+   * 每条来源消息产生一条 memory_sources 记录（§15.2）——
+   * 一条记忆可能同时由多句话支撑，全部记下来才能完整追溯。
+   *
+   * sourceType 固定为 'conversation'：抽取的来源一定是对话。
+   * 'manual'（用户手工创建）与 'goal_projection'（Goal 投影）
+   * 走别的入口，不在本流程。
+   */
+  const sources =
+    options.source.messageIds.length > 0
+      ? options.source.messageIds.map((messageId) => ({
+          sourceType: 'conversation' as const,
+          messageId,
+        }))
+      : // 无消息来源：manual 在 chk_sources_has_origin 的豁免列表内
+        [{ sourceType: 'manual' as const }];
 
   const createInput = {
     userId,
@@ -112,7 +154,7 @@ export async function processCandidate(
   // ---------- 分支二：查同槽位的当前有效记忆 ----------
   const existing = await findCurrentBySlot(
     { userId, subjectKey: candidate.subjectKey, predicateKey: slot.predicateKey },
-    readOpt(options)
+    execOpt(options)
   );
 
   if (!existing) {
@@ -211,13 +253,25 @@ export function isEquivalentValue(a: string | null, b: string | null): boolean {
   return norm(a) === norm(b);
 }
 
-/** 生成槽位指纹，用于日志与去重统计 */
+/**
+ * 生成槽位指纹。
+ *
+ * 用途：把「同一槽位」聚合成一个短的稳定标识，用于
+ *   ① 日志与告警里按槽位聚合冲突率 —— 冲突率异常的槽位通常意味着
+ *      提示词对该槽位的边界定义不清，或该属性本身易变
+ *   ② 离线评测按槽位统计 Precision / Conflict 指标
+ *
+ * 不用把 subjectKey 与 predicateKey 直接拼进日志的原因：
+ * 它们是受控词表值，本身可读；但加上哈希后能作为**稳定的字典键**，
+ * 避免同一槽位因大小写或空白差异被算成两组。
+ */
 export function slotFingerprint(params: {
   subjectKey: string;
   predicateKey: string;
 }): string {
+  const normalize = (s: string): string => s.trim().toLowerCase();
   return createHash('sha256')
-    .update(`${params.subjectKey}::${params.predicateKey}`)
+    .update(`${normalize(params.subjectKey)}::${normalize(params.predicateKey)}`)
     .digest('hex')
     .slice(0, 16);
 }
@@ -226,13 +280,13 @@ export function slotFingerprint(params: {
 // 执行器透传
 // ============================================================
 
+/**
+ * 把执行器透传给仓库方法。
+ *
+ * 读写共用同一个函数：仓库的读写方法都接受 { executor }，
+ * 形状相同，没必要分成两个（此前 execOpt / readOpt 实现完全一样，
+ * 属于重复代码）。
+ */
 function execOpt(options: ProcessCandidateOptions): { executor: ExecutorLike } | undefined {
   return options.executor ? { executor: options.executor } : undefined;
 }
-
-function readOpt(options: ProcessCandidateOptions): { executor: ExecutorLike } | undefined {
-  return options.executor ? { executor: options.executor } : undefined;
-}
-
-/** 供调用方了解：本模块不生成 embedding（§25.2，须在事务外做） */
-export type { Executor };

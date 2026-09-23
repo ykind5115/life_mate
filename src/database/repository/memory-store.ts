@@ -35,13 +35,19 @@ import type { CreateMemoryInput, MemorySourceInput } from './memory-types.js';
  * （在已有事务内会生成 SAVEPOINT），因此仓库方法既能在事务外开新事务，
  * 也能被调用方传入一个外层事务，从而组合成更大的原子操作，
  * 或在测试里整体回滚。
+ *
+ * 显式导出（而非让调用方用条件类型推导）：推导版本既脆弱又难读，
+ * 实测会推出 never、把类型检查变成假通过。
  */
-type Executor = Pick<typeof db, 'select' | 'insert' | 'update' | 'delete' | 'transaction'>;
+export type StoreExecutor = Pick<
+  typeof db,
+  'select' | 'insert' | 'update' | 'delete' | 'transaction'
+>;
 
 /** 所有写操作都接受可选的执行器，默认使用全局 db */
-interface ExecutorOption {
+export interface ExecutorOption {
   /** 传入外层事务以组合原子操作；不传则在自身事务内执行 */
-  executor?: Executor;
+  executor?: StoreExecutor;
 }
 
 // ============================================================
@@ -561,7 +567,7 @@ export async function removeSourcesByMessageIds(messageIds: string[]): Promise<n
 // 内部辅助
 // ============================================================
 
-async function loadMemory(tx: Executor, id: string): Promise<Memory> {
+async function loadMemory(tx: StoreExecutor, id: string): Promise<Memory> {
   const rows = await tx.select().from(memories).where(eq(memories.id, id)).limit(1);
   const memory = rows[0];
   if (!memory) throw new Error(`记忆不存在：${id}`);
@@ -575,7 +581,7 @@ async function loadMemory(tx: Executor, id: string): Promise<Memory> {
  *                       此时忽略冲突而非报错（uq_memory_sources_memory_message）
  */
 async function insertSources(
-  tx: Executor,
+  tx: StoreExecutor,
   memoryId: string,
   sources: MemorySourceInput[],
   options: { ignoreConflict?: boolean } = {}

@@ -11,9 +11,12 @@
  */
 import assert from 'node:assert/strict';
 import { after, test } from 'node:test';
+import { sql } from 'drizzle-orm';
 
 import { closePool } from '../database/client.js';
 import { opts, withTestContext } from '../database/repository/_test-helpers.js';
+import { conversations } from '../database/schema/conversations.js';
+import { messages } from '../database/schema/messages.js';
 import {
   findCurrentById,
   findCurrentBySlot,
@@ -23,6 +26,7 @@ import {
   isEquivalentValue,
   processCandidate,
   slotFingerprint,
+  type ExecutorLike,
   type SlotAdjudicator,
 } from './candidate-processor.js';
 import { normalizeCandidate, parseExtractionResult } from './extraction-schema.js';
@@ -36,6 +40,15 @@ after(async () => {
 function candidate(partial: Partial<CandidateMemory> & { content: string }): CandidateMemory {
   return { type: 'fact', ...partial };
 }
+
+/**
+ * 判定流程现在**要求显式提供来源**（source 为必填）。
+ *
+ * 这些用例不涉及真实消息，因此传空数组 —— 等价于「无消息来源」，
+ * 判定流程会写成 sourceType='manual'。
+ * 真实抽取编排会传入本次覆盖的 messageId，见 pipeline 实现。
+ */
+const NO_SOURCE = { messageIds: [] as string[] };
 
 /** 固定判定的假判定器，覆盖三个分支 */
 function fixedAdjudicator(
@@ -54,8 +67,9 @@ test('无槽位候选 → 直接新增，不参与冲突判定', async () => {
   await withTestContext(async ({ exec, userId }) => {
     const a = await processCandidate({
       userId,
+      source: NO_SOURCE,
       candidate: normalizeCandidate(candidate({ content: '用户今天心情不错' })),
-      executor: exec as never,
+      executor: exec as unknown as ExecutorLike,
     });
     assert.equal(a.kind, 'created');
     assert.equal(a.reason, 'no_slot');
@@ -63,8 +77,9 @@ test('无槽位候选 → 直接新增，不参与冲突判定', async () => {
     // 再来一条内容相同但同样无槽位的 —— 不应去重（数据库表达不了）
     const b = await processCandidate({
       userId,
+      source: NO_SOURCE,
       candidate: normalizeCandidate(candidate({ content: '用户今天心情不错' })),
-      executor: exec as never,
+      executor: exec as unknown as ExecutorLike,
     });
     assert.equal(b.kind, 'created', '无槽位记忆的重复由抽取器负责，判定流程不合并');
   });
@@ -74,10 +89,11 @@ test('有 predicateKey 但缺 objectValue → 视为无槽位（成对才有效�
   await withTestContext(async ({ exec, userId }) => {
     const r = await processCandidate({
       userId,
+      source: NO_SOURCE,
       candidate: normalizeCandidate(
         candidate({ content: '用户偏好某种沟通方式', predicateKey: 'preference.communication_style' })
       ),
-      executor: exec as never,
+      executor: exec as unknown as ExecutorLike,
     });
     assert.equal(r.kind, 'created');
     assert.equal(
@@ -96,6 +112,7 @@ test('同槽位无既有记忆 → 新增', async () => {
   await withTestContext(async ({ exec, userId }) => {
     const r = await processCandidate({
       userId,
+      source: NO_SOURCE,
       candidate: normalizeCandidate(
         candidate({
           content: '用户正在学习 TypeScript',
@@ -103,7 +120,7 @@ test('同槽位无既有记忆 → 新增', async () => {
           objectValue: 'TypeScript',
         })
       ),
-      executor: exec as never,
+      executor: exec as unknown as ExecutorLike,
     });
 
     assert.equal(r.kind, 'created');
@@ -120,6 +137,7 @@ test('同槽位同取值 → 去重合并，不新建记录', async () => {
   await withTestContext(async ({ exec, userId }) => {
     const first = await processCandidate({
       userId,
+      source: NO_SOURCE,
       candidate: normalizeCandidate(
         candidate({
           content: '用户正在学习 TypeScript',
@@ -128,13 +146,14 @@ test('同槽位同取值 → 去重合并，不新建记录', async () => {
           confidence: 0.8,
         })
       ),
-      executor: exec as never,
+      executor: exec as unknown as ExecutorLike,
     });
     assert.equal(first.kind, 'created');
 
     // 换个说法再提一次
     const second = await processCandidate({
       userId,
+      source: NO_SOURCE,
       candidate: normalizeCandidate(
         candidate({
           content: '用户最近在学 TypeScript',
@@ -143,7 +162,7 @@ test('同槽位同取值 → 去重合并，不新建记录', async () => {
           confidence: 0.95,
         })
       ),
-      executor: exec as never,
+      executor: exec as unknown as ExecutorLike,
     });
 
     assert.equal(second.kind, 'merged');
@@ -179,6 +198,7 @@ test('取值不同 + state_change → supersede，旧记忆保留为历史', asy
   await withTestContext(async ({ exec, userId }) => {
     const first = await processCandidate({
       userId,
+      source: NO_SOURCE,
       candidate: normalizeCandidate(
         candidate({
           content: '用户住在广州',
@@ -186,12 +206,13 @@ test('取值不同 + state_change → supersede，旧记忆保留为历史', asy
           objectValue: '广州',
         })
       ),
-      executor: exec as never,
+      executor: exec as unknown as ExecutorLike,
     });
     assert.equal(first.kind, 'created');
 
     const second = await processCandidate({
       userId,
+      source: NO_SOURCE,
       candidate: normalizeCandidate(
         candidate({
           content: '用户已搬到深圳',
@@ -200,7 +221,7 @@ test('取值不同 + state_change → supersede，旧记忆保留为历史', asy
         })
       ),
       adjudicator: fixedAdjudicator('state_change'),
-      executor: exec as never,
+      executor: exec as unknown as ExecutorLike,
     });
 
     assert.equal(second.kind, 'superseded');
@@ -222,6 +243,7 @@ test('取值不同 + conflict → 以 conflict 状态落库，等用户裁决', 
   await withTestContext(async ({ exec, userId }) => {
     const first = await processCandidate({
       userId,
+      source: NO_SOURCE,
       candidate: normalizeCandidate(
         candidate({
           content: '用户婚恋状态是单身',
@@ -229,12 +251,13 @@ test('取值不同 + conflict → 以 conflict 状态落库，等用户裁决', 
           objectValue: '单身',
         })
       ),
-      executor: exec as never,
+      executor: exec as unknown as ExecutorLike,
     });
     assert.equal(first.kind, 'created');
 
     const second = await processCandidate({
       userId,
+      source: NO_SOURCE,
       candidate: normalizeCandidate(
         candidate({
           content: '用户婚恋状态是已婚',
@@ -243,7 +266,7 @@ test('取值不同 + conflict → 以 conflict 状态落库，等用户裁决', 
         })
       ),
       adjudicator: fixedAdjudicator('conflict'),
-      executor: exec as never,
+      executor: exec as unknown as ExecutorLike,
     });
 
     assert.equal(second.kind, 'conflict');
@@ -272,6 +295,7 @@ test('取值不同 + coexist 但未指定新槽位 → 退化为冲突（不硬�
   await withTestContext(async ({ exec, userId }) => {
     await processCandidate({
       userId,
+      source: NO_SOURCE,
       candidate: normalizeCandidate(
         candidate({
           content: '用户正在学习 Python',
@@ -279,11 +303,12 @@ test('取值不同 + coexist 但未指定新槽位 → 退化为冲突（不硬�
           objectValue: 'Python',
         })
       ),
-      executor: exec as never,
+      executor: exec as unknown as ExecutorLike,
     });
 
     const r = await processCandidate({
       userId,
+      source: NO_SOURCE,
       candidate: normalizeCandidate(
         candidate({
           content: '用户也在用 TypeScript',
@@ -292,7 +317,7 @@ test('取值不同 + coexist 但未指定新槽位 → 退化为冲突（不硬�
         })
       ),
       adjudicator: fixedAdjudicator('coexist'),
-      executor: exec as never,
+      executor: exec as unknown as ExecutorLike,
     });
 
     // 关键判断：不允许自动改写槽位 ——
@@ -306,6 +331,7 @@ test('取值不同 + coexist + 显式指定新槽位 → 用新槽位新增', as
   await withTestContext(async ({ exec, userId }) => {
     await processCandidate({
       userId,
+      source: NO_SOURCE,
       candidate: normalizeCandidate(
         candidate({
           content: '用户正在学习 Python',
@@ -313,11 +339,12 @@ test('取值不同 + coexist + 显式指定新槽位 → 用新槽位新增', as
           objectValue: 'Python',
         })
       ),
-      executor: exec as never,
+      executor: exec as unknown as ExecutorLike,
     });
 
     const r = await processCandidate({
       userId,
+      source: NO_SOURCE,
       candidate: normalizeCandidate(
         candidate({
           content: '用户把编程当作兴趣',
@@ -327,7 +354,7 @@ test('取值不同 + coexist + 显式指定新槽位 → 用新槽位新增', as
       ),
       adjudicator: fixedAdjudicator('coexist'),
       overrideSlot: { predicateKey: 'interest.hobby', objectValue: '编程' },
-      executor: exec as never,
+      executor: exec as unknown as ExecutorLike,
     });
 
     assert.equal(r.kind, 'created');
@@ -340,6 +367,7 @@ test('无判定器时取值不同一律按冲突处理（保守，不擅自覆�
   await withTestContext(async ({ exec, userId }) => {
     await processCandidate({
       userId,
+      source: NO_SOURCE,
       candidate: normalizeCandidate(
         candidate({
           content: '用户目标是学 Rust',
@@ -347,11 +375,12 @@ test('无判定器时取值不同一律按冲突处理（保守，不擅自覆�
           objectValue: 'Rust',
         })
       ),
-      executor: exec as never,
+      executor: exec as unknown as ExecutorLike,
     });
 
     const r = await processCandidate({
       userId,
+      source: NO_SOURCE,
       candidate: normalizeCandidate(
         candidate({
           content: '用户目标是学 Go',
@@ -360,7 +389,7 @@ test('无判定器时取值不同一律按冲突处理（保守，不擅自覆�
         })
       ),
       // 不传 adjudicator
-      executor: exec as never,
+      executor: exec as unknown as ExecutorLike,
     });
 
     assert.equal(r.kind, 'conflict');
@@ -444,4 +473,124 @@ test('slotFingerprint 对同一槽位稳定、对不同槽位不同', () => {
 
   assert.equal(a, b);
   assert.notEqual(a, c);
+
+  // 大小写与空白差异不应被算成两个槽位，否则按槽位聚合的统计会分裂
+  assert.equal(
+    slotFingerprint({ subjectKey: 'USER', predicateKey: ' Residence.City ' }),
+    a,
+    '指纹应归一化大小写与空白'
+  );
+});
+
+// ============================================================
+// 来源追踪（§15）
+//
+// 这组测试是为补上一个**真实缺口**而加的：
+//   原先 processCandidate 写死 sourceType='system' 且所有指针为 null，
+//   LLM 摘录的 evidence 被算出来又丢弃，导致抽取产出的记忆
+//   **无法回答「这条记忆是从哪句话来的」** —— §15 的核心承诺静默失效。
+//   source 现已改为必填参数，类型检查会拦住漏传的调用方；
+//   这组测试则锁住「传了是否真的落库」。
+// ============================================================
+
+test('来源指针被正确写入 memory_sources（§15 来源追踪）', async () => {
+  await withTestContext(async ({ exec, userId }) => {
+    const convRows = await exec
+      .insert(conversations)
+      .values({ userId, title: '来源测试' })
+      .returning({ id: conversations.id });
+    const convId = convRows[0]!.id;
+
+    const msgRows = await exec
+      .insert(messages)
+      .values({
+        conversationId: convId,
+        role: 'user',
+        content: '我最近想认真学一下 TypeScript',
+        sequence: 1,
+      })
+      .returning({ id: messages.id });
+    const msgId = msgRows[0]!.id;
+
+    const r = await processCandidate({
+      userId,
+      source: { messageIds: [msgId] },
+      candidate: normalizeCandidate(
+        candidate({
+          content: '用户正在学习 TypeScript',
+          predicateKey: 'skill.learning',
+          objectValue: 'TypeScript',
+          evidence: '我最近想认真学一下 TypeScript',
+        })
+      ),
+      executor: exec as unknown as ExecutorLike,
+    });
+
+    const rows = await exec.execute<{ source_type: string; message_id: string | null }>(sql`
+      SELECT source_type, message_id::text AS message_id
+        FROM memory_sources WHERE memory_id = ${r.memory.id}
+    `);
+
+    assert.equal(rows.rows.length, 1, '应有一条来源记录');
+    assert.equal(rows.rows[0]?.source_type, 'conversation');
+    assert.equal(
+      rows.rows[0]?.message_id,
+      msgId,
+      '来源必须指向真实消息 —— 这是「点击记忆跳转到原始对话」的基础'
+    );
+  });
+});
+
+test('多条消息可共同支撑同一条记忆', async () => {
+  await withTestContext(async ({ exec, userId }) => {
+    const convRows = await exec
+      .insert(conversations)
+      .values({ userId, title: '多来源测试' })
+      .returning({ id: conversations.id });
+    const convId = convRows[0]!.id;
+
+    const msgRows = await exec
+      .insert(messages)
+      .values([
+        { conversationId: convId, role: 'user', content: '我在学 TS', sequence: 1 },
+        { conversationId: convId, role: 'user', content: 'TS 的类型系统挺有意思', sequence: 2 },
+      ])
+      .returning({ id: messages.id });
+
+    const r = await processCandidate({
+      userId,
+      source: { messageIds: msgRows.map((m) => m.id) },
+      candidate: normalizeCandidate(
+        candidate({
+          content: '用户正在学习 TypeScript',
+          predicateKey: 'skill.learning',
+          objectValue: 'TypeScript',
+        })
+      ),
+      executor: exec as unknown as ExecutorLike,
+    });
+
+    const rows = await exec.execute<{ n: number }>(sql`
+      SELECT COUNT(*)::int AS n FROM memory_sources WHERE memory_id = ${r.memory.id}
+    `);
+    assert.equal(rows.rows[0]?.n, 2, '两句话共同支撑时应记下两条来源');
+  });
+});
+
+test('无消息来源时写为 manual（在 chk_sources_has_origin 豁免内）', async () => {
+  await withTestContext(async ({ exec, userId }) => {
+    const r = await processCandidate({
+      userId,
+      source: { messageIds: [] },
+      candidate: normalizeCandidate(candidate({ content: '用户偏好简洁的回答' })),
+      executor: exec as unknown as ExecutorLike,
+    });
+
+    const rows = await exec.execute<{ source_type: string; message_id: string | null }>(sql`
+      SELECT source_type, message_id::text AS message_id
+        FROM memory_sources WHERE memory_id = ${r.memory.id}
+    `);
+    assert.equal(rows.rows[0]?.source_type, 'manual');
+    assert.equal(rows.rows[0]?.message_id, null);
+  });
 });
