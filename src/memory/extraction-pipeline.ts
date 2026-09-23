@@ -26,6 +26,7 @@ import { createHash } from 'node:crypto';
 
 import { db } from '../database/client.js';
 import { upsertMemoryEmbedding, setEmbeddingStatus } from '../database/repository/memory-store.js';
+import { writeExtractedEvents } from './event-writer.js';
 import type { ExecutorOption, StoreExecutor } from '../database/repository/types.js';
 import {
   claimExtractionRun,
@@ -50,6 +51,7 @@ import { LlmSlotAdjudicator } from './slot-adjudicator.js';
 import {
   normalizeCandidate,
   parseExtractionResultWithDiagnostics,
+  emptyDiagnostics,
   type ExtractionDiagnostics,
 } from './extraction-schema.js';
 import {
@@ -122,6 +124,8 @@ export interface ExtractionSummary {
     superseded: number;
     conflict: number;
   };
+  /** 事件写入情况（Timeline 的数据来源，§20） */
+  events: { created: number; skippedDuplicates: number };
   /** 判定阶段额外调用了几次 LLM（每次取值变化一次） */
   adjudicationCalls: number;
   /** 向量生成成功/失败的条数 */
@@ -223,9 +227,19 @@ export async function runExtraction(
       },
     };
 
+    /**
+     * 对话发生时间。
+     *
+     * 取本批消息里**最后一条**的 created_at —— 它最接近「用户说这些话的时刻」。
+     * 用途：提示词里告诉模型当前日期，让它把「上周三」「去年三月」
+     * 这类相对时间换算成绝对时间（event_time 是 TIMESTAMPTZ，存不了相对时间）。
+     */
+    const conversationTime = msgs[msgs.length - 1]!.createdAt;
+
     const res = await provider.generate({
       messages: buildExtractionMessages(
-        msgs.map((m) => ({ role: m.role, content: m.content }))
+        msgs.map((m) => ({ role: m.role, content: m.content })),
+        { conversationTime }
       ),
       // 抽取要输出结构化 JSON（10~20 条记忆），需要足够的回答空间。
       // 且推理模型思考与回答共享预算，必须留余量（见 env.ts 的说明）。
@@ -237,7 +251,7 @@ export async function runExtraction(
 
     // 用带诊断的解析：丢弃与降级的事实必须被记录，
     // 否则槽位命中率下降这类质量退化会静默发生（见 extraction-schema 的分级策略）
-    const parsed = parseExtractionResultWithDiagnostics(res.content);
+    const parsed = parseExtractionResultWithDiagnostics(res.content, { conversationTime });
     const extraction = parsed.result;
     const candidates = extraction.memories.map(normalizeCandidate);
 
@@ -258,6 +272,23 @@ export async function runExtraction(
       outcomes.push(outcome);
     }
 
+    // ---------- ⑤b 写入事件（Timeline 的数据来源，§20）----------
+    /**
+     * ⚠️ 事件与记忆**没有强绑定**（§20.4 明确二者允许独立存在）。
+     *    因此这里不做「记忆成功才写事件」这类耦合：
+     *    事件有自己的去重规则（见 upsertExtractedEvents），
+     *    失败也不影响记忆。
+     *
+     * 来源消息取本批的最后一条：事件通常是在对话末尾被提到的
+     * （「我上周换了工作」）。这比取第一条更接近事实。
+     */
+    const eventsWritten = await writeExtractedEvents({
+      userId,
+      events: extraction.events,
+      sourceMessageId: messageIds[messageIds.length - 1] ?? null,
+      ...ex,
+    });
+
     // ---------- ⑥ 生成并写入向量（事务外 → 事务 B）----------
     const shouldEmbed = params.generateEmbeddings ?? true;
     const embedStats = shouldEmbed
@@ -277,6 +308,7 @@ export async function runExtraction(
         superseded: outcomes.filter((o) => o.kind === 'superseded').length,
         conflict: outcomes.filter((o) => o.kind === 'conflict').length,
       },
+      events: eventsWritten,
       adjudicationCalls,
       embeddings: { succeeded: embedStats.succeeded, failed: embedStats.failed },
       memoriesWithoutEmbedding: embedStats.pending,
@@ -311,14 +343,9 @@ function emptySummary(
     executed,
     ...(skippedReason !== undefined ? { skippedReason } : {}),
     candidatesFound: 0,
-    diagnostics: {
-      rawCount: 0,
-      validCount: 0,
-      dropped: [],
-      degradations: [],
-      slotCoverage: { withSlot: 0, total: 0 },
-    },
+    diagnostics: emptyDiagnostics(),
     outcomes: { created: 0, merged: 0, superseded: 0, conflict: 0 },
+    events: { created: 0, skippedDuplicates: 0 },
     adjudicationCalls: 0,
     embeddings: { succeeded: 0, failed: 0 },
     memoriesWithoutEmbedding: [],

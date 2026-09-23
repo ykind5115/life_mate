@@ -30,6 +30,8 @@ import { registerChatRoutes, type ChatRouteDeps } from './routes/chat.js';
 import { registerConversationRoutes } from './routes/conversations.js';
 import { registerMemoryRoutes } from './routes/memories.js';
 import { registerSettingsRoutes } from './routes/settings.js';
+import { registerTimelineRoutes } from './routes/timeline.js';
+import { registerLifeReviewRoutes } from './routes/life-review.js';
 import type { IdempotencyStore } from './idempotency.js';
 import type { ChatResult } from '../conversation/chat-service.js';
 
@@ -162,6 +164,10 @@ export async function buildServer(options: BuildServerOptions = {}): Promise<Fas
       await registerConversationRoutes(v1);
       await registerMemoryRoutes(v1);
       await registerSettingsRoutes(v1);
+      await registerTimelineRoutes(v1);
+      await registerLifeReviewRoutes(v1, {
+        ...(options.provider !== undefined ? { provider: options.provider } : {}),
+      });
     },
     { prefix: '/api/v1' }
   );

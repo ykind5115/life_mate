@@ -216,6 +216,116 @@ export const updateSettingsSchema = z
   .strict();
 
 // ============================================================
+// Timeline / Event（docs/04 §27–§30）
+// ============================================================
+
+/**
+ * 事件分类。
+ *
+ * ⚠️ 直接从 enums.ts 导出，不在这里重写一份：
+ *    库层有 chk_events_category 的 CHECK（C37），
+ *    两处枚举各写一份必然漂移 —— 加一个类别就要改两个地方，
+ *    漏掉一处时前端会传一个被库层拒绝的值。
+ */
+export { EVENT_CATEGORIES as TIMELINE_CATEGORIES } from '../database/schema/enums.js';
+
+/**
+ * 日期参数。
+ *
+ * 接受 `YYYY-MM-DD` 或完整 ISO 8601。
+ * 不做 .datetime() 强校验的原因：docs/04 §27 的示例就是 `?start=2026-01-01`，
+ * 强校验会把它拒掉。
+ */
+const dateParamSchema = z.string().min(1).max(40);
+
+export const timelineQuerySchema = paginationSchema.extend({
+  start: dateParamSchema.optional(),
+  end: dateParamSchema.optional(),
+  category: z
+    .enum(['work', 'study', 'project', 'life', 'health', 'other'])
+    .optional(),
+});
+
+export const timelineEventIdParamSchema = z.object({ id: uuidSchema });
+
+export const createTimelineEventSchema = z
+  .object({
+    title: z.string().min(1, '标题不能为空').max(MAX_TITLE_LENGTH),
+    description: z.string().max(2000).nullish(),
+    /** 事件发生时间。必填 —— event_time 是 NOT NULL，没有时间的事件无法上时间线 */
+    event_time: z.string().min(1, 'event_time 不能为空'),
+    category: z.enum(['work', 'study', 'project', 'life', 'health', 'other']).nullish(),
+    importance_score: z.number().min(0).max(1).optional(),
+    timeline_visible: z.boolean().optional(),
+  })
+  .strict();
+
+/**
+ * 更新事件。
+ *
+ * ⚠️ 与记忆的 PATCH 形成对比，这里**允许改内容**：
+ *    Q1 的「不可变事实」约束针对 memories（要参与冲突判定与历史查询）。
+ *    事件是用户人生经历的记录，标题写错了就该能改 ——
+ *    docs/04 §29 也给了这个端点。
+ *    允许改：title / description / event_time / category /
+ *            importance_score / timeline_visible
+ *    不允许改：source_type / source_message_id（来源凭证）与 created_at
+ */
+export const updateTimelineEventSchema = z
+  .object({
+    title: z.string().min(1).max(MAX_TITLE_LENGTH).optional(),
+    description: z.string().max(2000).nullish(),
+    event_time: z.string().min(1).optional(),
+    category: z.enum(['work', 'study', 'project', 'life', 'health', 'other']).nullish(),
+    importance_score: z.number().min(0).max(1).optional(),
+    timeline_visible: z.boolean().optional(),
+  })
+  .strict();
+
+// ============================================================
+// Life Review（docs/04 §31–§33）
+// ============================================================
+
+/**
+ * 生成生活回顾。
+ *
+ * docs/04 §31 的示例只给了 start / end。
+ * 这里额外支持 kind=day|week|month —— PRD §7.6 明确要求
+ * 「日回顾 / 周回顾 / 月回顾 / 时间范围回顾」四种，
+ * 只给自定义区间的话前端要自己算周一到周日，
+ * 而「一周从哪天开始」这种约定不该散落在前端。
+ *
+ * 两种用法：
+ *   { "kind": "week" }                          回顾本周
+ *   { "start": "...", "end": "..." }            回顾指定区间
+ *   { "kind": "month", "at": "2026-08-15" }     回顾 2026 年 8 月
+ */
+export const lifeReviewRequestSchema = z
+  .object({
+    kind: z.enum(['day', 'week', 'month', 'custom']).optional(),
+    /** 参考时间点。缺省为现在。用于回顾「上个月的」而非「此刻所在月」 */
+    at: z.string().min(1).optional(),
+    /** kind=custom（或省略 kind）时的区间 */
+    start: z.string().min(1).optional(),
+    end: z.string().min(1).optional(),
+  })
+  .strict()
+  .refine(
+    (v) => {
+      /**
+       * 省略 kind 时按 custom 处理，因此必须给 start/end。
+       * 这个 refine 把「参数不全」在入口处拦下 ——
+       * 否则会走到 service 里抛一个 500。
+       */
+      if (v.kind === undefined || v.kind === 'custom') {
+        return v.start !== undefined && v.end !== undefined;
+      }
+      return true;
+    },
+    { message: 'kind 为 custom 或省略时必须同时提供 start 与 end' }
+  );
+
+// ============================================================
 // 内部再导出，供 route 做枚举校验
 // ============================================================
 

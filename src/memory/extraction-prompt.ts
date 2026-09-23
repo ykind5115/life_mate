@@ -105,6 +105,55 @@ ${buildPredicateTable()}
 - ❌ 不要用「他」「这个」「那个」等依赖上下文的指代。
 - 时间信息若用户提到，写进正文（例：「用户于 2026 年 9 月开始学习 TypeScript」）。
 
+## 事件（events）
+
+除了记忆，还要抽出**构成人生节点的事件** —— 它们会出现在用户的时间线上。
+
+### 什么算事件
+
+- 有**明确时间点**（或可推算出的时间）的、对用户有意义的经历
+- 典型：换工作、搬家、开始/完成某个项目、毕业、结婚、生病住院、开始学某样东西
+- 判据：**「几年后回头看，这件事值得在时间线上占一个点吗？」**
+  值得 → 事件；不值得 → 只是记忆，甚至什么都不记
+
+### 事件与记忆的区别（重要）
+
+同一句话可能同时产出记忆与事件，这是**正常且期望的**：
+
+    用户：「我上周换了工作，去了字节做后端」
+
+    memory: 用户在字节做后端开发（事实，会参与冲突判定）
+    event:  「换工作到字节」（时间点 2026-09-16，category=work，时间线上的一个节点）
+
+但两者不是一一对应：
+
+    只出 memory：用户喜欢喝手冲咖啡     → 偏好，不是"某天发生的事"
+    只出 event ：用户今天搬到了新家     → 一次性事件，没有需要长期维护的槽位
+
+### eventTime 的写法（最容易出错的地方）
+
+- **必须输出绝对时间**（ISO 8601），不能写「上周三」「去年」这种相对表述 ——
+  事件要落库排序，相对时间无法存储，而且几周后再看就无法解析了
+- 用上面给你的「当前日期」自己换算：
+  「上周」→ 当前日期减 7 天左右的**具体日期**
+  「去年三月」→ 去年的 3 月（具体到日时用 1 号）
+- 只知道年月、不知道具体哪天 → 用该月 1 号，不要编造具体日期
+- **推算不出来就不要输出这个事件** —— 宁可少一个节点，
+  也不要一个时间错误、让用户在时间线上看到自己没做过的事
+
+### title 与 description
+
+- title：短，10~20 字，时间线上直接显示。以事件本身为主语，不必写「用户」
+  （例：「换工作到字节」「开始学习 TypeScript」「搬到杭州」）
+- description：可长，补充背景与感受，供点开查看
+
+### category
+
+从下列里选一个；**实在无法归类就用 other**，不要编造：
+
+- work（工作相关）/ study（学习）/ project（个人项目）/
+  life（生活变动：搬家、婚恋、旅行）/ health（健康）/ other
+
 ## 字段说明
 
 - \`type\`：fact（稳定事实）/ preference（偏好）/ event（事件）/ goal（目标）/
@@ -134,10 +183,20 @@ ${buildPredicateTable()}
       "evidence": "我最近想认真学一下 TypeScript"
     }
   ],
+  "events": [
+    {
+      "title": "开始学习 TypeScript",
+      "description": "用户开始系统学习 TypeScript，用于开发个人项目",
+      "eventTime": "2026-09-10T00:00:00Z",
+      "category": "study",
+      "importance": 0.6,
+      "evidence": "我最近想认真学一下 TypeScript"
+    }
+  ],
   "note": "一句话说明抽到了什么（可选）"
 }
 
-若这段对话没有任何值得长期记住的信息，输出：{"memories": []}`;
+若这段对话没有任何值得长期记住的信息，输出：{"memories": [], "events": []}`;
 
 /**
  * 把对话片段组织成用户消息。
@@ -145,29 +204,48 @@ ${buildPredicateTable()}
  * 刻意标明每条消息的角色与序号：
  *   ① 让模型能区分用户自述与 AI 的推测（后者不可作为记忆来源）
  *   ② 序号便于 evidence 溯源时定位
+ *
+ * ⚠️ 必须告知**当前日期**，否则事件抽取做不了：
+ *    event_time 是 TIMESTAMPTZ，存不了「上周三」。
+ *    模型需要知道"现在"才能把相对时间换算成绝对时间。
+ *    用 UTC 表示并显式标注 —— 让模型自己处理时区比我们猜更可靠。
  */
 export function buildExtractionUserMessage(
-  messages: { role: string; content: string }[]
+  messages: { role: string; content: string }[],
+  options: { conversationTime?: Date } = {}
 ): LLMMessage {
   const lines = messages.map((m, i) => {
     const speaker = m.role === 'user' ? '用户' : m.role === 'assistant' ? 'AI' : m.role;
     return `[${i + 1}] ${speaker}：${m.content}`;
   });
 
+  const timeHint = options.conversationTime
+    ? `当前日期：${formatDateForPrompt(options.conversationTime)}（UTC）。\n` +
+      `抽取事件时用它来换算「上周」「去年三月」这类相对时间。\n\n`
+    : '';
+
   return {
     role: 'user',
-    content: `以下是需要抽取记忆的对话片段：\n\n${lines.join('\n')}\n\n请按契约输出 JSON。`,
+    content:
+      `${timeHint}以下是需要抽取记忆与事件的对话片段：\n\n${lines.join('\n')}\n\n` +
+      `请按契约输出 JSON。`,
   };
+}
+
+/** 格式化为 YYYY-MM-DD。不用 toLocaleDateString：输出依赖运行环境 locale */
+function formatDateForPrompt(d: Date): string {
+  return d.toISOString().slice(0, 10);
 }
 
 /**
  * 组装完整的抽取请求消息。
  */
 export function buildExtractionMessages(
-  conversation: { role: string; content: string }[]
+  conversation: { role: string; content: string }[],
+  options: { conversationTime?: Date } = {}
 ): LLMMessage[] {
   return [
     { role: 'system', content: EXTRACTION_SYSTEM_PROMPT },
-    buildExtractionUserMessage(conversation),
+    buildExtractionUserMessage(conversation, options),
   ];
 }

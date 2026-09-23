@@ -52,7 +52,12 @@
  */
 import { z } from 'zod';
 
-import { MEMORY_TYPES, MEMORY_POLARITIES, PREDICATE_KEYS } from '../database/schema/enums.js';
+import {
+  MEMORY_TYPES,
+  MEMORY_POLARITIES,
+  PREDICATE_KEYS,
+  EVENT_CATEGORIES,
+} from '../database/schema/enums.js';
 
 /**
  * 抽取器返回的单条候选记忆。
@@ -119,6 +124,67 @@ export const candidateMemorySchema = z.object({
 });
 
 /**
+ * 抽取器返回的单条候选事件（docs/03 §20、§20.4）。
+ *
+ * 【为什么事件与记忆在同一次调用里产出，而不是各调一次】
+ *   事件与记忆是从**同一段对话**里读出来的两类东西：
+ *     Memory「用户正在学习 TypeScript」  → 不一定是事件
+ *     Event 「2026-09 开始学习 TS」      → 有明确时间点、构成人生节点
+ *   分两次调用等于让模型把同样的对话读两遍，成本翻倍且两次判断可能不一致。
+ *   §20.4 明确二者「允许独立存在、不强制绑定」，因此一次读、分别输出最自然。
+ *
+ * 【与记忆的关键差异：事件必须有时间】
+ *   event_time 是 NOT NULL（§20.2）。没有时间的事件在时间线上无处安放。
+ *   因此 eventTime 是**必填**，模型给不出相对时间的换算时，
+ *   由调用方用对话发生时间兜底（见 normalizeCandidateEvent）。
+ *
+ * 【title 与 description 的分工】
+ *   title 要短（时间线上显示），description 可长（点开看详情）。
+ *   让模型自己判断详略，比我们截断更合理 —— 截断会把一句话切成半截。
+ */
+export const candidateEventSchema = z.object({
+  /** 事件名称。时间线上显示的就是它，因此要短 */
+  title: z.string().min(1).max(200),
+
+  /** 事件描述。可空 */
+  description: z.union([z.string().max(1000), z.null(), z.undefined()]).catch(null),
+
+  /**
+   * 事件发生时间，ISO 8601 字符串。
+   *
+   * ⚠️ 要求模型输出**绝对时间**而不是「上周三」：
+   *    提示词里会给出对话发生的日期，让它自行换算。
+   *    相对时间无法落库（event_time 是 TIMESTAMPTZ），
+   *    而且记忆会在几周后被检索到，那时「上周三」已经无法解析。
+   */
+  eventTime: z.string().min(1),
+
+  /**
+   * 分类。词表外或缺失 → 降级为 null（不强制归类，§20.2 的 C37 说明）。
+   *
+   * ⚠️ 不在这里把词表外的值改成 'other'：
+   *    那是**存储策略**，应由 normalizeCandidateEvent 决定并留下诊断。
+   *    schema 层只负责把非法值收敛成 null。
+   */
+  category: z.union([z.enum(EVENT_CATEGORIES), z.null(), z.undefined()]).catch(null),
+
+  /** 重要性 0~1。越界收敛 */
+  importance: z.number().min(0).max(1).catch(0.5).optional(),
+
+  /** 依据的原文片段，供人工核查 */
+  evidence: z.string().max(500).optional(),
+});
+
+export interface CandidateEvent {
+  title: string;
+  description?: string | null | undefined;
+  eventTime: string;
+  category?: (typeof EVENT_CATEGORIES)[number] | null | undefined;
+  importance?: number | undefined;
+  evidence?: string | undefined;
+}
+
+/**
  * 候选记忆的类型。
  *
  * ⚠️ 手写接口而不是 `z.infer<typeof candidateMemorySchema>`：
@@ -155,6 +221,16 @@ export const extractionResultSchema = z.object({
   memories: z.array(z.unknown()).max(50),
 
   /**
+   * 候选事件列表（docs/03 §20）。
+   *
+   * ⚠️ 用 `.optional()` 而不是必填：旧版提示词、或模型只返回 memories 时，
+   *    整批不该失败 —— 事件是**附加**产出，不是记忆抽取成立的前提。
+   *    这与 memories 的容器级严格性不同，是刻意的：
+   *    memories 缺失意味着抽取根本没成功；events 缺失只是这类信息为空。
+   */
+  events: z.array(z.unknown()).max(20).optional(),
+
+  /**
    * 抽取器的简短说明（1~2 句）。
    * 用途：调试提示词效果、人工核查时快速理解模型意图。
    * ⚠️ 不落库、不展示给用户。
@@ -163,8 +239,7 @@ export const extractionResultSchema = z.object({
 });
 
 /** 单条候选被丢弃的诊断记录 */
-export interface DroppedCandidate {
-  /** 在原始数组中的下标，便于对照原始输出排查 */
+export interface DroppedCandidate {  /** 在原始数组中的下标，便于对照原始输出排查 */
   index: number;
   /** 丢弃原因（人类可读） */
   reason: string;
@@ -201,6 +276,15 @@ export interface ExtractionDiagnostics {
   degradations: FieldDegradation[];
   /** 槽位命中情况：有槽位的条数 / 有效条数 */
   slotCoverage: { withSlot: number; total: number };
+  /** 事件抽取情况。与记忆分开记账 —— 两者的失败模式不同 */
+  events: {
+    rawCount: number;
+    validCount: number;
+    /** 因时间无法解析被丢弃的事件数 */
+    droppedForBadTime: number;
+    /** 分类不在词表内、降级为 other 的条数 */
+    categoryFallbacks: number;
+  };
 }
 
 /** 解析结果：数据 + 诊断 */
@@ -209,8 +293,29 @@ export interface ParseOutcome {
   diagnostics: ExtractionDiagnostics;
 }
 
+/**
+ * 全零诊断。
+ *
+ * 抽出来单独一个函数而不是让各处自己写字面量：
+ *  ExtractionDiagnostics 每加一个字段（如本次加 events），
+ *  所有手写字面量的地方都会类型报错 —— 那是好事，但改起来是重复劳动。
+ *  更重要的是**空诊断的语义必须一致**（「什么都没发生」），
+ *  散落多处迟早出现某个字段忘了置零的情况。
+ */
+export function emptyDiagnostics(): ExtractionDiagnostics {
+  return {
+    rawCount: 0,
+    validCount: 0,
+    dropped: [],
+    degradations: [],
+    slotCoverage: { withSlot: 0, total: 0 },
+    events: { rawCount: 0, validCount: 0, droppedForBadTime: 0, categoryFallbacks: 0 },
+  };
+}
+
 export type ExtractionResult = {
   memories: CandidateMemory[];
+  events: CandidateEvent[];
   note?: string;
 };
 
@@ -224,7 +329,16 @@ export type ExtractionResult = {
  *   ④ 单条候选不合格（应丢弃该条而不是整批）
  *   ⑤ 槽位不合格（应降级该字段而不是丢条）
  */
-export function parseExtractionResultWithDiagnostics(raw: string): ParseOutcome {
+export function parseExtractionResultWithDiagnostics(
+  raw: string,
+  params: {
+    /**
+     * 对话发生时间。当前未用于兜底（见 parseCandidateEvents 的说明），
+     * 保留为参数是为了让调用方显式表态，也便于将来若改变策略时不必改签名。
+     */
+    conversationTime?: Date;
+  } = {}
+): ParseOutcome {
   const jsonText = extractJsonBlock(raw);
 
   // ---------- ① 容器级：JSON 必须能解析 ----------
@@ -285,9 +399,16 @@ export function parseExtractionResultWithDiagnostics(raw: string): ParseOutcome 
     (m) => m.predicateKey !== null && m.predicateKey !== undefined && m.objectValue
   ).length;
 
+  // ---------- ⑤ 事件：同样的分级策略 ----------
+  const eventsOutcome = parseCandidateEvents(
+    container.data.events ?? [],
+    params.conversationTime
+  );
+
   return {
     result: {
       memories,
+      events: eventsOutcome.events,
       ...(container.data.note !== undefined ? { note: container.data.note } : {}),
     },
     diagnostics: {
@@ -296,8 +417,149 @@ export function parseExtractionResultWithDiagnostics(raw: string): ParseOutcome 
       dropped,
       degradations,
       slotCoverage: { withSlot, total: memories.length },
+      events: eventsOutcome.diagnostics,
     },
   };
+}
+
+/**
+ * 解析候选事件。
+ *
+ * 分级策略与记忆一致：容器级（events 不是数组）已在 schema 层处理为容器错误；
+ * 这里只做条目级（丢弃单条）与字段级（降级分类）。
+ *
+ * 【时间解析是最关键的一步】
+ *   event_time 是 NOT NULL，且相对时间（「上周三」）无法落库。
+ *   因此：
+ *     · 能解析成绝对时间的 → 采用
+ *     · 解析不了的 → 丢弃该事件并记录原因
+ *
+ *   ⚠️ 为什么不「解析不了就用对话时间兜底」：
+ *      那会把「三年前开始学琴」写成对话发生的时间，
+ *      在时间线上是个**错误的节点** —— 比缺一个节点更糟。
+ *      时间线错位会让用户觉得"它记错了我的生活"。
+ *      宁可少一个节点，也不要一个时间错误的节点。
+ *
+ *   提示词里已给出对话发生时间让模型自己换算，因此正常情况不需要兜底。
+ */
+export function parseCandidateEvents(
+  rawEvents: unknown[],
+  conversationTime?: Date
+): {
+  events: CandidateEvent[];
+  diagnostics: ExtractionDiagnostics['events'];
+} {
+  const events: CandidateEvent[] = [];
+  let droppedForBadTime = 0;
+  let categoryFallbacks = 0;
+
+  for (const item of rawEvents) {
+    const check = candidateEventSchema.safeParse(item);
+    if (!check.success) {
+      droppedForBadTime++; // 多数是时间缺失或标题为空
+      continue;
+    }
+
+    const candidate = check.data;
+    const parsedTime = resolveEventTime(candidate.eventTime, conversationTime);
+    if (parsedTime === null) {
+      droppedForBadTime++;
+      continue;
+    }
+
+    /**
+     * 分类降级：模型给了词表外的值（已被 .catch(null) 收敛成 null）
+     * 或干脆没给，且**事件确实存在**时写 'other'。
+     *
+     * §20.2 的 C37 明确要求：'other' 是兜底值 ——
+     * 「遇到无法归类的真实事件时写 'other'，而不是编造枚举外的值，
+     *   也不是弃之不存」。因此这里补 'other' 而不是留 null。
+     */
+    let category = candidate.category ?? null;
+    if (category === null) {
+      category = 'other';
+      categoryFallbacks++;
+    }
+
+    events.push({
+      title: candidate.title,
+      description: candidate.description ?? null,
+      eventTime: parsedTime.toISOString(),
+      category,
+      importance: candidate.importance,
+      evidence: candidate.evidence,
+    });
+  }
+
+  return {
+    events,
+    diagnostics: {
+      rawCount: rawEvents.length,
+      validCount: events.length,
+      droppedForBadTime,
+      categoryFallbacks,
+    },
+  };
+}
+
+/**
+ * 把模型给出的时间字符串解析成 Date。
+ *
+ * 容忍几种常见形态：
+ *   · 完整 ISO 8601             2026-09-10T00:00:00+08:00
+ *   · 只有日期                  2026-09-10
+ *   · 带中文字的时间描述         2026年9月10日  ← 实测模型会这样输出
+ *
+ * @returns 解析结果；无法解析返回 null（调用方应丢弃该事件）
+ */
+export function resolveEventTime(
+  raw: string,
+  _conversationTime?: Date
+): Date | null {
+  const text = raw.trim();
+  if (text.length === 0) return null;
+
+  // 中文字日期 → ISO 形式
+  const cn = /^(\d{4})年(\d{1,2})月(\d{1,2})日?$/.exec(text);
+  if (cn) {
+    const [, y, m, d] = cn;
+    const date = new Date(
+      `${y}-${String(m).padStart(2, '0')}-${String(d).padStart(2, '0')}T00:00:00Z`
+    );
+    return Number.isNaN(date.getTime()) ? null : date;
+  }
+
+  // 「2026年9月」这种只有年月 → 取该月 1 号
+  const cnMonth = /^(\d{4})年(\d{1,2})月$/.exec(text);
+  if (cnMonth) {
+    const [, y, m] = cnMonth;
+    const date = new Date(`${y}-${String(m).padStart(2, '0')}-01T00:00:00Z`);
+    return Number.isNaN(date.getTime()) ? null : date;
+  }
+
+  // 只有日期（YYYY-MM-DD）→ 按 UTC 零点
+  const dateOnly = /^(\d{4})-(\d{2})-(\d{2})$/.exec(text);
+  if (dateOnly) {
+    const date = new Date(`${text}T00:00:00Z`);
+    return Number.isNaN(date.getTime()) ? null : date;
+  }
+
+  // 标准 ISO 与其他 Date 能认的格式
+  const date = new Date(text);
+  if (Number.isNaN(date.getTime())) return null;
+
+  /**
+   * 拒绝明显不合理的时间：早于 1900 或晚于未来 1 年。
+   *
+   * 为什么需要：模型偶尔会把「2026」当成时间戳（1970 年附近），
+   * 或把相对时间算错成很远的未来。这类值会污染时间线排序，
+   * 而且看起来像是系统坏了。
+   */
+  const year = date.getUTCFullYear();
+  if (year < 1900) return null;
+  if (date.getTime() > Date.now() + 365 * 24 * 3600 * 1000) return null;
+
+  return date;
 }
 
 /**

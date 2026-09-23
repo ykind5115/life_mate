@@ -23,6 +23,7 @@ import type { LightMyRequestResponse } from 'fastify';
 
 import { closePool } from '../database/client.js';
 import { assertTestDatabase } from '../shared/test-guard.js';
+import { emptyDiagnostics } from '../memory/extraction-schema.js';
 import { buildServer } from './server.js';
 import { IdempotencyStore } from './idempotency.js';
 import type { ChatRouteDeps } from './routes/chat.js';
@@ -97,14 +98,10 @@ function emptySummary() {
     executed: false as const,
     skippedReason: 'no_new_messages' as const,
     candidatesFound: 0,
-    diagnostics: {
-      rawCount: 0,
-      validCount: 0,
-      dropped: [],
-      degradations: [],
-      slotCoverage: { withSlot: 0, total: 0 },
-    },
+    // 用共享的空诊断构造函数：ExtractionDiagnostics 加字段时只需改一处
+    diagnostics: emptyDiagnostics(),
     outcomes: { created: 0, merged: 0, superseded: 0, conflict: 0 },
+    events: { created: 0, skippedDuplicates: 0 },
     adjudicationCalls: 0,
     embeddings: { succeeded: 0, failed: 0 },
     memoriesWithoutEmbedding: [],
