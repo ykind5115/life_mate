@@ -11,6 +11,7 @@
   "scripts": {
     "dev": "node --env-file=.env --watch --import tsx src/api/main.ts",
     "start": "node --env-file=.env --import tsx src/api/main.ts",
+    "chat": "node --env-file=.env --import tsx src/cli/chat.ts",
     "typecheck": "tsc --noEmit",
     "test": "node --env-file=.env.test --import tsx --test --test-isolation=process --test-concurrency=1 \"src/**/*.test.ts\"",
     "db:generate": "drizzle-kit generate",
