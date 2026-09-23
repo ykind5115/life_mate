@@ -128,8 +128,22 @@ export interface ChatServiceDeps {
 /**
  * 执行一次聊天。
  *
- * @throws LLMError    LLM 调用失败（Controller 应映射为 502 LLM_ERROR）
- * @throws Error       会话不存在等业务错误（Controller 应映射为 404/409）
+ * 步骤与 docs/02 §28、docs/04 §10 的流程图一一对应：
+ *   ② 解析会话      （① 校验在 Controller，本函数只接受已校验的入参）
+ *   ③ 组装上下文    （近期消息 + 记忆 + 系统规则）
+ *   ④ 运行 Agent
+ *   ⑤ 落库          （会话 + 用户消息 + 助手消息，同一事务；
+ *                     对应流程图的「保存 User Message」与「保存 Assistant Message」，
+ *                      但都推迟到 LLM 成功之后 —— 见步骤⑤的说明）
+ *   ⑥ 触发后台抽取
+ *   ⑦ 返回
+ *
+ * ⚠️ 步骤⑤不在③之前，与流程图字面顺序不同。这是刻意的，
+ *    理由写在该步骤的注释里（失败的请求不该留下痕迹）。
+ *
+ * @throws LLMError                       LLM 调用失败（错误码 LLM_ERROR / SERVICE_UNAVAILABLE）
+ * @throws ConversationNotFoundError      会话不存在（错误码 NOT_FOUND）
+ * @throws ConversationDeletedError       会话已删除（错误码 CONFLICT）
  */
 export async function chat(
   params: ChatParams,
@@ -141,14 +155,14 @@ export async function chat(
   const user = await getOrCreateDefaultUser();
 
   /**
-   * ⚠️ 新会话在这里**只是拿一个 id，并不落库**。
+   * ⚠️ 新会话在这里**只是确定「要新建」，并不落库**。
    *
    * 为什么：本次对话可能因为 LLM 失败而根本没有结果。
    * 若先落库，一次失败的请求就会在会话列表里留下一个空会话
-   * （实测复现：连续几次 LLM 失败后列表里多出一串点进去什么都没有的会话）。
+   * （实测复现：LLM 失败后列表里多出点进去什么都没有的会话）。
    * 「先建后删」的写法还要处理删除失败，不如根本不建。
    *
-   * 会话在步骤⑥（确定要写入内容时）才真正 INSERT。
+   * 会话在步骤⑤（确定要写入内容时）才真正 INSERT。
    */
   const existingConversationId = params.conversationId ?? null;
   const created = existingConversationId === null;
@@ -169,12 +183,13 @@ export async function chat(
     title = existing.title;
   }
 
-  // ---------- ④ 组装上下文 ----------
+  // ---------- ③ 组装上下文 ----------
   /**
-   * 历史消息必须在**当前消息入上下文之前**读，且当前消息不能重复出现。
+   * 历史消息里**不能包含当前这条消息** —— 它此刻还没落库（见步骤⑤），
+   * 因此直接读库拿到的就是「当前消息之前」的历史，天然不会重复。
    *
-   * 已存在的会话：历史就在库里，读到的是「当前消息之前」的内容。
-   * 新会话：没有历史，只有 system + 当前消息。
+   * （早先的写法是先存用户消息再读历史，结果当前消息在上下文里出现两次：
+   *   一次来自历史、一次来自 Context Builder 的追加。模型会反复追问同一件事。）
    */
   const history = existingConversationId
     ? (await findRecentMessages({
@@ -211,7 +226,7 @@ export async function chat(
     ...(deps.injectLimit !== undefined ? { injectLimit: deps.injectLimit } : {}),
   });
 
-  // ---------- ⑤ 运行 Agent ----------
+  // ---------- ④ 运行 Agent ----------
   const agentResult = await runAgent({
     provider,
     messages: context.messages,
@@ -220,7 +235,7 @@ export async function chat(
     ...(deps.onToken !== undefined ? { onToken: deps.onToken } : {}),
   });
 
-  // ---------- ⑥ 落库：会话（首次）→ 用户消息 → 助手消息 ----------
+  // ---------- ⑤ 落库：会话（首次）→ 用户消息 → 助手消息 ----------
   /**
    * ⚠️ 三条写入放在**同一个事务**里。
    *
@@ -273,7 +288,7 @@ export async function chat(
 
   const { conversationId, userMessage, assistantMessage } = saved;
 
-  // ---------- ⑧ 触发后台抽取（不 await 结果）----------
+  // ---------- ⑥ 触发后台抽取（不 await 结果）----------
   deps.extractionTrigger?.schedule(conversationId);
 
   return {

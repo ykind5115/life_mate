@@ -13,8 +13,14 @@
  */
 import { EMBEDDING_DIM, EMBEDDING_MODEL_ID, env } from '../shared/env.js';
 
-/** 单次嵌入请求的超时。本地 GPU 推理正常在 50ms 内，留足余量 */
-const DEFAULT_TIMEOUT_MS = 10_000;
+/**
+ * 单次嵌入请求的超时。
+ *
+ * ⚠️ 取 env.EMBEDDING_TIMEOUT_MS，不要在这里另外写常量 ——
+ *    那会让 .env 里的配置变成摆设（本文件原先就有一个无人引用的
+ *    DEFAULT_TIMEOUT_MS，改 env 时不会有任何效果）。
+ */
+const timeoutMs = env.EMBEDDING_TIMEOUT_MS;
 
 export class EmbeddingError extends Error {
   constructor(
@@ -90,7 +96,7 @@ async function request(text: string): Promise<number[]> {
   const controller = new AbortController();
   const timer = setTimeout(() => {
     controller.abort();
-  }, DEFAULT_TIMEOUT_MS);
+  }, timeoutMs);
 
   let res: Response;
   try {
