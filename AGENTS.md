@@ -1,12 +1,24 @@
 # AGENTS.md — 编码 Agent 工作规则
 
 > 本文件面向在本仓库中执行编码任务的 AI Agent（DSH / Claude Code / Codex / Cursor 等）。
-> 项目当前状态：**设计阶段已完成，V1.0 功能面齐备，等待真实使用与调优**。
+>
+> ## 项目当前状态
+>
+> **V1.0 功能面齐备，尚未经过真实使用验证。**
+>
+> ```text
 > 已完成：数据库 Schema + 迁移、Repository 层、LLM Provider、Agent Loop、
-> 记忆抽取流水线、记忆召回、HTTP 层（chat / SSE / conversations / memories /
-> settings / timeline / life-review / goals）、会话摘要、离线评测。
-> 未完成：Agent 只读记忆工具、Web UI、检索质量评测、摘要接入 Life Review。
-> 详见 `docs/README.md`、`docs/09-evaluation-baseline.md` 与最近若干次提交。
+>         记忆抽取与演化、记忆召回（混合检索）、HTTP 层 30 个端点、
+>         Timeline、Life Review、Goals、会话摘要、Agent 只读工具、
+>         Web 界面、两套离线评测
+>
+> 未完成：真实使用验证（最重要）、记忆冲突裁决 UI、relationships 接口与页面、
+>         数据导出、OpenAPI 文档
+> ```
+>
+> **接手项目先读 `docs/10-usage-and-status.md`** —— 它回答「做到哪了、怎么用、还剩什么」，
+> 不需要先读完全部设计文档。质量指标现状见 `docs/09-evaluation-baseline.md`。
+>
 > 本文件的规则优先级高于 Agent 的个人习惯；与本文档冲突的"通常做法"一律以本文档为准。
 
 ---
@@ -85,7 +97,10 @@
 
 ```text
 • V1.0 不建 HNSW / IVFFlat 向量索引，走精确检索（数据量 < 5 万条）
-• 关键词通道用 pg_trgm（中文场景 PostgreSQL 默认全文检索不切词）
+• 关键词通道用**应用层字符 bigram + IDF 加权**
+  （C16 原定 pg_trgm，但实测它不支持中文：show_trgm('用户住在杭州') 返回空集。
+    替代方案 tsvector / pg_bigm / pgroonga 均不可用，详见
+    src/memory/chinese-ngram.ts 的文件头。⚠️ C16 待修订，见下方 §6）
 • Timeline 不是独立表，是 events 的查询视图
 • 不得引入 Redis / 消息队列 / 工作流引擎（02 §41/§42）
 • 新增依赖前先说明理由与替代方案，不要默默装包
@@ -268,9 +283,12 @@ users 记录），而为了断言稳定，夹具会在用例开始时清空该�
 
 | 位置 | 冲突 | 当前实现 |
 | ---- | ---- | ---- |
+| docs/03 §17.4（C16） | C16 决定关键词通道用 pg_trgm，理由「按字符三元组匹配，适合中文」。**实测该理由不成立**：`show_trgm('用户住在杭州')` 返回空集，CJK 不产生三元组 → 该通道对中文完全失效 | 改为应用层字符 bigram + IDF 加权。⚠️ 待修订 C16；`memories.idx_memories_content_trgm` 索引对中文无用，应随修订删除（需走 Schema 变更流程） |
 | docs/04 §23 vs Q1 | §23 允许 `PATCH /memories/:id` 改 `content` 并重算 embedding；Q1 与 docs/03 §13.1 禁止就地改正文 | 按 Q1 拒绝（422）。改内容应走「新建 + 替代」语义，那个端点尚未实现 |
+| docs/04 §50 | 接口清单里**没有 Goals 端点**，但 §13.10 要求「用户不可直接新建 type='goal' 的记忆（必须通过 Goal 实体）」→ 两条合起来用户完全没有创建目标的途径 | 已补齐 6 个 goals 端点 |
 | docs/04 §46 | 只规定"V1.0 纳入 Idempotency-Key"，未定存储方案 | 进程内存储（docs/06 P2-6 给的候选之一）。代价：重启后失效 |
 | docs/04 §48 | 推荐维护 OpenAPI 3.x | 未引入类型 provider，Zod 校验是手写的，没有生成 schema |
+| docs/02 §6 | 规定前端 Next.js + React + Tailwind | 当前是原生 HTML/CSS/ESM + Fastify 托管（零构建步骤）。将来换 Next.js 只替换 `public/` 一层 |
 | docs/02 §9 | Context Builder 的结构含"User Profile" | 未实现（users.settings 目前无人读） |
 
 ---

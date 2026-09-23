@@ -18,12 +18,18 @@
 | 06 | [06-design-review.md](./06-design-review.md) | 设计评审与改进建议 | V1.0 | 待决策项已闭环 |
 | 07 | [07-git-conventions.md](./07-git-conventions.md) | Git 提交规范 | V1.0 | 生效 |
 | 08 | [08-contract-audit.md](./08-contract-audit.md) | 设计契约审计报告 | V1.0 | 已修复并回归（C29～C32 为二次复查） |
+| 09 | [09-evaluation-baseline.md](./09-evaluation-baseline.md) | 离线评测基线与指标定义 | V1.0 | 持续更新 |
+| 10 | [10-usage-and-status.md](./10-usage-and-status.md) | **开发完成度与使用说明** | V1.0 | 面向使用者 |
 
 **归档：**
 
 | 文件 | 说明 |
 | ---- | ---- |
 | [archive/数据库设计V1.0-已弃用.md](./archive/数据库设计V1.0-已弃用.md) | 已被 03 取代，仅作历史留档。**不要据此编写 Schema** |
+
+**注：** 09 与 10 不是设计文档，而是**工程产出物**：
+- 09 记录「指标现在是多少」——调优时用来对比，防止把改动前后搞混
+- 10 记录「做到哪了、怎么用」——面向使用者，也是接手项目时的第一份读物
 
 ---
 
@@ -45,6 +51,10 @@
 05-environment-setup.md   怎么把环境跑起来
 06-design-review.md       为什么这么设计（决策来源）
 07-git-conventions.md     怎么把改动记录下来
+
+工程产出（非设计文档）：
+09-evaluation-baseline.md 质量指标现在是多少
+10-usage-and-status.md    做到哪了、怎么用
 ```
 
 ---
@@ -84,6 +94,21 @@ README.md（项目根目录）
       ↓
 回到对应文档核对
 ```
+
+### 路径 D：接手项目 / 想知道做到哪了（约 20 分钟）
+
+```text
+10-usage-and-status.md   ← 先读这个：做到哪了、怎么用、还剩什么
+      ↓
+09-evaluation-baseline.md  质量指标现状与已知局限
+      ↓
+AGENTS.md  §4 环境规则、§6 设计问题状态
+      ↓
+docs/03  §0.2 / §0.3       所有设计修订（C1～C38）的登记
+```
+
+**路径 D 是给「过一段时间回来继续做」或「换人接手」用的。**
+它跳过全部设计论证，直接回答三个问题：现在能跑什么、质量如何、还剩哪些坑。
 
 ---
 
@@ -159,8 +184,20 @@ NN-<english-name>.md
 
 | 计划文档 | 触发时机 |
 | ---- | ---- |
-| Agent 行为规范（提示词与行为约束） | Phase 6 开发 Chat Agent 前 |
-| 记忆算法设计（抽取 / 去重 / 冲突的详细算法） | Phase 7 开发 Memory Engine 前 |
-| 受控词表定义（`predicate_key` 枚举） | 与 Phase 7 同步 |
-| 记忆评测方案（金标数据集与指标口径） | Phase 5 建立评测基石时 |
-| 部署与运维手册 | 首次部署时 |
+| 部署与运维手册 | 首次部署到非本机时 |
+| 数据导出与迁移说明 | 实现 PRD §12.2 的导出功能时 |
+
+**已补齐的（原先列在这里，现已完成）：**
+
+```text
+✅ Agent 行为规范    → 实现为 src/conversation/prompts.ts 与 src/memory/extraction-prompt.ts
+                       （提示词即行为规范；版本号 AGENT_PROMPT_VERSION / EXTRACTOR_VERSION
+                         用于追溯行为变化）
+✅ 记忆算法设计      → 实现为 src/memory/ 下的 candidate-processor / slot-adjudicator /
+                       extraction-pipeline，设计依据写在各自的文件头注释里
+✅ 受控词表定义      → src/database/schema/enums.ts 的 PREDICATE_KEYS（与库层 CHECK 同源）
+✅ 记忆评测方案      → docs/09-evaluation-baseline.md + src/evaluation/
+```
+
+**这一节的教训：** 上面四项当初被列为「待写的文档」，但实际实现时都变成了**代码里的注释与常量**，而不是独立文档。原因是它们必须与代码同步演进——独立文档写一遍、代码改一遍，两边必然漂移（C19/C27 就是这么发生的）。
+因此**新增设计文档前先问一句：它会不会需要跟代码同步？** 会的话，写在代码里更可靠。
