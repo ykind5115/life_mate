@@ -53,3 +53,35 @@ export {
   parseVerdict,
   type SlotVerdict,
 } from './slot-adjudicator.js';
+
+// ---------- 召回（docs/03 §18）----------
+
+export {
+  retrieveMemories,
+  type RetrieveParams,
+  type RetrievalResult,
+  type RetrievalDiagnostics,
+  type RetrievalDegradation,
+} from './retriever.js';
+
+export {
+  fuseByRrf,
+  rerank,
+  normalizeVector,
+  typeAwareRecency,
+  decay,
+  type RetrievalCandidate,
+  type ScoredCandidate,
+} from './retrieval-fusion.js';
+
+export {
+  RRF_K,
+  CHANNEL_LIMIT,
+  FUSION_LIMIT,
+  INJECT_LIMIT,
+  RERANK_WEIGHTS,
+  NORM_VECTOR_MIN,
+  NORM_VECTOR_MAX,
+  DECAY_HALF_LIFE_DAYS,
+  SOURCE_COUNT_SATURATION,
+} from './retrieval-config.js';

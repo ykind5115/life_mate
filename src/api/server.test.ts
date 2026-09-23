@@ -24,6 +24,7 @@ import type { LightMyRequestResponse } from 'fastify';
 import { closePool } from '../database/client.js';
 import { buildServer } from './server.js';
 import { IdempotencyStore } from './idempotency.js';
+import type { ChatRouteDeps } from './routes/chat.js';
 import { ExtractionTrigger } from '../conversation/extraction-trigger.js';
 import type { GenerateInput, LLMProvider } from '../llm/provider.js';
 import { LLMError } from '../llm/provider.js';
@@ -114,10 +115,19 @@ function emptySummary() {
  *
  * ⚠️ 每个用例**必须** new 一个 IdempotencyStore：
  *    缺省是模块级单例，用例之间会串（上一个用例的键会命中下一个用例）。
+ *
+ * ⚠️ retrieveMemories 缺省传 null（显式关闭检索）。
+ *    不关掉的话每个用例都会去连 embedding 服务、并读库里**其他用例留下的**
+ *    真实记忆，断言就依赖了外部状态与执行顺序。
+ *    要测检索接线请显式传一个函数。
  */
 async function withServer(
   fn: (ctx: { app: FastifyInstance; provider: FakeProvider }) => Promise<void>,
-  options: { answer?: string; failure?: LLMError } = {}
+  options: {
+    answer?: string;
+    failure?: LLMError;
+    retrieveMemories?: ChatRouteDeps['retrieveMemories'];
+  } = {}
 ): Promise<void> {
   const provider = new FakeProvider(options.answer ?? '这是测试回答。', options.failure);
   const app = await buildServer({
@@ -125,6 +135,7 @@ async function withServer(
     provider,
     chatIdempotency: new IdempotencyStore(),
     extractionTrigger: inertTrigger(),
+    retrieveMemories: options.retrieveMemories ?? null,
   });
 
   try {
@@ -467,6 +478,83 @@ test('非法 Idempotency-Key 头被忽略而不是报错（视为无键）', asy
 
     // 键非法 → 退化为不做幂等，但请求本身应当成功
     assert.equal(res.statusCode, 200);
+  });
+});
+
+test('检索到的记忆被注入到上下文（system 段落），且当前消息仍在最后', async () => {
+  await withServer(
+    async ({ app, provider }) => {
+      await postJson(app, '/api/v1/chat', { message: '我最近怎么样' });
+
+      const call = provider.received.at(-1)!;
+
+      // 结构：system(规则) + system(已知信息) + user(当前消息)
+      assert.equal(call.messages[0]!.role, 'system');
+      assert.equal(call.messages[1]!.role, 'system');
+      assert.match(call.messages[1]!.content, /已知信息/, '第二条 system 应是记忆段落');
+      assert.match(call.messages[1]!.content, /用户正在学习 Rust/, '记忆正文应出现在上下文里');
+      assert.match(call.messages[1]!.content, /2026-01-15/, '应带事实生效日期，供模型正确表述');
+      assert.equal(call.messages.at(-1)!.content, '我最近怎么样');
+    },
+    {
+      retrieveMemories: async () => [
+        {
+          id: 'm1',
+          content: '用户正在学习 Rust',
+          type: 'fact',
+          validFrom: new Date('2026-01-15T00:00:00Z'),
+        },
+      ],
+    }
+  );
+});
+
+test('检索返回空 → 不插入空的「已知信息」段落', async () => {
+  await withServer(
+    async ({ app, provider }) => {
+      await postJson(app, '/api/v1/chat', { message: '你好' });
+
+      const call = provider.received.at(-1)!;
+      /**
+       * 空段落会被模型当成「系统查过了，确实没有」，
+       * 而实际上可能只是本次没命中。整段不出现才不传递错误信号。
+       *
+       * ⚠️ 断言的是**段落标题**而不是「已知信息」四个字：
+       *    系统提示词正文里本来就有「当下面提供的「已知信息」里没有…」这句话，
+       *    用宽泛的模式会把规则文本也匹配上（本测试第一版就是这么假失败的）。
+       */
+      assert.equal(call.messages.length, 2, '只有 system + 当前 user');
+      assert.doesNotMatch(
+        JSON.stringify(call.messages),
+        /已知信息（来自长期记忆/,
+        '没有记忆时不应出现记忆段落'
+      );
+    },
+    { retrieveMemories: async () => [] }
+  );
+});
+
+test('检索抛错 → 聊天照常成功（§45 的同类降级原则）', async () => {
+  await withServer(
+    async ({ app }) => {
+      const res = await postJson(app, '/api/v1/chat', { message: '检索挂了也要能聊' });
+
+      assert.equal(res.statusCode, 200, '检索失败不应让聊天失败');
+      assert.equal(res.json().data.meta.context.injectedMemoryCount, 0);
+    },
+    {
+      retrieveMemories: async () => {
+        throw new Error('embedding 服务连接被拒绝');
+      },
+    }
+  );
+});
+
+test('未注入检索实现时 injectedMemoryCount 为 0（功能未开，不是失败）', async () => {
+  await withServer(async ({ app }) => {
+    const res = await postJson(app, '/api/v1/chat', { message: '你好' });
+    assert.equal(res.statusCode, 200);
+    assert.equal(res.json().data.meta.context.injectedMemoryCount, 0);
   });
 });
 

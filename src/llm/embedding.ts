@@ -148,3 +148,19 @@ export const embeddingModelId = EMBEDDING_MODEL_ID;
 
 /** 当前使用模型的维度 */
 export const embeddingDimensions = EMBEDDING_DIM;
+
+/**
+ * 把向量数组转成 pgvector 字面量，形如 `[0.1,0.2,...]`。
+ *
+ * 【为什么放在这里，而不是各处自己写一份】
+ *   写入（抽取流水线）与查询（检索）必须产出一致的字面量格式 ——
+ *   两者一旦漂移，向量仍然能存进去、查询也不报错，
+ *   但相似度会静默算错。这类「不报错的错误」只能靠单一实现来避免。
+ *
+ * 固定 7 位小数：精度远超实际需要（bge-m3 本身是 float32），
+ * 同时避免浮点 toString 产生 `0.30000000000000004` 这类超长表示
+ * 显著增大 SQL 体积。
+ */
+export function toVectorLiteral(vec: number[]): string {
+  return `[${vec.map((x) => x.toFixed(7)).join(',')}]`;
+}

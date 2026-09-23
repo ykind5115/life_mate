@@ -200,6 +200,15 @@ export async function chat(
         .map((m: Message) => ({ role: m.role as 'user' | 'assistant', content: m.content }))
     : [];
 
+  /**
+   * 记忆检索（docs/03 §18.5：检索与注入分离）。
+   *
+   * ⚠️ 缺省行为分两种，不要混淆：
+   *    · retrieveMemories 未注入 → 「未实现」，performed=false
+   *      （测试与离线场景刻意不联网）
+   *    · 注入了但检索失败 → 「执行过但降级」，performed=true + skippedReason='failed'
+   *    两者的区别对排查很重要：前者是功能没开，后者是服务出问题。
+   */
   let retrieval: MemoryRetrieval;
   if (deps.retrieveMemories) {
     try {

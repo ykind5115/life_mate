@@ -17,7 +17,10 @@ import {
   ConversationDeletedError,
   ConversationNotFoundError,
   type ChatResult,
+  type ChatServiceDeps,
 } from '../../conversation/chat-service.js';
+import type { ContextMemory } from '../../conversation/context-builder.js';
+import { retrieveMemories } from '../../memory/retriever.js';
 import {
   getDefaultExtractionTrigger,
   type ExtractionTrigger,
@@ -34,6 +37,16 @@ export interface ChatRouteDeps {
   extractionTrigger?: ExtractionTrigger;
   /** 覆盖 LLM Provider。生产不传，测试注入假实现 */
   provider?: LLMProvider;
+  /**
+   * 覆盖记忆检索。
+   *
+   * 缺省接真实的 retrieveMemories（向量 + 关键词 + 结构化三通道）。
+   * 测试传一个固定返回，避免依赖 embedding 服务与库里的真实数据。
+   *
+   * ⚠️ 传 null 表示**显式关闭**检索（performed=false）。
+   *    与「不传」的区别：不传会用真实检索，传 null 才是关掉。
+   */
+  retrieveMemories?: ChatServiceDeps['retrieveMemories'] | null;
 }
 
 let defaultIdempotency: IdempotencyStore<ChatResult> | undefined;
@@ -44,6 +57,44 @@ function idempotencyOf(deps: ChatRouteDeps): IdempotencyStore<ChatResult> {
   return defaultIdempotency;
 }
 
+/**
+ * 默认的记忆检索实现。
+ *
+ * 把检索结果映射成 Context Builder 需要的形状（ContextMemory），
+ * 只保留注入需要的最小字段 —— Content Builder 不该看到 status / 向量等内部细节。
+ *
+ * ⚠️ 这里**不抛错**：retrieveMemories 自身已把各种依赖失败降级为
+ *    「返回空 + 记录 degradation」，因此聊天不会因检索出问题而失败（§45 的同类原则）。
+ */
+async function defaultRetrieve(params: {
+  userId: string;
+  query: string;
+}): Promise<ContextMemory[]> {
+  const result = await retrieveMemories({ userId: params.userId, query: params.query });
+
+  if (result.diagnostics.degradations.length > 0) {
+    /**
+     * 只记录降级类型与耗时，**不记录查询词与记忆正文**（docs/03 §29.1）。
+     * 降级必须可见：否则「Agent 今天怎么想不起我了」永远查不出原因。
+     */
+    console.info(
+      `[retrieval] 降级：${result.diagnostics.degradations.join(',')} ` +
+        `命中 向量${result.diagnostics.channelHits.vector}/` +
+        `关键词${result.diagnostics.channelHits.keyword}/` +
+        `槽位${result.diagnostics.channelHits.slot}，` +
+        `返回 ${result.diagnostics.returned} 条，耗时 ${result.diagnostics.timings.total}ms`
+    );
+  }
+
+  return result.memories.map((m) => ({
+    id: m.id,
+    content: m.content,
+    type: m.type,
+    validFrom: m.validFrom,
+    importanceScore: m.importanceScore,
+  }));
+}
+
 export async function registerChatRoutes(
   app: FastifyInstance,
   deps: ChatRouteDeps = {}
@@ -51,10 +102,18 @@ export async function registerChatRoutes(
   const idempotency = idempotencyOf(deps);
   const extractionTrigger = deps.extractionTrigger ?? getDefaultExtractionTrigger();
 
-  /** ChatService 的依赖。抽成常量避免两个 route 里各写一份而漂移 */
-  const serviceDeps = {
+  /**
+   * ChatService 的依赖。抽成常量避免两个 route 里各写一份而漂移。
+   *
+   * retrieveMemories 的三态：显式 null（关闭）/ 显式函数（覆盖）/ 缺省（用真实检索）
+   */
+  const retrieveMemories =
+    deps.retrieveMemories === null ? undefined : (deps.retrieveMemories ?? defaultRetrieve);
+
+  const serviceDeps: ChatServiceDeps = {
     extractionTrigger,
     ...(deps.provider !== undefined ? { provider: deps.provider } : {}),
+    ...(retrieveMemories !== undefined ? { retrieveMemories } : {}),
   };
 
   // ==========================================================

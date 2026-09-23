@@ -37,7 +37,13 @@ import {
   findMessagesInRange,
   maxMessageSequence,
 } from '../database/repository/conversation-queries.js';
-import { embed, buildEmbeddedText, embeddingModelId, embeddingDimensions } from '../llm/embedding.js';
+import {
+  embed,
+  buildEmbeddedText,
+  embeddingModelId,
+  embeddingDimensions,
+  toVectorLiteral,
+} from '../llm/embedding.js';
 import type { LLMProvider } from '../llm/provider.js';
 import { buildExtractionMessages } from './extraction-prompt.js';
 import { LlmSlotAdjudicator } from './slot-adjudicator.js';
@@ -404,14 +410,4 @@ async function embedOutcomes(outcomes: CandidateOutcome[], options: ExecutorOpti
 
 function sha256Hex(text: string): string {
   return createHash('sha256').update(text, 'utf8').digest('hex');
-}
-
-/**
- * 把向量数组转成 pgvector 字面量。
- *
- * 用固定 7 位小数：既保留足够精度，又避免浮点 toString 产生的超长字符串
- * （例如 0.30000000000000004 这类表示会显著增大 SQL 体积）。
- */
-function toVectorLiteral(vec: number[]): string {
-  return `[${vec.map((x) => x.toFixed(7)).join(',')}]`;
 }

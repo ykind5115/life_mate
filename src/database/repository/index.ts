@@ -14,6 +14,7 @@ export * from './extraction-runs.js';
 export * from './conversation-queries.js';
 export * from './conversation-store.js';
 export * from './user-store.js';
+export * from './retrieval-queries.js';
 
 // Schema 类型在这里再导出一次，方便上层使用而不必深入 schema 目录
 export type { Memory, NewMemory } from '../schema/memories.js';

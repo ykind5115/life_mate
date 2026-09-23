@@ -26,7 +26,7 @@ import {
 import type { ExtractionTrigger } from '../conversation/extraction-trigger.js';
 import { HttpError, internalError, ok, validationError } from './errors.js';
 import { IdempotencyConflictError } from './idempotency.js';
-import { registerChatRoutes } from './routes/chat.js';
+import { registerChatRoutes, type ChatRouteDeps } from './routes/chat.js';
 import { registerConversationRoutes } from './routes/conversations.js';
 import type { IdempotencyStore } from './idempotency.js';
 import type { ChatResult } from '../conversation/chat-service.js';
@@ -48,6 +48,13 @@ export interface BuildServerOptions {
   provider?: LLMProvider;
   /** 覆盖抽取触发器（测试传一个不真跑的） */
   extractionTrigger?: ExtractionTrigger;
+  /**
+   * 覆盖记忆检索。
+   *
+   * 缺省接真实检索（向量 + 关键词 + 结构化三通道）。
+   * 测试传函数以避免依赖 embedding 服务，传 null 显式关闭。
+   */
+  retrieveMemories?: ChatRouteDeps['retrieveMemories'];
 }
 
 /**
@@ -145,6 +152,9 @@ export async function buildServer(options: BuildServerOptions = {}): Promise<Fas
         ...(options.provider !== undefined ? { provider: options.provider } : {}),
         ...(options.extractionTrigger !== undefined
           ? { extractionTrigger: options.extractionTrigger }
+          : {}),
+        ...(options.retrieveMemories !== undefined
+          ? { retrieveMemories: options.retrieveMemories }
           : {}),
       });
       await registerConversationRoutes(v1);
