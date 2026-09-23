@@ -40,6 +40,7 @@ import {
 import { embed, buildEmbeddedText, embeddingModelId, embeddingDimensions } from '../llm/embedding.js';
 import type { LLMProvider } from '../llm/provider.js';
 import { buildExtractionMessages } from './extraction-prompt.js';
+import { LlmSlotAdjudicator } from './slot-adjudicator.js';
 import { normalizeCandidate, parseExtractionResult } from './extraction-schema.js';
 import {
   processCandidate,
@@ -69,6 +70,13 @@ export interface RunExtractionParams {
   /** 是否生成向量。默认 true；测试中可关掉以避免依赖 embedding 服务 */
   generateEmbeddings?: boolean;
   /**
+   * 思考模式覆盖。缺省保留思考（推理模型默认开启）。
+   *
+   * 用途：实测思考对抽取质量的影响 —— 同一段对话跑两遍对比。
+   * 简单/格式类任务关掉可省 3~4 倍延迟，但抽取是语义判断，通常该开。
+   */
+  thinking?: { type: 'enabled' | 'disabled' };
+  /**
    * 执行器。传入外层事务以把整次抽取纳入同一原子操作，
    * 或供测试整体回滚。
    *
@@ -95,6 +103,8 @@ export interface ExtractionSummary {
     superseded: number;
     conflict: number;
   };
+  /** 判定阶段额外调用了几次 LLM（每次取值变化一次） */
+  adjudicationCalls: number;
   /** 向量生成成功/失败的条数 */
   embeddings: { succeeded: number; failed: number };
   /** 未生成向量的记忆（供后续补齐） */
@@ -171,6 +181,29 @@ export async function runExtraction(
 
     // ---------- ④ LLM 抽取 ----------
     const provider = params.provider ?? (await defaultProvider());
+
+    /**
+     * 判定器缺省用 LLM 实现。
+     *
+     * ⚠️ 此前必须显式传入，缺省是「一律按 conflict 处理」——
+     *    那会让每次取值变化都变成待裁决冲突，用户被大量无谓的裁决请求淹没。
+     *    保守降级是对的**兜底**，但不该是**常态**。
+     *
+     * 保留注入点：测试可传固定判定器，确定性地覆盖三个分支。
+     */
+    const baseAdjudicator =
+      params.adjudicator ?? new LlmSlotAdjudicator(provider, params.thinking);
+
+    // 统计判定调用了几次 LLM —— 抽取本身的开销在 res.usage 里，
+    // 判定是额外的 N 次调用。不分开记账会让「一次抽取花了多少」无法解释。
+    let adjudicationCalls = 0;
+    const adjudicator: SlotAdjudicator = {
+      adjudicate: async (input) => {
+        adjudicationCalls++;
+        return baseAdjudicator.adjudicate(input);
+      },
+    };
+
     const res = await provider.generate({
       messages: buildExtractionMessages(
         msgs.map((m) => ({ role: m.role, content: m.content }))
@@ -178,7 +211,9 @@ export async function runExtraction(
       // 抽取要输出结构化 JSON（10~20 条记忆），需要足够的回答空间。
       // 且推理模型思考与回答共享预算，必须留余量（见 env.ts 的说明）。
       maxOutputTokens: 4096,
-      // 抽取是语义判断任务，保留思考模式（缺省即开启）
+      // 抽取是语义判断任务，缺省保留思考模式。
+      // 传 params.thinking 可覆盖 —— 用于实测思考对抽取质量的影响。
+      ...(params.thinking !== undefined ? { thinking: params.thinking } : {}),
     });
 
     const extraction = parseExtractionResult(res.content);
@@ -186,15 +221,16 @@ export async function runExtraction(
 
     // ---------- ⑤ 逐条判定并落库（事务 A：每条一个事务）----------
     const messageIds = msgs.map((m) => m.id);
+    const userId = await userIdOfConversation(params.conversationId, ex);
     const outcomes: CandidateOutcome[] = [];
 
     for (const candidate of candidates) {
       const outcome = await processCandidate({
-        userId: await userIdOfConversation(params.conversationId, ex),
+        userId,
         candidate,
         // 来源由编排层提供 —— 抽取覆盖了哪些消息，只有这里知道
         source: { messageIds },
-        ...(params.adjudicator ? { adjudicator: params.adjudicator } : {}),
+        adjudicator,
         ...ex,
       });
       outcomes.push(outcome);
@@ -218,6 +254,7 @@ export async function runExtraction(
         superseded: outcomes.filter((o) => o.kind === 'superseded').length,
         conflict: outcomes.filter((o) => o.kind === 'conflict').length,
       },
+      adjudicationCalls,
       embeddings: { succeeded: embedStats.succeeded, failed: embedStats.failed },
       memoriesWithoutEmbedding: embedStats.pending,
     };
@@ -252,6 +289,7 @@ function emptySummary(
     ...(skippedReason !== undefined ? { skippedReason } : {}),
     candidatesFound: 0,
     outcomes: { created: 0, merged: 0, superseded: 0, conflict: 0 },
+    adjudicationCalls: 0,
     embeddings: { succeeded: 0, failed: 0 },
     memoriesWithoutEmbedding: [],
   };

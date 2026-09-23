@@ -35,11 +35,12 @@ const PREDICATE_GUIDE: Record<string, string> = {
   'interest.hobby': '兴趣爱好',
   'preference.food': '饮食偏好',
   'preference.communication_style': '沟通方式偏好（例如希望回答简洁/详细）',
-  'health.status': '健康或身心状态',
+  'health.status': '**稳定的**健康状况（慢性病、体能、长期身体状态）。不要用于情绪',
+  'state.emotion': '**阶段性的**情绪或感受（烦躁、开心、焦虑、疲惫等）',
   'habit.sleep': '作息习惯',
   'habit.exercise': '运动习惯',
-  'goal.long_term': '长期目标',
-  'plan.near_term': '近期计划',
+  'goal.long_term': '长期目标（跨度以月或年计）',
+  'plan.near_term': '近期计划（跨度以周计，或即将要做的事）',
   'relationship.person': '人际关系（取值填人名，可加关系，如「张三（同事）」）',
 };
 
@@ -88,8 +89,15 @@ ${buildPredicateTable()}
 - ❌ 绝不为了填满字段而把信息硬套到相近的槽位上。
   硬套错槽位比留空更糟：它会污染冲突判定，把本可共存的信息判成矛盾。
 - predicateKey 与 objectValue 必须**成对出现**，要么都给、要么都不给。
+  ⚠️ 只给 predicateKey 而不给 objectValue 会被系统判为不合格。
 - objectValue 只填**该槽位的值**，不要重复整句话。
   例：content「用户住在广州」→ objectValue「广州」，不是「用户住在广州」。
+- **不要把情绪填进 health.status**。
+  情绪用 state.emotion；health.status 只用于稳定的身体状况。
+  例：「用户最近很烦躁」→ state.emotion=烦躁（不是 health.status）
+      「用户有慢性胃炎」→ health.status=慢性胃炎
+- **目标与计划的区分**：跨度以月或年计 → goal.long_term；
+  以周计或即将要做 → plan.near_term。拿不准时用 goal.long_term。
 
 ## 正文（content）要求
 

@@ -69,7 +69,16 @@ const SYSTEM_PROMPT = `你是记忆冲突判定器。系统已确认两条记忆
  * 两害相权，宁可多问用户一次。
  */
 export class LlmSlotAdjudicator implements SlotAdjudicator {
-  constructor(private readonly provider: LLMProvider) {}
+  constructor(
+    private readonly provider: LLMProvider,
+    /**
+     * 思考模式覆盖。缺省继承 Provider 的默认（推理模型默认开启）。
+     *
+     * 用途：让编排层能把「抽取阶段是否开思考」一致地传递到判定阶段 ——
+     * 两者都不该各自决定，否则实测思考影响时会混入两个变量。
+     */
+    private readonly thinking?: { type: 'enabled' | 'disabled' }
+  ) {}
 
   async adjudicate(input: {
     existing: Memory;
@@ -98,6 +107,7 @@ export class LlmSlotAdjudicator implements SlotAdjudicator {
         ],
         // 窄任务不需要长输出；但仍要给足推理余量（推理模型思考与回答共享预算）
         maxOutputTokens: 1024,
+        ...(this.thinking !== undefined ? { thinking: this.thinking } : {}),
       });
       raw = res.content;
     } catch {

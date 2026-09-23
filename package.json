@@ -16,6 +16,7 @@
     "db:check": "node --env-file=.env --import tsx src/database/check-connection.ts",
     "e2e:check": "node --env-file=.env --import tsx src/database/e2e-check.ts",
     "llm:check": "node --env-file=.env --import tsx src/llm/check.ts",
+    "llm:e2e": "node --env-file=.env --import tsx src/memory/verify-extraction.ts",
     "db:studio": "drizzle-kit studio"
   },
   "dependencies": {

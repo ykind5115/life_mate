@@ -115,6 +115,21 @@ export const PREDICATE_KEYS = [
   'preference.food',
   'preference.communication_style',
   'health.status',
+  /**
+   * 情绪 / 阶段性感受。
+   *
+   * ⚠️ 为什么单独设这个槽位（2026-09-22 实测发现）：
+   *   原先只有 health.status，我把它的说明写成「健康或身心状态」，
+   *   结果模型把「用户最近因被追问进度而烦躁」映射到了 health.status。
+   *   这会让「最近烦躁」在记忆库里看起来像一条**健康记录** ——
+   *   语义错配，且与 PRD §10.3「不应过度心理分析」的意图相悖。
+   *
+   *   情绪是一类独立的、短时效的状态，不该与健康状况混在一个槽位：
+   *     健康状况是相对稳定的客观事实（慢性病、体能等）
+   *     情绪是快速变化的阶段性状态
+   *   两者的时效衰减与冲突判定都不同（见 docs/03 §18.4 的时效表）。
+   */
+  'state.emotion',
   'habit.sleep',
   'habit.exercise',
   'goal.long_term',
