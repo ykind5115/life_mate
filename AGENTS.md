@@ -4,20 +4,29 @@
 >
 > ## 项目当前状态
 >
-> **V1.0 功能面齐备，尚未经过真实使用验证。**
+> **V1.0 功能面齐备，正在真实使用中（2026-09-24 起）。**
 >
 > ```text
 > 已完成：数据库 Schema + 迁移、Repository 层、LLM Provider、Agent Loop、
->         记忆抽取与演化、记忆召回（混合检索）、HTTP 层 30 个端点、
+>         记忆抽取与演化、记忆召回（混合检索）、HTTP 层 30+ 端点、
 >         Timeline、Life Review、Goals、会话摘要、Agent 只读工具、
->         Web 界面、两套离线评测
+>         Web 界面、两套离线评测、时间注入、会话标题、前端时间显示
 >
-> 未完成：真实使用验证（最重要）、记忆冲突裁决 UI、relationships 接口与页面、
+> 未完成：记忆冲突裁决 UI、relationships 接口与页面、
 >         数据导出、OpenAPI 文档
+>
+> 已按用户反馈调整：系统提示词 v2（docs/12 §方案 3，去掉机制叙述、
+>         提问上限两个、人格定位）、时间注入（docs/12 §方案 1）、
+>         会话标题（docs/12 §方案 2）
 > ```
 >
 > **接手项目先读 `docs/10-usage-and-status.md`** —— 它回答「做到哪了、怎么用、还剩什么」，
 > 不需要先读完全部设计文档。质量指标现状见 `docs/09-evaluation-baseline.md`。
+> 用户使用反馈的处理过程见 `docs/12-ux-improvement-plan.md`（含 §5 实施记录）。
+>
+> ⚠️ **用户数据现在是真实的，不允许被任何测试或脚本删除** ——
+> 对话记录不可再生（记忆/事件/摘要都能从它重新生成，它本身不能）。
+> 相关防线见 §4.4 / §4.4.1，改测试前必读。
 >
 > 本文件的规则优先级高于 Agent 的个人习惯；与本文档冲突的"通常做法"一律以本文档为准。
 
@@ -243,6 +252,27 @@ Agent Tool      不直接操作数据库，与 API 共享 Application Service
                                默认用户有会话时直接中止事务）
 ```
 
+### 4.4.2 测试库的 Schema 要**手动**跟着迁移（2026-09-26 踩到）
+
+```text
+🔴 `pnpm test` **不会**自动迁移测试库 —— 它只跑测试。
+
+   实测踩到：给 memories.status 加了 'rejected'（C39），
+   `pnpm db:migrate` 只迁了开发库，测试库仍是旧 CHECK。
+   于是 5 个新用例全部 500：
+     new row for relation "memories" violates check constraint "chk_memories_status"
+   而错误信息里只有约束名，看起来像代码写错了 —— 排查花了不少时间。
+
+规则：
+  □ 每次改 Schema 之后跑**两条**命令：
+       pnpm db:migrate        （开发库）
+       pnpm db:migrate:test   （测试库）
+  □ 若出现「约束不存在 / CHECK 违约」这类错误而代码看着没问题，
+    先怀疑测试库没迁移，而不是先改代码
+  □ 反过来也要注意：测试库**已经**有数据时，新约束可能无法直接加上。
+    本项目的做法是让迁移自身对已有数据安全（默认值、可空、宽松枚举）。
+```
+
 ### 4.5 测试串行执行（不要改成并发）
 ```text
 test 脚本带了 --test-isolation=process --test-concurrency=1。
@@ -300,6 +330,34 @@ users 记录），而为了断言稳定，夹具会在用例开始时清空该�
 ✅ C35  memories.status 新增 'conflict'；记忆召回不返回它（已实现并用真实数据验证）
 ✅ C37  events.category / conversation_summaries.status 的 CHECK 已加
 ✅ C38  会话删除时 title 置 '[已删除的对话]'、summary 清空（已实现并测试）
+✅ C39  memories.status 新增 'rejected'（「这条不对」）；**不设 deleted_at**，
+       管理页仍可见、召回天然排除（靠 status='active' 谓词）。
+       迁移 0004。后端 POST /memories/:id/reject；撤回走同一个 restore
+```
+
+**用户反馈引发的行为调整（docs/12，改动时要保持）：**
+
+```text
+✅ 时间注入 —— 上下文里带每条消息的时间与「当前时间」
+   （context-builder 的 buildNowLine / buildTimeMarker，阈值 60 分钟）
+   ⚠️ 三条实测踩过的坑写在 context-builder.ts 的注释里，改动前先读：
+      锚点只在打了标记时推进 / 日期一律写全年份 / 时钟必须 hourCycle:'h23'
+
+✅ 会话标题 —— 新建写占位标题，首轮后由 LLM 覆盖
+   （conversation-title.ts + title-trigger.ts）
+   ⚠️ 幂等判据是「当前标题为空（NULL/空串）**或** === 占位标题 → 需要生成」，
+      两个分支缺一不可：
+        · 少了「为空」→ 上线前的历史会话永远起不了名（实测踩到过）
+        · 少了「=== 占位标题」→ 每次对话都重新生成
+      而占位标题必须回到 messages 里重算，**不能拿当前标题反推**
+      （反推会得到「永远需要重新生成」，每次对话都覆盖用户改的名字）
+   运维：pnpm title:backfill [id...]  给无标题的会话补标题
+
+✅ 系统提示词 AGENT_PROMPT_VERSION = v2
+   （去掉机制叙述、提问上限两个、人格定位）
+   ⚠️ prompts.test.ts 守着这些约束 —— 删掉哪条，对应的使用反馈就会复现
+   ⚠️ 提示词里不要出现「检索 / 系统 / 上下文 / 数据库」这些词，
+      连禁令里列举它们也不行（提示词里的每个词都是输入）
 ```
 
 **仍未解决（实现到对应位置时先提出问题，不要自行发明方案）：**
