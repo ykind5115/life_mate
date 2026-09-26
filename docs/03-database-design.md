@@ -96,6 +96,49 @@ C35～C38 解决的是 §6 遗留的四项**需要产品决策**的未决问题�
   指向 §14.2 的实际约束，避免读者据此以为换维度可以直接双写。
 ```
 
+### 0.3.2 使用反馈驱动的修订（C39）
+
+C39 不是契约审计发现的缺陷，而是**首次真实使用后的反馈**（`docs/11`）经方案评审
+（`docs/12`）后落到的库结构变更。
+
+| 编号 | 修订 | 类型 | 依据 |
+| ---- | ---- | ---- | ---- |
+| C39 | `memories.status` 新增 **`rejected`**（用户「这条不对」），并明确它**不设 `deleted_at`** | 🟠 枚举扩展 | `docs/11` 反馈 2 讨论后的遗留动作项（`docs/12` §方案 4 的②）：用户看到错误记忆时只有「删除」可用，而删除既不能表达「这条是错的」，也让用户无法回顾自己否定过什么 |
+
+```text
+C39 的落地细节（三处，缺一不可）：
+
+① §13.5 的状态枚举增加 'rejected'
+   语义：用户明确否定了这条内容。与 'deleted' 的区别是
+     · deleted  = 清理语义（这条记录我不想留着了）
+     · rejected = 事实语义（这条是错的）
+
+② 不设 deleted_at
+   它不是删除。管理页的 notDeletedCondition() 因此仍能查到它
+   （带「已否定」标签），用户可以回头看我否定过哪些 ——
+   那是抽取器质量的直接证据。而删除掉的记忆再也看不到。
+
+③ **不需要改任何检索代码**
+   §13.6 的「当前有效记忆」谓词要求 status='active'，
+   因此新增一个非 active 的取值天然退出向量/关键词/槽位三条召回路径
+   （三条都引用同一个谓词，§18.3 的 C14）。
+   这正是「谓词集中定义一次」的价值：隐私与正确性只在一处把关。
+
+对唯一索引的影响：
+  uq_memories_current_slot 的 WHERE 只匹配 status='active'，
+  因此被否定的记忆**立刻让出槽位**，同槽位可以写入新记忆 ——
+  用户否定「职业是 A」之后说「职业是 B」应当能顺利落库。
+```
+
+**仍未纳入本次修订的**（保持原样，需要时另开编号）：
+
+```text
+· 抽取器会不会把被否定的内容重新抽出来 —— 会（没有排除机制）。
+  代价可接受：重新抽出来只是一条 status='active' 的新记忆，
+  用户再否定一次即可，数据不会错乱。
+  「用否定记录去抑制后续抽取」属于抽取策略变更，不在本次范围内。
+```
+
 ## 0.4 与 V1.0 的不兼容说明
 
 ```text
@@ -1129,10 +1172,11 @@ deleted_at      表达「用户是否要求删除」
 | 待用户裁决 | `conflict` | 保持原值 | NULL | NULL | ❌ | 冲突解决流程（见 §13.7） |
 | 已被替代 | `superseded` | 非空 | 非空 | NULL | ❌ | 冲突解决流程 |
 | 已归档 | `archived` | 非空 | NULL | NULL | ❌ | 长期未使用降级 |
+| 已否定 | `rejected` | 保持原值 | NULL | **NULL** | ❌ | 用户操作（「这条不对」，C39） |
 | 已删除 | `deleted` | 保持原值 | 保持原值 | 非空 | ❌ | 用户操作 |
 
 ```sql
-CHECK (status IN ('active','conflict','superseded','archived','deleted'))
+CHECK (status IN ('active','conflict','superseded','archived','rejected','deleted'))
 CHECK (status <> 'superseded' OR superseded_by IS NOT NULL)
 CHECK (status <> 'deleted' OR deleted_at IS NOT NULL)
 ```
@@ -1174,6 +1218,46 @@ CHECK (status <> 'deleted' OR deleted_at IS NOT NULL)
 > **为什么不用「独立待确认队列」：** 那会引入第二张表和一套并行状态流转，
 > 而冲突候选与普通记忆共享全部字段（content / 槽位 / 来源 / embedding）。
 > 放进同一张表用状态区分，成本最低且不会两处漂移。
+
+> 🟠 **C39：新增 `rejected` 状态（用户「这条不对」）**
+>
+> **来源：** 首次真实使用反馈（`docs/11` 反馈 2）讨论后的遗留动作项，
+> 方案见 `docs/12` §方案 4 的②。
+>
+> **问题：** 用户在记忆页看到一条错的内容时只有「删除」可用。
+> 但删除是清理语义，它既不能表达「这条是错的」，
+> 也让用户无法回顾自己否定过什么 —— 而那正是抽取器质量的直接证据。
+>
+> **决定：** 新增 `rejected` 状态，**不设 `deleted_at`**。
+>
+> ```text
+>      ┌── 用户点「这条不对」 ──→ status = 'rejected'（deleted_at 保持 NULL）
+>      │
+> active ──┬── 用户删除 ────────→ status = 'deleted'（deleted_at 非空）
+>      │
+>      └── 用户点「撤回否定」 ───→ status = 'active'
+>                                  （若槽位已被占用则转 conflict，与 restore 同规则）
+>
+> 已否定与已删除**互不覆盖**：
+>   一条 rejected 的记忆被删除 → 变为 deleted（清理语义优先，用户意图更彻底）
+>   但 deleted 的记忆不能「撤回否定」到 active —— 那要先走 restore
+> ```
+>
+> **与 `deleted` 的三点区别（实现时必须保持）：**
+>
+> ```text
+> ① 管理页可见性
+>    notDeletedCondition()（管理页用）只排除 status='deleted'，
+>    因此 rejected 的记忆**仍然看得见**，带「已否定」标签。
+> ② 召回
+>    两者都不被召回 —— 靠的都是 status<>'active'（§13.6 的谓词），
+>    不需要在检索路径里为 rejected 单独写条件（这是 C14 的收益）。
+> ③ embedding 处置
+>    softDeleteMemory 会把向量置 deleted；
+>    rejectMemory **刻意不动向量** —— 否定的是内容而不是向量，
+>    留着它可以让「撤回否定」不必重新调用 embedding 服务。
+>    向量残留不会导致召回：检索谓词已经排除了非 active 的记忆。
+> ```
 
 ## 13.6 「当前有效记忆」的判定谓词
 
@@ -2022,7 +2106,7 @@ ALTER TABLE messages           ADD CONSTRAINT chk_messages_role
 ALTER TABLE memories           ADD CONSTRAINT chk_memories_type
   CHECK (type IN ('fact','preference','event','goal','relationship','state'));
 ALTER TABLE memories           ADD CONSTRAINT chk_memories_status
-  CHECK (status IN ('active','conflict','superseded','archived','deleted'));
+  CHECK (status IN ('active','conflict','superseded','archived','rejected','deleted'));
 ALTER TABLE memories           ADD CONSTRAINT chk_memories_polarity
   CHECK (polarity IS NULL OR polarity IN ('affirm','deny'));
 ALTER TABLE memory_embeddings  ADD CONSTRAINT chk_embeddings_status
@@ -3199,7 +3283,7 @@ CREATE TABLE memories (
   updated_at       TIMESTAMPTZ NOT NULL DEFAULT now(),
   deleted_at       TIMESTAMPTZ,
   CONSTRAINT chk_memories_type       CHECK (type IN ('fact','preference','event','goal','relationship','state')),
-  CONSTRAINT chk_memories_status     CHECK (status IN ('active','conflict','superseded','archived','deleted')),
+  CONSTRAINT chk_memories_status     CHECK (status IN ('active','conflict','superseded','archived','rejected','deleted')),
   CONSTRAINT chk_memories_polarity   CHECK (polarity IS NULL OR polarity IN ('affirm','deny')),
   CONSTRAINT chk_memories_importance CHECK (importance_score BETWEEN 0 AND 1),
   CONSTRAINT chk_memories_confidence CHECK (confidence_score BETWEEN 0 AND 1),

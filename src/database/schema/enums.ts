@@ -73,7 +73,7 @@ export const MEMORY_TYPES = [
 export type MemoryType = (typeof MEMORY_TYPES)[number];
 
 /**
- * ⚠️ 含 'conflict'（C35，2026-09-22 决策）。
+ * ⚠️ 含 'conflict'（C35，2026-09-22 决策）与 'rejected'（2026-09-26 决策）。
  *
  * 'conflict' 表示「疑似与既有记忆冲突、等待用户裁决」。
  * 该状态的记忆：
@@ -81,12 +81,30 @@ export type MemoryType = (typeof MEMORY_TYPES)[number];
  *   - 不参与部分唯一索引（该索引的 WHERE 只匹配 'active'，§13.11）
  *   - 不阻塞同槽位的新写入
  * 裁决流转与 30 天自动归档见 §13.5 的 C35 说明。
+ *
+ * 'rejected' 表示「用户明确否定了这条」——比删除更精确的一种表达。
+ * 该状态的记忆：
+ *   - 不被召回（同上，这是它的全部意义）
+ *   - **不设 deleted_at**，因此管理页仍然看得见它（带「已否定」标签），
+ *     也不会挡住同一槽位的新记忆写入（部分唯一索引只匹配 'active'）
+ *   - 与 'deleted' 的区别：
+ *       · deleted = 「这条记录我不想留着了」（清理语义）
+ *       · rejected = 「这条是错的」（事实语义，用户对内容的判断）
+ *     对用户而言后者更明确；对系统而言，
+ *     它把「用户否定过什么」变成了可查询的数据，而删除做不到这一点。
+ *
+ * ⚠️ 为什么不复用 'deleted'：
+ *   被否定的记忆若直接置为 deleted，前端只能靠一段猜出来的文案
+ *   把它和「随手删掉的」混在一起显示 —— 那是两件不同的事。
+ *   而且 deleted 的记忆会被管理页默认隐藏，用户将无法回顾
+ *   「我否定过哪些」，也就无法发现抽取器反复犯的同一个错。
  */
 export const MEMORY_STATUSES = [
   'active',
   'conflict',
   'superseded',
   'archived',
+  'rejected',
   'deleted',
 ] as const;
 export type MemoryStatus = (typeof MEMORY_STATUSES)[number];

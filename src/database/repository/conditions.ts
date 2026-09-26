@@ -25,13 +25,16 @@ import { memories } from '../schema/memories.js';
  * 「当前有效记忆」判定谓词（§13.6）。
  *
  * 四个条件缺一不可：
- *   status = 'active'        排除 conflict / superseded / archived / deleted
+ *   status = 'active'        排除 conflict / superseded / archived / rejected / deleted
  *   deleted_at IS NULL       排除用户软删除的
  *   valid_until IS NULL      排除事实上已失效的（双时间轴）
  *   superseded_by IS NULL    排除已被新记忆替代的
  *
- * ⚠️ 注意 status='active' 已隐含排除 'conflict'（C35）：
- *    冲突记忆照常入库但不被召回，等用户裁决。
+ * ⚠️ 注意 status='active' 已隐含排除 'conflict'（C35）与 'rejected'：
+ *    冲突记忆照常入库但不被召回，等用户裁决；
+ *    被用户否定（「这条不对」）的记忆同样立刻退出所有召回路径 ——
+ *    这是那个操作的全部意义。两条路径都**不需要**改检索代码，
+ *    因为它们本来就要求 status='active'（§18.3 C14 的收益）。
  */
 export function currentMemoryCondition(): SQL {
   return and(
@@ -63,7 +66,12 @@ export function memoryValidAtCondition(at: Date): SQL {
  * 「未被用户删除」谓词。
  *
  * 用于不该受 status 影响、但仍必须排除删除记录的场合
- * （例如管理页需要看到 conflict / archived 的记忆，但不能看到已删除的）。
+ * （例如管理页需要看到 conflict / archived / rejected 的记忆，
+ *  但不能看到已删除的）。
+ *
+ * ⚠️ 刻意**不**排除 'rejected'：被否定的记忆必须留在管理页看得到 ——
+ *    用户需要能回顾「我否定过哪些」，否则无法发现抽取器反复犯的同一个错。
+ *    它不参与召回是靠 currentMemoryCondition()，与这里无关。
  */
 export function notDeletedCondition(): SQL {
   return and(isNull(memories.deletedAt), ne(memories.status, 'deleted'))!;

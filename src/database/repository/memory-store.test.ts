@@ -21,7 +21,9 @@ import {
   createConflictMemory,
   createMemory,
   hardDeleteMemory,
+  MemoryNotActiveError,
   mergeDuplicate,
+  rejectMemory,
   restoreMemory,
   resolveConflictAcceptNew,
   resolveConflictKeepOld,
@@ -638,10 +640,133 @@ test('restoreMemory 拒绝恢复未删除的记忆', async () => {
       opts(exec)
     );
 
+    /**
+     * 可恢复的只有两种状态：deleted（用户删了）与 rejected（用户说「这条不对」）。
+     * active 的没有可恢复的东西 —— 让它「恢复成功」会让用户以为操作生效了。
+     */
     await assert.rejects(
       () => restoreMemory(m.id, opts(exec)),
-      /只有已删除的可以恢复/
+      /只有已删除或已否定的可以恢复/
     );
+  });
+});
+
+test('rejectMemory 把记忆标为 rejected，且不写 deleted_at（C39）', async () => {
+  await withTestContext(async ({ exec, userId }) => {
+    const m = await createMemory(
+      {
+        userId,
+        type: 'fact',
+        content: '用户是技术工程师',
+        subjectKey: 'user',
+        predicateKey: 'employment.role',
+        objectValue: '技术工程师',
+        sources: [{ sourceType: 'manual' }],
+      },
+      opts(exec)
+    );
+
+    const rejected = await rejectMemory(m.id, opts(exec));
+
+    assert.equal(rejected.status, 'rejected');
+    /**
+     * 关键：rejected ≠ deleted。
+     * 写 deleted_at 会让它掉进「已删除」的语义里，
+     * 管理页的 notDeletedCondition() 就会把它藏起来，
+     * 用户也就无法回顾自己否定过什么 —— 那正是这个状态存在的理由。
+     */
+    assert.equal(rejected.deletedAt, null, '否定不是删除');
+
+    // 内容不可变（Q1）：否定只改状态，不动正文
+    assert.equal(rejected.content, m.content);
+  });
+});
+
+test('rejectMemory 对非 active 的记忆抛 MemoryNotActiveError', async () => {
+  await withTestContext(async ({ exec, userId }) => {
+    const m = await createMemory(
+      { userId, type: 'fact', content: '否定两次', sources: [{ sourceType: 'manual' }] },
+      opts(exec)
+    );
+
+    await rejectMemory(m.id, opts(exec));
+
+    /**
+     * 用一个专门的错误类型而不是裸 Error：Controller 要据此返回 409 而不是 500。
+     * 重复否定必须是可见的错误 —— 静默成功会让用户以为又生效了一次。
+     */
+    await assert.rejects(
+      () => rejectMemory(m.id, opts(exec)),
+      (err: unknown) =>
+        err instanceof MemoryNotActiveError &&
+        err.status === 'rejected' &&
+        err.memoryId === m.id
+    );
+  });
+});
+
+test('被否定的记忆让出槽位：同槽位可以再写入新记忆', async () => {
+  await withTestContext(async ({ exec, userId }) => {
+    const slot = {
+      subjectKey: 'user',
+      predicateKey: 'employment.role',
+      objectValue: '技术工程师',
+    };
+
+    const wrong = await createMemory(
+      { userId, type: 'fact', content: '用户是技术工程师', ...slot, sources: [{ sourceType: 'manual' }] },
+      opts(exec)
+    );
+
+    // 否定之前同槽位写不进去（uq_memories_current_slot）
+    await assertRejectsWithConstraint(
+      () =>
+        createMemory(
+          {
+            userId,
+            type: 'fact',
+            content: '用户是运维工程师',
+            ...slot,
+            objectValue: '运维工程师',
+            sources: [{ sourceType: 'manual' }],
+          },
+          opts(exec)
+        ),
+      'uq_memories_current_slot',
+      '前提：同槽位在 active 时不允许两条'
+    );
+
+    await rejectMemory(wrong.id, opts(exec));
+
+    // 否定之后槽位空出来了 —— 这是 rejected 相对 deleted 的实际收益之一
+    const corrected = await createMemory(
+      {
+        userId,
+        type: 'fact',
+        content: '用户是运维工程师',
+        ...slot,
+        objectValue: '运维工程师',
+        sources: [{ sourceType: 'manual' }],
+      },
+      opts(exec)
+    );
+
+    assert.equal(corrected.status, 'active');
+  });
+});
+
+test('restoreMemory 可以把 rejected 撤回成 active（撤是否定）', async () => {
+  await withTestContext(async ({ exec, userId }) => {
+    const m = await createMemory(
+      { userId, type: 'fact', content: '其实是对的', sources: [{ sourceType: 'manual' }] },
+      opts(exec)
+    );
+
+    await rejectMemory(m.id, opts(exec));
+    const { memory, becameConflict } = await restoreMemory(m.id, opts(exec));
+
+    assert.equal(memory.status, 'active');
+    assert.equal(becameConflict, false);
   });
 });
 

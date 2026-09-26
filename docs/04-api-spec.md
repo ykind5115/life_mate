@@ -722,7 +722,7 @@ soft delete
 
 # 25. 恢复 Memory
 
-如果 Memory 被软删除：
+如果 Memory 被软删除，或被标记为「这条不对」（见 §25.1）：
 
 ```http
 POST /api/v1/memories/:id/restore
@@ -734,6 +734,50 @@ POST /api/v1/memories/:id/restore
 status = active
 deleted_at = NULL
 ```
+
+两种来源状态都可以恢复 —— 撤回删除与撤回否定是同一个动作。
+
+⚠️ 若该记忆的槽位已被别的记忆占用，会转为 `conflict` 而不是 `active`
+（直接置 `active` 会撞 `uq_memories_current_slot`）。
+响应里的 `became_conflict` 用于让前端提示用户去裁决。
+
+## 25.1 标记「这条不对」（实现补充，对应 C39）
+
+```http
+POST /api/v1/memories/:id/reject
+```
+
+```text
+status = rejected
+deleted_at 保持 NULL
+```
+
+与 `DELETE`（软删除）的区别：
+
+|  | `DELETE` | `reject` |
+| --- | --- | --- |
+| 语义 | 这条记录我不想留着了 | 这条是错的 |
+| `deleted_at` | 非空 | **保持 NULL** |
+| 管理视图（`view=management`） | 默认隐藏 | **仍然可见**（带「已否定」标签） |
+| 召回 | 排除 | 排除 |
+| 撤回 | `restore` | `restore` |
+
+两者都不被召回 —— 靠的都是「当前有效记忆」谓词要求 `status='active'`
+（docs/03 §13.6），因此不需要在检索路径里为 `rejected` 单独写条件。
+
+否定后**立刻让出槽位**（`uq_memories_current_slot` 只匹配 `active`），
+因此「否定错的 → 写入对的」可以顺利落库。
+
+错误：
+
+```text
+404  记忆不存在
+409  当前状态不是 active（已否定 / 已删除的重复操作）
+```
+
+> **说明：** 本节是实现补充，原文档没有这个端点。
+> 需求来自首次使用反馈（docs/11 反馈 2 讨论后的遗留动作项），
+> 方案见 docs/12 §方案 4 的②，库结构变更见 docs/03 的 C39。
 
 ------
 
@@ -1462,6 +1506,7 @@ POST   /api/v1/memories
 PATCH  /api/v1/memories/:id
 DELETE /api/v1/memories/:id
 POST   /api/v1/memories/:id/restore
+POST   /api/v1/memories/:id/reject      ← 实现补充，见 §25.1（C39）
 GET    /api/v1/memories/:id/sources
 ```
 

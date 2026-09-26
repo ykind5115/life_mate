@@ -1,0 +1,37 @@
+-- ============================================================
+-- 0004 —— memories.status 新增 'rejected'（「这条不对」）
+--
+-- 来源：docs/12 §方案 4 的②（用户 2026-09-26 决定实施）
+--
+-- 【为什么需要这个状态，而不是复用 'deleted'】
+--   用户在记忆页看到一条错的内容时，现有的动作只有「删除」。
+--   但「我不想留着了」与「这条是错的」是两件事：
+--     · deleted  = 清理语义，管理页默认隐藏它
+--     · rejected = 事实语义，管理页仍然显示（带「已否定」标签），
+--                  用户可以回头看我否定过哪些 —— 那是抽取器质量的直接证据
+--
+-- 【为什么这一条不需要改任何检索代码】
+--   §13.6 的「当前有效记忆」谓词要求 status='active'，
+--   因此新增一个非 active 的取值天然退出全部召回路径
+--   （向量 / 关键词 / 槽位三通道都引用同一个谓词，§18.3 C14）。
+--   这正是把谓词集中定义一次的价值。
+--
+-- 【⚠️ 不设 deleted_at】
+--   rejected 的记忆 deleted_at 保持 NULL：
+--     · 它不是删除
+--     · 管理页的 notDeletedCondition() 因此仍能查到它
+--     · chk_memories_deleted 只约束 status='deleted' 的行，不受影响
+--
+-- 【对唯一索引的影响】
+--   uq_memories_current_slot 的 WHERE 只匹配 status='active'，
+--   因此被否定的记忆**立刻让出槽位**，同槽位可以写入新记忆。
+--   这是想要的：用户否定了「职业是 A」，之后说「职业是 B」应当能顺利落库。
+--
+-- 【回滚】
+--   回滚前必须先处理已存在的数据，否则 ADD CONSTRAINT 会失败：
+--     UPDATE memories SET status='deleted', deleted_at=now() WHERE status='rejected';
+--   然后反向执行本文件的 DROP / ADD（枚举少一项）。
+-- ============================================================
+
+ALTER TABLE "memories" DROP CONSTRAINT "chk_memories_status";--> statement-breakpoint
+ALTER TABLE "memories" ADD CONSTRAINT "chk_memories_status" CHECK ("memories"."status" IN ('active', 'conflict', 'superseded', 'archived', 'rejected', 'deleted'));

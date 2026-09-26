@@ -135,7 +135,7 @@ export const listMemoriesQuerySchema = paginationSchema.extend({
     )
     .pipe(
       z
-        .array(z.enum(['active', 'conflict', 'superseded', 'archived', 'deleted']))
+        .array(z.enum(['active', 'conflict', 'superseded', 'archived', 'rejected', 'deleted']))
         .optional()
     ),
   /** 管理页需要看到 conflict / archived，默认口径不同 */

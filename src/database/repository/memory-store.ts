@@ -497,12 +497,20 @@ export async function softDeleteMemory(
 }
 
 /**
- * 恢复被软删除的记忆（接口 §25 的 restore）。
+ * 恢复被软删除或被否定的记忆（接口 §25 的 restore）。
+ *
+ * 两种来源状态：
+ *   · 'deleted'  —— 用户删掉了这条记录
+ *   · 'rejected' —— 用户说「这条不对」
+ * 两者都是用户主动否定的结果，都可以撤回。
  *
  * 恢复到 active。若该槽位已被别的记忆占用，则转为 conflict 等待裁决 ——
  * 直接置 active 会撞上 uq_memories_current_slot。
  *
  * embedding 同步恢复为 ready（与 softDeleteMemory 对称）。
+ *
+ * ⚠️ 被否定的记忆（rejected）并没有清空 embedding，
+ *    所以恢复它只需要把 status 改回 ready 即可 —— 与 deleted 走同一段代码。
  */
 export async function restoreMemory(
   memoryId: string,
@@ -512,8 +520,10 @@ export async function restoreMemory(
   return exec.transaction(async (tx) => {
     const target = await loadMemory(tx, memoryId);
 
-    if (target.status !== 'deleted') {
-      throw new Error(`记忆 ${memoryId} 的状态是 ${target.status}，只有已删除的可以恢复`);
+    if (target.status !== 'deleted' && target.status !== 'rejected') {
+      throw new Error(
+        `记忆 ${memoryId} 的状态是 ${target.status}，只有已删除或已否定的可以恢复`
+      );
     }
 
     // 检查槽位是否已被占用（只有带槽位的记忆才需要检查）
@@ -552,6 +562,79 @@ export async function restoreMemory(
 
     return { memory: rows[0]!, becameConflict };
   });
+}
+
+/**
+ * 标记「这条不对」（docs/12 §方案 4 的②，2026-09-26 决策）。
+ *
+ * 【为什么需要它，而不是让用户去「删除」】
+ *   用户的原话是「记忆页加一个『这条不对』的快捷操作，比现在的删除更明确」。
+ *   区别在两处：
+ *     ① 语义：删除是「这条我不想留着了」，否定是「这条是错的」。
+ *        后者才是用户看到一条错误记忆时真正想表达的意思。
+ *     ② 可回顾：被否定的记忆留在管理页（带「已否定」标签），
+ *        用户可以回头看「我否定过哪些」—— 那是抽取器质量的直接证据。
+ *        而删除掉的就再也看不到了。
+ *
+ * 【为什么不是「先存再确认」那套流程】
+ *   docs/11 反馈 2 讨论过「不确定的信息要不要先确认再写记忆」，
+ *   用户决定不改（多数时候模型是对的，先确认会让每次对话都变成表单）。
+ *   因此这里走的是**事后纠正**：写进去，错了由用户一键否定。
+ *   这是那次讨论留下的唯一动作项。
+ *
+ * 【不设 deleted_at】
+ *   它不是删除。管理页要看得见它，所以 notDeletedCondition() 也不会排除它。
+ *   退出召回靠的是 status !== 'active'（currentMemoryCondition）。
+ *
+ * 【为什么不清 embedding】
+ *   与 softDeleteMemory 不同：那条路径要表达「不想留了」，
+ *   残留向量没有意义；而否定是「内容错了」，向量本身没错，
+ *   留着它可以让「撤回否定」不需要重新调用 embedding 服务。
+ *   检索谓词已经把它排除了，向量存在不会导致它被召回（§18.3 C14）。
+ *
+ * @returns 更新后的记忆
+ * @throws 记忆不存在，或当前不是 active（已否定/已删除的重复操作应被拒绝，
+ *         否则会让用户以为「操作生效了」而实际上什么都没变）
+ */
+export async function rejectMemory(
+  memoryId: string,
+  options: ExecutorOption = {}
+): Promise<Memory> {
+  const exec = options.executor ?? db;
+  return exec.transaction(async (tx) => {
+    const target = await loadMemory(tx, memoryId);
+
+    if (target.status !== 'active') {
+      throw new MemoryNotActiveError(memoryId, target.status);
+    }
+
+    const rows = await tx
+      .update(memories)
+      .set({ status: 'rejected', updatedAt: sql`now()` })
+      .where(eq(memories.id, memoryId))
+      .returning();
+
+    const memory = rows[0];
+    if (!memory) throw new Error(`记忆不存在：${memoryId}`);
+
+    return memory;
+  });
+}
+
+/**
+ * 对一个不是 active 的记忆执行了只有 active 才能做的操作。
+ *
+ * 单独定义类型而不是拼字符串：Controller 要据此返回 409 而不是 500，
+ * 靠 message 文本判断会在文案改动时静默失效（与 ChatService 的错误同理）。
+ */
+export class MemoryNotActiveError extends Error {
+  constructor(
+    readonly memoryId: string,
+    readonly status: string
+  ) {
+    super(`记忆 ${memoryId} 的状态是 ${status}，只有当前有效的记忆可以这样操作`);
+    this.name = 'MemoryNotActiveError';
+  }
 }
 
 /**

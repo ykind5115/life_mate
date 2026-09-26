@@ -7,6 +7,7 @@
  *   GET    /api/v1/memories/:id/sources     来源（§26）
  *   POST   /api/v1/memories                 手工创建（§22）
  *   PATCH  /api/v1/memories/:id             更新（§23，受限，见下）
+ *   POST   /api/v1/memories/:id/reject      「这条不对」（docs/12 §方案 4 的②）
  *   DELETE /api/v1/memories/:id             软删除（§24）
  *   POST   /api/v1/memories/:id/restore     恢复（§25）
  *
@@ -32,6 +33,7 @@ import {
   getOrCreateDefaultUser,
   listCurrent,
   listForManagement,
+  rejectMemory,
   restoreMemory,
   softDeleteMemory,
   updateMemoryScores,
@@ -274,6 +276,42 @@ export async function registerMemoryRoutes(app: FastifyInstance): Promise<void> 
   });
 
   // ==========================================================
+  // POST /api/v1/memories/:id/reject   （「这条不对」，docs/12 §方案 4 的②）
+  // ==========================================================
+  app.post('/memories/:id/reject', async (request) => {
+    const { id } = memoryIdParamSchema.parse(request.params);
+
+    /**
+     * 必须能看到非 active 的记忆，否则：
+     *   · 已删除的会走 404（语义错了，它是「有，但状态不允许」）
+     *   · 被否定的重复点击也会走 404（用户会以为记录不见了）
+     * 两种情况都要给 409 与明确的原因。
+     */
+    const existing = await findByIdIncludingInactive(id, { includeDeletedForRestore: true });
+    if (!existing) throw notFound('记忆不存在');
+
+    if (existing.status !== 'active') {
+      throw conflict(`记忆当前状态是 ${existing.status}，只有当前有效的记忆可以否定`);
+    }
+
+    const rejected = await rejectMemory(id);
+
+    return ok({
+      ...toMemoryDto(rejected, { includeScores: true }),
+      /**
+       * 与 DELETE 的 note 同构：说明这次操作的**实际效果**。
+       * 「立即从所有召回路径排除」是事实，不是承诺 ——
+       * 检索谓词要求 status='active'（§13.6），下一次召回就看不到它了。
+       *
+       * 同时说明它与删除的区别：记录还在，可以撤回，也可以回顾。
+       */
+      note:
+        '已否定：立即从所有召回路径排除，但记录仍保留在管理页（可用 restore 撤回）。' +
+        '与删除的区别是「这条是错的」比「不想留着了」更明确，也便于回顾否定过什么。',
+    });
+  });
+
+  // ==========================================================
   // DELETE /api/v1/memories/:id   （docs/04 §24，软删除）
   // ==========================================================
   app.delete('/memories/:id', async (request) => {
@@ -302,14 +340,20 @@ export async function registerMemoryRoutes(app: FastifyInstance): Promise<void> 
     const { id } = memoryIdParamSchema.parse(request.params);
 
     /**
-     * 必须用 includeDeletedForRestore 才看得到已删除的记忆，
+     * 必须用 includeDeletedForRestore 才看得到已删除/已否定的记忆，
      * 否则这条路径永远 404（这正是那个选项存在的唯一理由）。
      */
-    const deleted = await findByIdIncludingInactive(id, { includeDeletedForRestore: true });
-    if (!deleted) throw notFound('记忆不存在');
+    const target = await findByIdIncludingInactive(id, { includeDeletedForRestore: true });
+    if (!target) throw notFound('记忆不存在');
 
-    if (deleted.status !== 'deleted') {
-      throw conflict(`记忆当前状态是 ${deleted.status}，只有已删除的可以恢复`);
+    /**
+     * 两种来源状态都可以恢复（C39）：
+     *   deleted  —— 用户删掉了这条记录
+     *   rejected —— 用户说「这条不对」
+     * 撤回否定与撤回删除是同一件事：让这条记忆重新可被召回。
+     */
+    if (target.status !== 'deleted' && target.status !== 'rejected') {
+      throw conflict(`记忆当前状态是 ${target.status}，只有已删除或已否定的可以恢复`);
     }
 
     const { memory, becameConflict } = await restoreMemory(id);

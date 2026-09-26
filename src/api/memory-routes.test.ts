@@ -72,7 +72,7 @@ interface MemoryFixture {
     subjectKey?: string | null;
     predicateKey?: string | null;
     objectValue?: string | null;
-    status?: 'active' | 'conflict' | 'superseded' | 'archived' | 'deleted';
+    status?: 'active' | 'conflict' | 'superseded' | 'archived' | 'rejected' | 'deleted';
     importanceScore?: number;
   }) => Promise<string>;
 }
@@ -562,6 +562,143 @@ test('POST /:id/restore 未删除的记忆 → 409', async () => {
 
     const res = await req(app, { method: 'POST', url: `/api/v1/memories/${id}/restore` });
     assert.equal(res.statusCode, 409);
+  });
+});
+
+// ============================================================
+// 「这条不对」（docs/12 §方案 4 的②，C39）
+// ============================================================
+
+test('POST /:id/reject 把记忆标为已否定，并立即从当前有效列表消失', async () => {
+  await withMemoryFixture(async ({ app, seed }) => {
+    const id = await seed({ content: '用户是互联网主场技术工程师' });
+
+    const res = await req(app, { method: 'POST', url: `/api/v1/memories/${id}/reject` });
+    assert.equal(res.statusCode, 200);
+
+    const data = res.json().data;
+    assert.equal(data.status, 'rejected');
+    // 关键：它不是删除，所以不设 deleted_at
+    assert.equal(data.deleted_at ?? null, null, '否定不是删除，不该写 deleted_at');
+
+    const list = await req(app, { method: 'GET', url: '/api/v1/memories' });
+    assert.equal(list.json().data.pagination.total, 0, '被否定的记忆必须立刻退出召回');
+  });
+});
+
+test('被否定的记忆仍留在管理视图里（这是它与删除的核心区别）', async () => {
+  await withMemoryFixture(async ({ app, seed }) => {
+    const id = await seed({ content: '一条错的内容' });
+    await req(app, { method: 'POST', url: `/api/v1/memories/${id}/reject` });
+
+    /**
+     * 用户需要能回顾「我否定过哪些」——那是抽取器质量的直接证据。
+     * 若这条路径也把它藏起来，rejected 就退化成了 deleted，
+     * 多出来的状态就没有意义了。
+     */
+    const mgmt = await req(app, { method: 'GET', url: '/api/v1/memories?view=management' });
+    const items = mgmt.json().data.items as { id: string; status: string }[];
+    const found = items.find((m) => m.id === id);
+
+    assert.ok(found, '管理视图必须能看到被否定的记忆');
+    assert.equal(found.status, 'rejected');
+
+    // 可以按状态过滤出来
+    const filtered = await req(
+      app,
+      { method: 'GET', url: '/api/v1/memories?view=management&status=rejected' }
+    );
+    const only = filtered.json().data.items as { id: string; status: string }[];
+    assert.ok(only.length > 0);
+    assert.ok(only.every((m) => m.status === 'rejected'));
+  });
+});
+
+test('撤回否定：restore 让记忆回到可召回状态', async () => {
+  await withMemoryFixture(async ({ app, seed }) => {
+    const id = await seed({ content: '其实是对的' });
+    await req(app, { method: 'POST', url: `/api/v1/memories/${id}/reject` });
+
+    const res = await req(app, { method: 'POST', url: `/api/v1/memories/${id}/restore` });
+    assert.equal(res.statusCode, 200, '撤回否定与撤回删除是同一个动作');
+
+    const data = res.json().data;
+    assert.equal(data.status, 'active');
+    assert.equal(data.became_conflict, false);
+
+    const list = await req(app, { method: 'GET', url: '/api/v1/memories' });
+    assert.equal(list.json().data.pagination.total, 1, '撤回后必须重新可召回');
+  });
+});
+
+test('否定会让出槽位：之后写同槽位的新记忆不会撞唯一索引', async () => {
+  await withMemoryFixture(async ({ app, seed }) => {
+    const slot = { predicateKey: 'employment.role', objectValue: '技术工程师' };
+    const wrong = await seed({ content: '用户是技术工程师', ...slot });
+
+    await req(app, { method: 'POST', url: `/api/v1/memories/${wrong}/reject` });
+
+    /**
+     * 这条是「否定」相对「删除」的实际收益之一：
+     * uq_memories_current_slot 的 WHERE 只匹配 status='active'，
+     * 因此被否定的记忆立刻让出槽位，用户更正后的新记忆能顺利落库。
+     */
+    const corrected = await seed({ content: '用户是运维工程师', ...slot });
+    assert.ok(corrected);
+
+    const list = await req(app, { method: 'GET', url: '/api/v1/memories' });
+    const items = list.json().data.items as { id: string }[];
+    assert.equal(items.length, 1, '只有更正后的那条是当前有效');
+    assert.equal(items[0]!.id, corrected);
+  });
+});
+
+test('重复否定同一记忆 → 409（不静默成功）', async () => {
+  await withMemoryFixture(async ({ app, seed }) => {
+    const id = await seed({ content: '否定两次' });
+    await req(app, { method: 'POST', url: `/api/v1/memories/${id}/reject` });
+
+    const again = await req(app, { method: 'POST', url: `/api/v1/memories/${id}/reject` });
+    assert.equal(again.statusCode, 409, '第二次必须报错，否则用户以为操作生效了');
+  });
+});
+
+test('否定已删除的记忆 → 409（要先恢复）', async () => {
+  await withMemoryFixture(async ({ app, seed }) => {
+    const id = await seed({ content: '已删除', status: 'deleted' });
+
+    const res = await req(app, { method: 'POST', url: `/api/v1/memories/${id}/reject` });
+    assert.equal(res.statusCode, 409);
+  });
+});
+
+test('否定不存在的记忆 → 404', async () => {
+  await withMemoryFixture(async ({ app }) => {
+    const res = await req(app, {
+      method: 'POST',
+      url: '/api/v1/memories/00000000-0000-4000-8000-0000000000ff/reject',
+    });
+    assert.equal(res.statusCode, 404);
+  });
+});
+
+test('被删除的记忆不能靠 restore 变成「撤回否定」以外的状态，反之亦然', async () => {
+  await withMemoryFixture(async ({ app, seed }) => {
+    /**
+     * 边界：rejected 与 deleted 互不覆盖。
+     * 一条 rejected 的记忆被删除后是 deleted（清理语义更彻底），
+     * 此时 restore 仍然可用 —— 回到 active 而不是回到 rejected。
+     * 这是刻意的简化：状态机不该有两个"上一状态"。
+     */
+    const id = await seed({ content: '先否定再删除' });
+
+    await req(app, { method: 'POST', url: `/api/v1/memories/${id}/reject` });
+    const del = await req(app, { method: 'DELETE', url: `/api/v1/memories/${id}` });
+    assert.equal(del.statusCode, 200);
+    assert.equal(del.json().data.status, 'deleted');
+
+    const res = await req(app, { method: 'POST', url: `/api/v1/memories/${id}/restore` });
+    assert.equal(res.json().data.status, 'active');
   });
 });
 

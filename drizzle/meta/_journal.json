@@ -29,6 +29,13 @@
       "when": 1790079021081,
       "tag": "0003_exclude_constraint_and_deferred_fks",
       "breakpoints": true
+    },
+    {
+      "idx": 4,
+      "version": "7",
+      "when": 1790434723258,
+      "tag": "0004_opposite_mordo",
+      "breakpoints": true
     }
   ]
 }
