@@ -125,6 +125,16 @@ async function withServer(
     answer?: string;
     failure?: LLMError;
     retrieveMemories?: ChatRouteDeps['retrieveMemories'];
+    /**
+     * 是否启用标题生成。缺省**关闭**。
+     *
+     * ⚠️ 与摘要触发器不同，标题没有天然的省钱机制 ——
+     *    摘要要满 30 条才动手，标题首轮就会真的去生成。
+     *    绝大多数用例不关心标题，开着只会多两条查询、
+     *    并在输出里刷出无关的 [title] 日志（实测过一轮，噪声很明显）。
+     *    关心标题的用例显式传 true。
+     */
+    title?: boolean;
   } = {}
 ): Promise<void> {
   /**
@@ -141,6 +151,7 @@ async function withServer(
     chatIdempotency: new IdempotencyStore(),
     extractionTrigger: inertTrigger(),
     retrieveMemories: options.retrieveMemories ?? null,
+    titleTrigger: options.title ? undefined : null,
   });
 
   try {
@@ -243,6 +254,97 @@ test('第二轮请求带上 conversation_id 时会复用同一会话，序号继
   });
 });
 
+// ============================================================
+// 会话标题（docs/12 §方案 2，对应 docs/11 反馈 4）
+// ============================================================
+
+test('首轮对话立刻写入占位标题 —— 列表在任何时刻都有东西可显示', async () => {
+  await withServer(async ({ app }) => {
+    const res = await postJson(app, '/api/v1/chat', { message: '帮我看看这个简历' });
+
+    // 响应里就带着标题（不等到后台生成）
+    assert.equal(res.json().data.conversation.title, '帮我看看这个简历');
+
+    const list = await app.inject({ method: 'GET', url: '/api/v1/conversations' });
+    const items = list.json().data.items as { id: string; title: string | null }[];
+    const created = items.find((c) => c.id === res.json().data.conversation.id);
+    assert.equal(created?.title, '帮我看看这个简历');
+  });
+});
+
+test('占位标题是首条消息的截断，超长也不会把列表撑破', async () => {
+  await withServer(async ({ app }) => {
+    const res = await postJson(app, '/api/v1/chat', {
+      message: '早上好呀，你知道现在是什么时间吗，你知道我是谁吗？',
+    });
+
+    const title = res.json().data.conversation.title as string;
+    assert.ok(title.endsWith('…'), '超长标题应被截断');
+    assert.ok(title.length <= 21);
+  });
+});
+
+test('后台标题生成把占位标题换成正式标题（含清洗）', async () => {
+  await withServer(
+    async ({ app }) => {
+      const res = await postJson(app, '/api/v1/chat', { message: '聊聊我的运维工作' });
+      const conversationId = res.json().data.conversation.id;
+
+      /**
+       * 标题生成是 fire-and-forget（在响应之后）。
+       * 默认触发器是进程单例，测试无法直接 await 它的 idle()，
+       * 因此这里轮询数据库直到标题变化 —— 比 sleep 一个固定值可靠。
+       */
+      let title: string | null = null;
+      for (let i = 0; i < 50; i++) {
+        const detail = await app.inject({
+          method: 'GET',
+          url: `/api/v1/conversations/${conversationId}`,
+        });
+        title = detail.json().data.title;
+        if (title !== '聊聊我的运维工作') break;
+        await new Promise((r) => setTimeout(r, 20));
+      }
+
+      // 假 Provider 返回的是 answer，清洗后就是它（去掉了句末的句号）
+      assert.equal(title, '这是测试回答');
+    },
+    { answer: '这是测试回答。', title: true }
+  );
+});
+
+test('已有正式标题时不会重复生成（第二轮不该再调 LLM 起标题）', async () => {
+  await withServer(
+    async ({ app, provider }) => {
+      const first = await postJson(app, '/api/v1/chat', { message: '第一句' });
+      const conversationId = first.json().data.conversation.id;
+
+      // 等第一轮的标题生成落库
+      for (let i = 0; i < 50; i++) {
+        const detail = await app.inject({
+          method: 'GET',
+          url: `/api/v1/conversations/${conversationId}`,
+        });
+        if (detail.json().data.title !== '第一句') break;
+        await new Promise((r) => setTimeout(r, 20));
+      }
+
+      const callsAfterFirst = provider.received.length;
+
+      await postJson(app, '/api/v1/chat', { conversation_id: conversationId, message: '第二句' });
+      // 给后台任务一点时间（若它真的调了 LLM，这里就能看出来）
+      await new Promise((r) => setTimeout(r, 150));
+
+      assert.equal(
+        provider.received.length,
+        callsAfterFirst + 1,
+        '第二轮只该调一次 LLM（对话本身），不该再调一次起标题'
+      );
+    },
+    { title: true }
+  );
+});
+
 test('上下文里包含近期历史（短期上下文，docs/02 §23）', async () => {
   await withServer(async ({ app, provider }) => {
     const first = await postJson(app, '/api/v1/chat', { message: '我叫阿康' });
@@ -253,11 +355,21 @@ test('上下文里包含近期历史（短期上下文，docs/02 §23）', async
       message: '我刚才说了什么',
     });
 
-    // 第二次调用的 messages：1 条 system + 历史(user,assistant) + 当前 user
+    /**
+     * 第二次调用的 messages：
+     *   system(规则 + 当前时间) + 历史(user,assistant) + 当前 user
+     *
+     * ⚠️ 两条历史消息在同一事务里写入，created_at 完全相同，
+     *    因此它们之间不会插时间标记 —— 标记只出现在第一条历史消息之前
+     *    （作为锚点）。断言按「非 system 消息的形状」写，
+     *    这样即使将来阈值调整也不会因为这个用例假失败。
+     */
     const secondCall = provider.received.at(-1)!;
-    const roles = secondCall.messages.map((m) => m.role);
-    assert.equal(roles[0], 'system');
-    assert.deepEqual(roles.slice(1), ['user', 'assistant', 'user']);
+    const nonSystem = secondCall.messages.filter((m) => m.role !== 'system');
+    assert.deepEqual(
+      nonSystem.map((m) => m.role),
+      ['user', 'assistant', 'user']
+    );
 
     const contents = secondCall.messages.map((m) => m.content);
     assert.ok(contents.includes('我叫阿康'), '历史里的用户消息应进入上下文');
@@ -274,7 +386,10 @@ test('上下文里包含近期历史（短期上下文，docs/02 §23）', async
       1,
       '当前消息在上下文里只能出现一次'
     );
-    assert.equal(secondCall.messages.length, 4, 'system + 2 条历史 + 当前消息');
+
+    // 系统提示在最前，且带上了「现在」——docs/12 §方案 1（反馈 1.2 / 5）
+    assert.equal(secondCall.messages[0]!.role, 'system');
+    assert.match(secondCall.messages[0]!.content, /当前时间/, '系统提示必须给出当前时间');
   });
 });
 
@@ -493,13 +608,25 @@ test('检索到的记忆被注入到上下文（system 段落），且当前消�
 
       const call = provider.received.at(-1)!;
 
-      // 结构：system(规则) + system(已知信息) + user(当前消息)
+      // 结构：system(规则) + system(你记得的事) + user(当前消息)
       assert.equal(call.messages[0]!.role, 'system');
       assert.equal(call.messages[1]!.role, 'system');
-      assert.match(call.messages[1]!.content, /已知信息/, '第二条 system 应是记忆段落');
+      assert.match(call.messages[1]!.content, /你记得的关于对方的事/, '第二条 system 应是记忆段落');
       assert.match(call.messages[1]!.content, /用户正在学习 Rust/, '记忆正文应出现在上下文里');
       assert.match(call.messages[1]!.content, /2026-01-15/, '应带事实生效日期，供模型正确表述');
       assert.equal(call.messages.at(-1)!.content, '我最近怎么样');
+
+      /**
+       * docs/11 反馈 1：不能把机制端到对方面前。
+       * 上下文里出现的机制词汇会被模型照着复述，因此这里断言它们不出现。
+       * 注意只查**记忆段落**：系统提示词正文里「记忆」是规则用语，
+       * 那是给模型看的，不会被复述成「我翻了长期记忆」。
+       */
+      assert.doesNotMatch(
+        call.messages[1]!.content,
+        /系统|检索|上下文|数据库/,
+        '记忆段落不得出现机制词汇 —— 模型会照着复述'
+      );
     },
     {
       retrieveMemories: async () => [
@@ -521,17 +648,17 @@ test('检索返回空 → 不插入空的「已知信息」段落', async () => 
 
       const call = provider.received.at(-1)!;
       /**
-       * 空段落会被模型当成「系统查过了，确实没有」，
+       * 空段落会被模型当成「确实没有」，
        * 而实际上可能只是本次没命中。整段不出现才不传递错误信号。
        *
-       * ⚠️ 断言的是**段落标题**而不是「已知信息」四个字：
-       *    系统提示词正文里本来就有「当下面提供的「已知信息」里没有…」这句话，
+       * ⚠️ 断言的是**段落标题**而不是「记忆」两个字：
+       *    系统提示词正文里本来就有关于记忆的规则文本，
        *    用宽泛的模式会把规则文本也匹配上（本测试第一版就是这么假失败的）。
        */
       assert.equal(call.messages.length, 2, '只有 system + 当前 user');
       assert.doesNotMatch(
         JSON.stringify(call.messages),
-        /已知信息（来自长期记忆/,
+        /你记得的关于对方的事/,
         '没有记忆时不应出现记忆段落'
       );
     },

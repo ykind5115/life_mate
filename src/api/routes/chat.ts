@@ -29,7 +29,9 @@ import {
   getDefaultSummaryTrigger,
   type SummaryTrigger,
 } from '../../conversation/summary-trigger.js';
+import { getDefaultTitleTrigger, type TitleTrigger } from '../../conversation/title-trigger.js';
 import { ok } from '../errors.js';
+import { env } from '../../shared/env.js';
 import { chatRequestSchema, toChatParams } from '../schemas.js';
 import { fingerprintChat, IdempotencyStore } from '../idempotency.js';
 import { parseIdempotencyKey, SseStream } from '../sse.js';
@@ -41,6 +43,13 @@ export interface ChatRouteDeps {
   extractionTrigger?: ExtractionTrigger;
   /** 摘要触发器。缺省为进程单例；测试传一个不真跑的 */
   summaryTrigger?: SummaryTrigger | null;
+  /**
+   * 标题触发器（docs/12 §方案 2）。
+   *
+   * 与 summaryTrigger 同样三态：显式 null（关闭）/ 显式实例（覆盖）/ 缺省（进程单例）。
+   * ⚠️ 测试必须传 null 或一个假实例 —— 缺省会真调 LLM 生成标题。
+   */
+  titleTrigger?: TitleTrigger | null;
   /** 覆盖 LLM Provider。生产不传，测试注入假实现 */
   provider?: LLMProvider;
   /**
@@ -124,6 +133,29 @@ export async function registerChatRoutes(
         ));
 
   /**
+   * 标题触发器。三态与 summaryTrigger 完全一致，但**多一道测试兜底**。
+   *
+   * ⚠️ 为什么需要兜底：摘要触发器有个天然的省钱机制 ——
+   *    阈值 30 条，测试里永远达不到，所以在调 LLM 之前就返回了。
+   *    标题**没有这个保护**：首轮就会真的去生成。
+   *    而测试进程读的是 .env（NODE_ENV=development）里的真实 LLM_API_KEY，
+   *    于是 `pnpm test` 会悄悄产生真实的 API 调用并计费。
+   *
+   *    因此：NODE_ENV=test 且没有显式注入 provider 时，**不构造触发器**。
+   *    测试若想验证标题逻辑，必须显式传一个假 provider 的实例 ——
+   *    那时走的是上面的 `deps.titleTrigger` 分支，不受此兜底影响。
+   */
+  const titleTrigger =
+    deps.titleTrigger === null
+      ? undefined
+      : (deps.titleTrigger ??
+        (env.NODE_ENV === 'test' && deps.provider === undefined
+          ? undefined
+          : getDefaultTitleTrigger(
+              deps.provider !== undefined ? { provider: deps.provider } : {}
+            )));
+
+  /**
    * ChatService 的依赖。抽成常量避免两个 route 里各写一份而漂移。
    *
    * retrieveMemories 的三态：显式 null（关闭）/ 显式函数（覆盖）/ 缺省（用真实检索）
@@ -134,6 +166,7 @@ export async function registerChatRoutes(
   const serviceDeps: ChatServiceDeps = {
     extractionTrigger,
     ...(summaryTrigger !== undefined ? { summaryTrigger } : {}),
+    ...(titleTrigger !== undefined ? { titleTrigger } : {}),
     ...(deps.provider !== undefined ? { provider: deps.provider } : {}),
     ...(retrieveMemories !== undefined ? { retrieveMemories } : {}),
   };
@@ -212,18 +245,26 @@ export async function registerChatRoutes(
        * docs/04 §11 只定义了 token 与 done，而 done 里没有 id ——
        * 前端拿不到 message_id 就无法做引用、反馈、重新生成这些后续动作。
        * 因此这里补充 message 事件（不改动 token/done 的既有语义）。
+       *
+       * ⚠️ created_at 一并发给前端（docs/12 §方案 1，反馈 5）：
+       *    前端要显示「这条是三天前说的」，而在客户端用 Date.now()
+       *    打时间是**错的** —— 那是响应到达的时刻，不是消息落库的时刻，
+       *    两者在网络慢或请求排队时能差出好几秒。
+       *    消息时间必须以服务端为准，前端只负责渲染。
        */
       stream.write({
         type: 'message',
         role: 'user',
         message_id: result.userMessage.id,
         conversation_id: result.conversation.id,
+        created_at: result.userMessage.createdAt.toISOString(),
       });
       stream.write({
         type: 'message',
         role: 'assistant',
         message_id: result.assistantMessage.id,
         conversation_id: result.conversation.id,
+        created_at: result.assistantMessage.createdAt.toISOString(),
       });
       stream.write({
         type: 'meta',

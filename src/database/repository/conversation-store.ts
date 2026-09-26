@@ -48,8 +48,9 @@ function aliveConversationCondition() {
 /**
  * 新建会话。
  *
- * title 允许为空：标题通常在首轮对话后由服务层补上（§9 未规定生成时机，
- * 因此这里不擅自生成，只提供写入能力）。
+ * title 允许为空：调用方（ChatService）会在首轮对话时先写一个占位标题，
+ * 随后由后台的 conversation-title 服务用 LLM 覆盖成正式标题。
+ * 本层只提供写入能力，不决定标题内容 —— 生成策略属于 service 层。
  */
 export async function createConversation(
   input: { userId: string; title?: string | null; summary?: string | null },
@@ -164,21 +165,34 @@ export async function listConversations(
   return { items, total: totalRows[0]?.n ?? 0, limit, offset };
 }
 
-/** 更新会话标题或摘要（不改状态） */
+/**
+ * 更新会话标题或摘要（不改状态）。
+ *
+ * @param options.withUpdatedAt 是否推进 updated_at，缺省 true。
+ *
+ * ⚠️ 为什么要能关掉它：
+ *    「自动生成标题」是**后台**补写 —— 用户发完消息、响应已经返回之后才跑。
+ *    它若推进 updated_at，会把一条**旧会话**顶到列表最前面。
+ *    实测场景：用户在第一轮聊完就再没碰过这个会话，
+ *    第二天打开列表，标题生成任务迟到完成 → 那条旧会话跳到顶部。
+ *    标题是元数据，不是「有新消息」，不该影响排序。
+ *    用户手动改名（PATCH /conversations/:id）仍然要推进 —— 那是主动操作。
+ */
 export async function updateConversation(
   id: string,
   patch: { title?: string; summary?: string | null },
-  options: ExecutorOption = {}
+  options: ExecutorOption & { withUpdatedAt?: boolean } = {}
 ): Promise<Conversation | undefined> {
   const exec = options.executor ?? db;
+  const withUpdatedAt = options.withUpdatedAt ?? true;
 
   const rows = await exec
     .update(conversations)
     .set({
       ...(patch.title !== undefined ? { title: patch.title } : {}),
       ...(patch.summary !== undefined ? { summary: patch.summary } : {}),
-      // 与 touchConversation 同理：now() 在事务内是常量，推不动排序
-      updatedAt: sql`clock_timestamp()`,
+      // clock_timestamp 而非 now()：now() 在事务内是常量，推不动排序（见 touchConversation）
+      ...(withUpdatedAt ? { updatedAt: sql`clock_timestamp()` } : {}),
     })
     .where(and(eq(conversations.id, id), aliveConversationCondition()))
     .returning();

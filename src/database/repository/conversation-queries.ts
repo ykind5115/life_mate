@@ -53,3 +53,35 @@ export async function maxMessageSequence(
 
   return rows[0]?.maxSeq ?? 0;
 }
+
+/**
+ * 某会话的**第一条用户消息**。
+ *
+ * 用途：会话标题的占位文案与「是否还需要生成正式标题」的判据
+ * （docs/12 §方案 2）。占位标题是「首条用户消息截断」，
+ * 因此凡是需要重算它的地方都得拿到这条消息。
+ *
+ * ⚠️ 为什么必须从库里取，而不是拿当前标题反推：
+ *    当前标题可能是**正式标题**（已生成）或**用户改过的名字**，
+ *    对它再截断一次只会得到一个毫无意义的字符串，
+ *    然后拿它去和当前标题比较必然相等 → 生成器会误判「还需要生成」→
+ *    每次对话都重新生成标题并覆盖用户改的名字。
+ *
+ * 走 idx_messages_conversation_sequence 索引，代价可忽略。
+ * 返回 undefined 表示该会话还没有用户消息（正常路径下不会出现）。
+ */
+export async function findFirstUserMessage(
+  conversationId: string,
+  options: ExecutorOption = {}
+): Promise<Message | undefined> {
+  const exec = options.executor ?? db;
+
+  const rows = await exec
+    .select()
+    .from(messages)
+    .where(and(eq(messages.conversationId, conversationId), eq(messages.role, 'user')))
+    .orderBy(asc(messages.sequence))
+    .limit(1);
+
+  return rows[0];
+}

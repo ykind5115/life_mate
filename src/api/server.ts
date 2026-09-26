@@ -56,6 +56,23 @@ export interface BuildServerOptions {
   /** 覆盖抽取触发器（测试传一个不真跑的） */
   extractionTrigger?: ExtractionTrigger;
   /**
+   * 覆盖会话标题触发器（docs/12 §方案 2）。
+   *
+   * 三态与 retrieveMemories 一致：不传 = 缺省（进程单例）、
+   * 传 null = 显式关闭、传实例 = 覆盖。
+   *
+   * ⚠️ 与摘要触发器不同，标题**没有天然的省钱机制** ——
+   *    摘要要满 30 条才动手，标题首轮就会真的去生成。
+   *    因此测试若不关心标题，应当显式传 null，
+   *    免得每个用例都白跑一次生成（虽然注入的假 Provider 不花钱，
+   *    但会让测试多两条查询，也会在输出里刷出无关日志）。
+   *
+   * 类型里显式带上 undefined：`{ titleTrigger: cond ? undefined : null }`
+   * 是调用方最自然的写法，而「undefined = 走缺省」正是这里想要的语义
+   * （tsconfig 开了 exactOptionalPropertyTypes，不写就编译不过）。
+   */
+  titleTrigger?: ChatRouteDeps['titleTrigger'] | undefined;
+  /**
    * 覆盖记忆检索。
    *
    * 缺省接真实检索（向量 + 关键词 + 结构化三通道）。
@@ -192,6 +209,7 @@ export async function buildServer(options: BuildServerOptions = {}): Promise<Fas
         ...(options.extractionTrigger !== undefined
           ? { extractionTrigger: options.extractionTrigger }
           : {}),
+        ...(options.titleTrigger !== undefined ? { titleTrigger: options.titleTrigger } : {}),
         ...(options.retrieveMemories !== undefined
           ? { retrieveMemories: options.retrieveMemories }
           : {}),

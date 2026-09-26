@@ -42,6 +42,7 @@ import {
   touchConversation,
   type Message,
 } from '../database/repository/index.js';
+import { findFirstUserMessage } from '../database/repository/conversation-queries.js';
 import {
   buildChatContext,
   DEFAULT_RECENT_MESSAGE_LIMIT,
@@ -50,6 +51,8 @@ import {
 } from './context-builder.js';
 import type { ExtractionTrigger } from './extraction-trigger.js';
 import type { SummaryTrigger } from './summary-trigger.js';
+import type { TitleTrigger } from './title-trigger.js';
+import { buildPlaceholderTitle } from './conversation-title.js';
 import { isAutoExtractEnabled } from './settings-service.js';
 import { createMemoryTools } from '../memory/tools.js';
 
@@ -144,6 +147,13 @@ export interface ChatServiceDeps {
    */
   summaryTrigger?: SummaryTrigger;
   /**
+   * 标题触发器（docs/12 §方案 2）。
+   *
+   * 与摘要触发器同样三态：不传 = 不生成（测试与离线场景）、
+   * 传实例 = 用注入的（测试用假 LLM）、生产由路由层注入进程单例。
+   */
+  titleTrigger?: TitleTrigger;
+  /**
    * 逐 token 回调，透传给 Agent Loop。
    * 传了它就走流式（provider.stream）。
    */
@@ -202,7 +212,18 @@ export async function chat(
    */
   const existingConversationId = params.conversationId ?? null;
   const created = existingConversationId === null;
-  let title: string | null = null;
+
+  /**
+   * 新会话的**占位标题**（docs/12 §方案 2 的①）。
+   *
+   * 立刻用首条用户消息截断出来，纯字符串操作、零成本、无 LLM 调用 ——
+   * 目的是让会话列表在**任何时刻**都有东西可显示。
+   * 正式标题由后台的 TitleTrigger 稍后覆盖（见步骤⑥）。
+   *
+   * 只在新建时算：往已有会话追加消息不该改它的标题。
+   */
+  const placeholderTitle = created ? buildPlaceholderTitle(params.message) : null;
+  let title: string | null = placeholderTitle;
 
   if (existingConversationId) {
     /**
@@ -334,7 +355,20 @@ export async function chat(
   const saved = await db.transaction(async (tx) => {
     const conversationId =
       existingConversationId ??
-      (await createConversation({ userId: user.id }, { executor: tx })).id;
+      (
+        await createConversation(
+          {
+            userId: user.id,
+            /**
+             * 占位标题在这里落库（不是等后台生成）——
+             * 用户发完就切到列表页也该看得到它。
+             * placeholderTitle 非 null 时必然是新建的会话（见上面的赋值）。
+             */
+            title: placeholderTitle,
+          },
+          { executor: tx }
+        )
+      ).id;
 
     const userMessage = await appendMessage(
       { conversationId, role: 'user', content: params.message },
@@ -396,6 +430,30 @@ export async function chat(
    *    代价可接受：没生成就下次消息再触发（幂等由区间唯一索引保证）。
    */
   deps.summaryTrigger?.schedule(conversationId, assistantMessage.sequence);
+
+  /**
+   * 会话标题生成（docs/12 §方案 2 的②，解决反馈 4）。
+   *
+   * ⚠️ **每一轮都 schedule，而不是只在首轮**。
+   *    生成器自己判断「当前标题是否还是占位标题」：
+   *      · 已是正式标题 → 直接返回，不调 LLM（只多两条走索引的查询）
+   *      · 上次失败或材料不足 → 这一次会真的重试
+   *    只在首轮触发的话，第一次失败就再也没机会补了 ——
+   *    列表里会永远留着「早上好呀，你知道现在是什么时间吗…」这种标题。
+   *
+   * 用 placeholderTitle 而不是数据库里的 title 作为判据：
+   *   新建时两者相同；用户手动改名后 title 变了而 placeholderTitle 不变，
+   *   于是生成器会正确地跳过，不会覆盖用户起的名字。
+   *
+   * ⚠️ 触发器不存在时整个跳过 —— 连那次查询都不做。
+   *    否则关掉标题生成的场景（测试、离线跑）每轮白多两条查询。
+   */
+  if (deps.titleTrigger) {
+    const titleIfFresh = await resolvePlaceholderTitle(placeholderTitle, conversationId);
+    if (titleIfFresh !== null) {
+      deps.titleTrigger.schedule(conversationId, titleIfFresh);
+    }
+  }
 
   return {
     conversation: { id: conversationId, created, title },
