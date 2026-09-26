@@ -95,6 +95,14 @@ export interface ChatResult {
       historyCount: number;
       injectedMemoryCount: number;
       approxTokens: number;
+      /**
+       * 注入的「时间标记」条数（docs/12 §方案 1）。
+       *
+       * 观测价值：0 表示整段历史都在 1 小时内（或历史为空），
+       * 大于 0 说明模型看到了「中间断开过」——
+       * 排查「它怎么又分不清隔了多久」时，第一个要看的数就是它。
+       */
+      timeMarkerCount: number;
     };
   };
 }
@@ -144,6 +152,13 @@ export interface ChatServiceDeps {
   injectLimit?: number;
   /** 近期消息条数上限。缺省 20（docs/02 §23） */
   recentMessageLimit?: number;
+  /**
+   * 组装上下文时的「现在」，透传 Context Builder。
+   *
+   * 仅测试与实验用：真实路径不传，由 Context Builder 取当前时刻。
+   * 生产代码传固定值会让上下文里的「今天」永远停在那一刻。
+   */
+  now?: Date;
 }
 
 /**
@@ -218,7 +233,18 @@ export async function chat(
         limit: deps.recentMessageLimit ?? DEFAULT_RECENT_MESSAGE_LIMIT,
       }))
         .filter((m: Message) => CONTEXT_ROLES.has(m.role))
-        .map((m: Message) => ({ role: m.role as 'user' | 'assistant', content: m.content }))
+        .map((m: Message) => ({
+          role: m.role as 'user' | 'assistant',
+          content: m.content,
+          /*
+           * ⚠️ createdAt 必须带上，不能像早先那样只取 role/content。
+           *
+           * 早先的写法把时间丢在这里，模型看到的历史与刚刚发生的对话
+           * 长得一模一样 —— 于是用户隔了两天回来说话，模型仍当成接着聊。
+           * 实测（2026-09-26）：一个会话横跨 2 天 11 小时，模型毫无察觉。
+           */
+          createdAt: m.createdAt,
+        }))
     : [];
 
   /**
@@ -264,6 +290,9 @@ export async function chat(
     userMessage: params.message,
     retrieval,
     summaries,
+    // 时间与「现在」都取自同一处：users.timezone 是用户配置的独立列
+    timezone: user.timezone,
+    ...(deps.now !== undefined ? { now: deps.now } : {}),
     ...(deps.injectLimit !== undefined ? { injectLimit: deps.injectLimit } : {}),
   });
 
@@ -393,9 +422,42 @@ export async function chat(
         historyCount: context.meta.historyCount,
         injectedMemoryCount: context.meta.injectedMemoryCount,
         approxTokens: context.meta.approxTokens,
+        /**
+         * 时间标记条数：能看出这次历史被切成了几段。
+         * 0 表示整段历史都在 1 小时内（或历史为空）。
+         */
+        timeMarkerCount: context.meta.timeMarkerCount,
       },
     },
   };
+}
+
+// ============================================================
+// 内部
+// ============================================================
+
+/**
+ * 得到该会话的「占位标题」—— 即「这个会话还没起过正式名字时长什么样」。
+ *
+ * 标题生成器靠它做判据：当前标题 === 它 → 还需要生成；
+ * 否则说明已经有正式标题、或用户手动改过名 → 跳过。
+ *
+ * ⚠️ 已有会话时**不能拿当前标题反推**（对它再截断一次，比较必然相等 →
+ *    生成器会误判「还要生成」→ 每次对话都重新生成并覆盖用户改的名字）。
+ *    必须回到「首条用户消息」这个唯一事实来源重新算。
+ *    代价是一条走 idx_messages_conversation_sequence 的查询。
+ *
+ * @param placeholderTitle 新建会话时已经算好的占位标题；已有会话传 null
+ * @returns 占位标题；取不到首条用户消息时返回 null（调用方跳过生成）
+ */
+async function resolvePlaceholderTitle(
+  placeholderTitle: string | null,
+  conversationId: string
+): Promise<string | null> {
+  if (placeholderTitle !== null) return placeholderTitle;
+
+  const firstUserMessage = await findFirstUserMessage(conversationId);
+  return firstUserMessage ? buildPlaceholderTitle(firstUserMessage.content) : null;
 }
 
 // ============================================================

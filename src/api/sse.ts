@@ -19,8 +19,9 @@ import type { ServerResponse } from 'node:http';
  *
  * ⚠️ 文档只规定了 `token` 与 `done` 两种。这里多出四种，
  *    它们都服务于「一次流式响应里的失败与元信息」这个文档未展开的场景：
- *      · message  —— 落库后的消息 id（文档的 done 里没有 id，
- *                     前端拿不到 message_id 就无法做后续引用与反馈）
+ *      · message  —— 落库后的消息 id 与时间（文档的 done 里没有 id，
+ *                     前端拿不到 message_id 就无法做后续引用与反馈；
+ *                     时间用于在消息上显示「这条是三天前说的」）
  *      · progress —— 模型在调用工具时的中间说明（不是给用户的回答）
  *      · error    —— 流已经开始后发生的错误（此时改不了 HTTP 状态码）
  *      · meta     —— 用量与截断信息
@@ -29,7 +30,20 @@ import type { ServerResponse } from 'node:http';
 export type SseEvent =
   | { type: 'token'; content: string }
   | { type: 'progress'; turn: number; content: string }
-  | { type: 'message'; role: 'user' | 'assistant'; message_id: string; conversation_id: string }
+  | {
+      type: 'message';
+      role: 'user' | 'assistant';
+      message_id: string;
+      conversation_id: string;
+      /**
+       * 消息落库时间（ISO 字符串，序列化后）。
+       *
+       * ⚠️ 必须由服务端给出，不能让前端用 Date.now() 打时间：
+       *    那是「响应到达时刻」而不是「消息落库时刻」，
+       *    网络慢或请求排队时两者能差出好几秒。
+       */
+      created_at: string;
+    }
   | { type: 'meta'; data: Record<string, unknown> }
   | { type: 'error'; code: string; message: string }
   | { type: 'done' };
