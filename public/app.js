@@ -83,6 +83,55 @@ function relTime(iso) {
 }
 
 // ============================================================
+// 时间显示（docs/12 §方案 1）
+// ============================================================
+
+/**
+ * 消息上的绝对时间，如「09-24 08:51」。
+ *
+ * ⚠️ 用 getMonth/getDate 这类**本地时间**取值，不要 toISOString().slice()。
+ *    toISOString 转的是 UTC：本机 UTC+8，凌晨 0-8 点发的消息
+ *    会被显示成前一天 —— 用户看到「昨天 17:30」而实际是「今天 01:30」。
+ *    实测过同类问题（时间注入那边也必须用 users.timezone，理由相同）。
+ */
+function absTime(d) {
+  const p2 = (n) => String(n).padStart(2, '0');
+  return `${p2(d.getMonth() + 1)}-${p2(d.getDate())} ${p2(d.getHours())}:${p2(d.getMinutes())}`;
+}
+
+/** 同一天（按本地时间） */
+function sameLocalDay(a, b) {
+  return (
+    a.getFullYear() === b.getFullYear() &&
+    a.getMonth() === b.getMonth() &&
+    a.getDate() === b.getDate()
+  );
+}
+
+/**
+ * 日期分隔条上的文字：「今天」「昨天」「09-22 周二」。
+ *
+ * 为什么要有分隔条，而不只是在每条消息上标时间：
+ *   用户反馈 5 的原话是「我隔了两天再跟他讲话，她根本就分不清中间过了多长时间」——
+ *   他自己看聊天记录时也有同样的问题。逐条标时间不够醒目，
+ *   一个横贯的分隔条才能一眼看出「这里断开了一天」。
+ */
+function dayLabel(d) {
+  const now = new Date();
+  if (sameLocalDay(d, now)) return '今天';
+
+  const yesterday = new Date(now);
+  yesterday.setDate(now.getDate() - 1);
+  if (sameLocalDay(d, yesterday)) return '昨天';
+
+  const p2 = (n) => String(n).padStart(2, '0');
+  const week = ['周日', '周一', '周二', '周三', '周四', '周五', '周六'][d.getDay()];
+  const ymd = `${p2(d.getMonth() + 1)}-${p2(d.getDate())}`;
+  // 跨年才写年份：绝大多数的聊天记录都在同一年内
+  return d.getFullYear() === now.getFullYear() ? `${ymd} ${week}` : `${d.getFullYear()}-${ymd}`;
+}
+
+// ============================================================
 // 路由
 // ============================================================
 
@@ -224,10 +273,23 @@ async function openConversation(id) {
       );
     } else {
       box.replaceChildren();
+      /**
+       * 重置日期分隔状态：否则上一个会话最后一次渲染的日期
+       * 会压制这个会话第一条消息的分隔条。
+       * 用 epoch 而不是 null —— 「与任何真实日期都不同天」天然成立。
+       */
+      lastRenderedDay = new Date(0);
       for (const m of items) {
         // 只渲染 user / assistant；system 与 tool 是 Agent 内部协议，不该给用户看
         if (m.role !== 'user' && m.role !== 'assistant') continue;
-        addMessage(m.role, m.content, { skipScroll: true });
+        /**
+         * created_at 由 DTO 提供（conversations.ts 的 toMessageDto）。
+         * 历史消息自带时间，因此这里能直接把时间与分隔条一起渲染出来。
+         */
+        addMessage(m.role, m.content, {
+          skipScroll: true,
+          ...(m.created_at ? { createdAt: m.created_at } : {}),
+        });
       }
     }
 
@@ -242,6 +304,8 @@ async function openConversation(id) {
 function startNewChat() {
   conversationId = null;
   $('#chat-title').textContent = '对话';
+  // 与 openConversation 同理：不清的话上一个会话的日期会压制新会话的分隔条
+  lastRenderedDay = new Date(0);
   $('#messages').replaceChildren(
     el('div', { class: 'empty' }, [
       el('p', { text: '新会话。' }),
@@ -267,9 +331,73 @@ function addMessage(role, text, opts = {}) {
   const empty = $('#messages .empty');
   if (empty) empty.remove();
 
+  /**
+   * ⚠️ 顺序不可颠倒：必须**先**把 wrap 挂进 DOM，**再**调 stampMessage。
+   *
+   * stampMessage 内部会 `box.insertBefore(divider, wrap)`，
+   * 而 insertBefore 的参照节点**必须已经是 box 的子节点**。
+   *
+   * 🔴 2026-09-26 实测就是这个顺序写反了：打开任意一个历史会话，
+   *    第一条消息就出错，界面只显示「加载失败：…」，整个列表渲染不出来。
+   *    当时 399 个 Node 测试全绿 —— 因为测试跑不到浏览器 DOM。
+   *    现在由 public/app.dom.test.ts 守住，且它断言的是
+   *    「分隔条真的插进去了」而不只是「没抛错」：
+   *    stampMessage 里的防御性 return 会把顺序错误变成**静默不插分隔条**，
+   *    只断言「不抛错」的测试在故意写坏顺序后依然全绿（实测过）。
+   */
   $('#messages').appendChild(wrap);
+
+  /**
+   * 时间显示（docs/12 §方案 1，对应反馈 5）。
+   *
+   * createdAt 缺失时不显示，而不是显示「现在」——
+   * 把不知道的时间编造成此刻，比不显示更糟。
+   * stampMessage 内部会按需插入日期分隔条（在 wrap **之前**）。
+   */
+  if (opts.createdAt) stampMessage(wrap, opts.createdAt);
+
   if (!opts.skipScroll) scrollToBottom();
   return wrap;
+}
+
+/** 上一条已渲染消息的日期。用于判断是否需要插日期分隔条 */
+let lastRenderedDay = new Date(0);
+
+/**
+ * 把时间写到一条消息上，并在需要时于它**之前**插入日期分隔条。
+ *
+ * 两个调用来源：
+ *   · addMessage —— 渲染历史消息（时间现成）
+ *   · SSE 的 message 事件 —— 实时消息的时间要等落库后才有
+ *
+ * ⚠️ 实时消息那一侧，user 与 assistant 的 created_at 是**同一个值**
+ *    （同事务写入，now() 在事务内是常量）。于是 assistant 那条
+ *    必然与 user 同一天 → 分隔条只会插在用户消息前面，不会把
+ *    同一轮的一问一答劈成两半。这里不需要额外判断。
+ *
+ * ⚠️ 调用前 wrap **必须已经挂进 #messages**。
+ *    insertBefore 的参照节点必须是父节点的子节点，否则浏览器抛 NotFoundError。
+ *    这里显式判断一次而不是靠约定 —— 那次事故的代价是整页加载失败，
+ *    而多一个 if 的成本是零。
+ */
+function stampMessage(wrap, iso) {
+  const d = new Date(iso);
+  if (Number.isNaN(d.getTime())) return;
+
+  const metaLine = wrap.querySelector('.msg-meta');
+  if (metaLine) {
+    metaLine.textContent = absTime(d);
+    metaLine.title = d.toLocaleString('zh-CN');
+  }
+
+  // 已经有分隔条（或已有消息）时，同一天不重复插
+  const box = $('#messages');
+  if (wrap.parentNode !== box) return;
+
+  if (!sameLocalDay(d, lastRenderedDay)) {
+    lastRenderedDay = d;
+    box.insertBefore(el('div', { class: 'day-divider', text: dayLabel(d) }), wrap);
+  }
 }
 
 function scrollToBottom() {
@@ -283,7 +411,7 @@ async function sendMessage(text) {
   streaming = true;
   $('#btn-send').disabled = true;
 
-  addMessage('user', text);
+  const userMsg = addMessage('user', text);
   const reply = addMessage('assistant', '');
   const replyBody = reply.querySelector('.msg-body');
   const replyMeta = reply.querySelector('.msg-meta');
@@ -338,6 +466,11 @@ async function sendMessage(text) {
           scrollToBottom();
         } else if (ev.type === 'message') {
           if (ev.role === 'assistant') conversationId = ev.conversation_id;
+          /**
+           * 时间以服务端为准（见 chat.ts 的说明）：
+           * 用客户端时钟打时间是「响应到达时刻」，不是消息落库时刻。
+           */
+          stampMessage(ev.role === 'user' ? userMsg : reply, ev.created_at);
         } else if (ev.type === 'meta') {
           meta = ev.data;
         } else if (ev.type === 'error') {
@@ -373,12 +506,16 @@ async function sendMessage(text) {
   /**
    * 刷新会话列表。
    *
-   * 两个原因：
+   * 三个原因：
    *   ① 首轮对话会**新建**会话，不刷新的话它不在列表里 ——
    *      用户会以为「聊了半天怎么没记录」
    *   ② updated_at 变了，顺序应重排（最近聊的排最前）
+   *   ③ 标题是后台用 LLM 生成的，慢一两秒才落库 ——
+   *      只刷一次的话列表里会一直显示占位标题（首条消息截断）。
+   *      第二次刷新就能看到正式标题，这比让用户自己按 F5 好得多。
    */
   loadConversations();
+  setTimeout(loadConversations, 6000);
 }
 
 /** 让侧栏/输入框附近显示「已记住多少条」，给后台抽取一个可见的反馈 */
@@ -400,6 +537,8 @@ const STATUS_LABEL = {
   conflict: '待裁决',
   superseded: '已替代',
   archived: '已归档',
+  /** C39：用户明确否定的（「这条不对」）。与「已删除」是两件事 */
+  rejected: '已否定',
   deleted: '已删除',
 };
 
@@ -463,30 +602,68 @@ function memoryCard(m, extraTags = []) {
   meta.push(relTime(m.created_at));
 
   const actions = el('div', { class: 'head-actions' });
-  const delBtn = el('button', {
-    class: 'btn small danger',
-    text: '删除',
-    onclick: async () => {
-      if (!confirm('删除这条记忆？可以从「全部」视图里恢复。')) return;
-      try {
-        await api('DELETE', `/memories/${m.id}`);
-        loadMemories();
-        updateMemoryHint();
-      } catch (err) {
-        alert(`删除失败：${err.message}`);
-      }
-    },
-  });
-  actions.appendChild(delBtn);
+
+  /**
+   * 「这条不对」（docs/12 §方案 4 的②）。
+   *
+   * 只在当前有效的记忆上出现 —— 已否定/已删除的再点一次没有意义，
+   * 后端也会拒绝（409）。
+   *
+   * 与「删除」并排而不是替换它：两者表达的意图不同，
+   * 删除是「不想留着了」，否定是「这条是错的」。
+   * 用户会在不同场景下用不同那个。
+   */
+  if (m.status === 'active') {
+    actions.appendChild(
+      el('button', {
+        class: 'btn small',
+        text: '这条不对',
+        title: '否掉这条内容：立刻不再被想起，但记录保留在「全部」视图里',
+        onclick: async () => {
+          if (!confirm('标记这条为「不对」？\n\n它会立刻从所有回忆路径中排除，但记录仍保留（可在「全部」视图里撤回）。')) {
+            return;
+          }
+          try {
+            await api('POST', `/memories/${m.id}/reject`);
+            loadMemories();
+            updateMemoryHint();
+          } catch (err) {
+            alert(`操作失败：${err.message}`);
+          }
+        },
+      })
+    );
+  }
+
+  actions.appendChild(
+    el('button', {
+      class: 'btn small danger',
+      text: '删除',
+      onclick: async () => {
+        if (!confirm('删除这条记忆？可以从「全部」视图里恢复。')) return;
+        try {
+          await api('DELETE', `/memories/${m.id}`);
+          loadMemories();
+          updateMemoryHint();
+        } catch (err) {
+          alert(`删除失败：${err.message}`);
+        }
+      },
+    })
+  );
 
   return el('div', { class: 'card item' }, [
     el('div', { class: 'item-head' }, [...tags, ...(meta.length ? [el('span', { class: 'dim', text: meta.join(' · ') })] : [])]),
     el('div', { class: 'item-body', text: m.content }),
-    m.status === 'deleted'
+    /**
+     * 已删除与已否定都给「撤回」按钮 —— 两者的撤回是同一个动作
+     * （POST /:id/restore），后端已支持两种来源状态（C39）。
+     */
+    m.status === 'deleted' || m.status === 'rejected'
       ? el('div', { class: 'head-actions' }, [
           el('button', {
             class: 'btn small',
-            text: '恢复',
+            text: m.status === 'rejected' ? '撤回否定' : '恢复',
             onclick: async () => {
               try {
                 const r = await api('POST', `/memories/${m.id}/restore`);
@@ -831,6 +1008,11 @@ function bindEvents() {
   $('#btn-review').addEventListener('click', generateReview);
 }
 
+/** 启动时把两个渲染入口挂到 window，供无浏览器回归测试调用（见 app.dom.test.ts） */
+if (typeof window !== 'undefined') {
+  window.__lifemateTestHooks = { addMessage, openConversation };
+}
+
 // ============================================================
 // 启动
 // ============================================================
@@ -842,4 +1024,13 @@ updateMemoryHint();
 loadConversations();
 
 // 定期查服务状态：后端挂了应该能一眼看出来，而不是每次发消息才失败
-setInterval(checkHealth, 30000);
+const healthTimer = setInterval(checkHealth, 30000);
+/**
+ * ⚠️ unref 是给无浏览器回归测试用的（public/app.dom.test.ts）。
+ *    浏览器里定时器没有 unref，所以必须先判断存在性再调用。
+ *    不加这一句时，测试进程会被这个定时器永远挂住 ——
+ *    实测表现为 `pnpm test` 卡满超时，而不是报失败。
+ */
+if (healthTimer && typeof healthTimer.unref === 'function') {
+  healthTimer.unref();
+}

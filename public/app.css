@@ -235,6 +235,33 @@ html, body {
 
 .msg-meta { font-size: 11px; color: var(--text-faint); }
 
+/**
+ * 日期分隔条（docs/12 §方案 1，反馈 5）。
+ *
+ * 用横贯整行的一条线把「隔了两天」标出来 —— 逐条标时间不够醒目，
+ * 用户自己翻记录时同样需要一眼看出中间断开了多久。
+ *
+ * ⚠️ flex: 0 0 auto + width: 100%：消息列表是纵向 flex 容器，
+ *    不写 width 的话它会被压成内容宽度，分隔条就不是「横贯」了。
+ */
+.day-divider {
+  flex: 0 0 auto;
+  width: 100%;
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  margin: 6px 0;
+  font-size: 11px;
+  color: var(--text-faint);
+}
+.day-divider::before,
+.day-divider::after {
+  content: "";
+  flex: 1;
+  height: 1px;
+  background: var(--border);
+}
+
 /* 光标：流式输出时的视觉提示 */
 .cursor::after {
   content: "▍";
@@ -293,6 +320,11 @@ html, body {
 .tag.conflict { background: #4a2f2f; color: var(--red); }
 .tag.archived { background: #33322a; color: var(--yellow); }
 .tag.active { background: #26382f; color: var(--green); }
+/**
+ * 已否定（C39）。用中性偏冷的灰蓝，不用红色 ——
+ * 红色留给「冲突」（需要用户处理），而已否定是用户已经处理完的状态。
+ */
+.tag.rejected { background: #2c3038; color: var(--text-dim); }
 
 .month-head {
   font-weight: 600;
