@@ -37,10 +37,13 @@ after(async () => {
 class StubProvider implements LLMProvider {
   readonly providerName = 'stub';
   readonly defaultModel = 'stub-model';
+  /** 记录收到的输入，便于断言「设置真的影响了上下文组装」 */
+  readonly received: GenerateInput[] = [];
 
   constructor(private readonly answer = '好的。') {}
 
-  generate(_input: GenerateInput): Promise<LLMGenerateResult> {
+  generate(input: GenerateInput): Promise<LLMGenerateResult> {
+    this.received.push(input);
     return Promise.resolve({
       content: this.answer,
       toolCalls: [],
@@ -104,17 +107,21 @@ async function withSettings(
     app: FastifyInstance;
     extractionCalls: string[];
     resetSettings: () => Promise<void>;
+    provider: StubProvider;
   }) => Promise<void>
 ): Promise<void> {
   assertTestDatabase('settings-routes.test.ts / withSettings');
 
   const { trigger, calls } = recordingTrigger();
+  const provider = new StubProvider();
   const app = await buildServer({
     logLevel: 'silent',
-    provider: new StubProvider(),
+    provider,
     chatIdempotency: new IdempotencyStore(),
     extractionTrigger: trigger,
     retrieveMemories: null,
+    // 标题生成在测试里默认关掉（见 server.test.ts 的说明）
+    titleTrigger: null,
   });
 
   const user = await resolveTestUser('settings-routes.test.ts');
@@ -129,7 +136,7 @@ async function withSettings(
   await resetSettings();
 
   try {
-    await fn({ app, extractionCalls: calls, resetSettings });
+    await fn({ app, extractionCalls: calls, resetSettings, provider });
   } finally {
     await app.close();
     await resetSettings();
@@ -309,6 +316,43 @@ test('PATCH /settings 空 body 不报错，也不改动任何设置', async () =
 
     const get = await req(app, { method: 'GET', url: '/api/v1/settings' });
     assert.equal(get.json().data.preferences.display_name, '保留我');
+  });
+});
+
+// ============================================================
+// 时区真的进了上下文（docs/12 §方案 1）
+// ============================================================
+
+test('改时区之后，聊天上下文里的「当前时间」按新时区渲染', async () => {
+  /**
+   * ⚠️ 这条必须端到端验证，不能只断言「GET /settings 返回了新时区」。
+   *    后者只证明值存进了库，不证明它**被用上了** ——
+   *    时间注入的时区参数完全可能一直是缺省常量，
+   *    而设置页显示得好好的（典型的假接线）。
+   *
+   * 断言方式：同一时刻用两个相差 8 小时以上的时区各聊一次，
+   * 上下文里的「当前时间」必须不同。
+   */
+  await withSettings(async ({ app, provider }) => {
+    await req(app, { method: 'PATCH', url: '/api/v1/settings', payload: { timezone: 'UTC' } });
+    await req(app, { method: 'POST', url: '/api/v1/chat', payload: { message: '现在几点' } });
+    const utcLine = provider.received.at(-1)!.messages[0]!.content;
+
+    await req(app, {
+      method: 'PATCH',
+      url: '/api/v1/settings',
+      payload: { timezone: 'Asia/Shanghai' },
+    });
+    await req(app, { method: 'POST', url: '/api/v1/chat', payload: { message: '现在几点' } });
+    const shLine = provider.received.at(-1)!.messages[0]!.content;
+
+    const extract = (text: string): string => /当前时间：([^\n。]+)/.exec(text)?.[1] ?? '';
+    const utcTime = extract(utcLine);
+    const shTime = extract(shLine);
+
+    assert.ok(utcTime.length > 0, '系统提示里必须有「当前时间」');
+    assert.ok(shTime.length > 0);
+    assert.notEqual(utcTime, shTime, '时区改了，上下文里的时间必须跟着改 —— 否则设置是假的');
   });
 });
 
