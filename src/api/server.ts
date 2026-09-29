@@ -29,6 +29,7 @@ import type { ExtractionTrigger } from '../conversation/extraction-trigger.js';
 import { HttpError, internalError, ok, validationError } from './errors.js';
 import { IdempotencyConflictError } from './idempotency.js';
 import { toLogError } from '../shared/error-info.js';
+import { initializeAppLogger } from '../shared/app-logger.js';
 import { registerChatRoutes, type ChatRouteDeps } from './routes/chat.js';
 import { registerConversationRoutes } from './routes/conversations.js';
 import { registerMemoryRoutes } from './routes/memories.js';
@@ -118,8 +119,16 @@ export async function buildServer(options: BuildServerOptions = {}): Promise<Fas
   });
 
   // ---------- 统一响应头 ----------
-  app.addHook('onSend', async (request, reply, payload) => {
-    // 把 request id 回给客户端，便于用户报错时引用（docs/04 §42）
+  /**
+   * 绑定进程级日志器（见 shared/app-logger.ts）。
+   *
+   * 放在这里而不是 main.ts：测试用 buildServer() 组装实例，
+   * 而多个用例各有自己的实例 —— 放在这里能让每个用例各自绑上自己的
+   * （最后一个生效），而不是共用 main.ts 里那一个。
+   */
+  initializeAppLogger(app.log);
+
+  app.addHook('onSend', async (request, reply, payload) => {    // 把 request id 回给客户端，便于用户报错时引用（docs/04 §42）
     reply.header('X-Request-Id', request.id);
     // 本项目保存私密数据，禁止被任何中间层或爬虫缓存
     reply.header('Cache-Control', 'no-store');

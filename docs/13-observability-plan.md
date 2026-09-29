@@ -2,7 +2,7 @@
 
 **日期：** 2026-09-29
 **来源：** `docs/11` 的一次幻觉报告 → `docs/12` §5.7 的遗留项
-**状态：** 🔶 **未完成** —— 主体已实现，还有 4 项待做（见 §1 进度表）
+**状态：** ✅ **本轮已完成** —— 9 项全部做完，验证见 §1
 
 ---
 
@@ -85,27 +85,49 @@
 
 ────────────────────────────────────────────────────────
 
-⑥ 【P0】真实跑一轮，验证轨迹真的落库          ⬜ 未做   ← 下次从这里开始
-   这是本次交付最大的缺口：以上全部只经过 typecheck + 408 测试 + 探针，
-   但**没有真发过一条消息、没有查过库**。
-   步骤见 §6.1（含具体 SQL）
+⑥ 真实跑一轮，验证轨迹真的落库                  ✅ 完成
+   两条路都验过：
+     · 测试库（可重复、零残留、不花钱）：新增 src/api/trace-routes.test.ts
+       3 个用例 —— 轨迹落库 / 不含正文 / 白名单外的键被拒
+     · 开发库真实调用：发一条【可观测性自检】消息，psql 查回来核对七项全齐，
+       然后用 DELETE /conversations/:id 清掉（含之前探针留下的 7 条垃圾会话）
+   实测轨迹（deepseek-flash，真实一轮）：
+     retrieval: 向量 38 命中 → 融合 38 → 注入 8，embedding 79ms / 总 115ms
+     injectedMemories: 8 条 id + type + score（0.435 ~ 0.499）
+     timingsMs: agentTotal 1136 / retrieval 116
+     promptVersion v2, usage input 1388 / output 101 / reasoning 60
+   并把被注入的记忆 id 与记忆正文对照过：8 条全部与「工作/招聘」话题相关
 
-⑦ 【P1】5 处后台任务补 logger 注入            ⬜ 未做
-   仍用 console.*，丢了 request_id。见 §6.2
+⑦ 5 处后台任务补 logger                       ✅ 完成
+   新增 src/shared/app-logger.ts：启动时绑定一次，后台任务共用。
+   这些任务是 fire-and-forget，不在请求上下文里，拿不到 request.log ——
+   此前它们的日志**没有任何关联键**。
+   已改为字段化结构化日志（可按键筛选，而不是人眼扫中文句子）
 
-⑧ 【P2】提示词补一条约束                      ⬜ 未做
-   「跨对话的具体事实用问句而不是陈述句」。见 §8③ 与 §6.3
+⑧ 提示词补一条约束                            ✅ 完成
+   「提到以前的事时用问句，不要当陈述句说」+「对方这次没提过的事，
+     不要当成已经说好的前提」，并直接写进那次幻觉的具体形状。
+   加了 2 条测试守着（prompts.test.ts 现在 19 条）
 
-⑨ 【P3】同步设计文档                          ⬜ 未做
-   docs/03 §10.5 白名单按新结构更新；§16.3 指向实现位置
+⑨ 同步设计文档                                ✅ 完成
+   docs/03 §10.5 白名单按新结构重写，并指向实现位置；
+   §29.1 补上日志脱敏的实现位置与那次实测事故的记录
 ```
 
 **当前验证状态（已跑过、可复现）：**
 
 ```text
 pnpm typecheck      → 0 错误
-pnpm test           → 408 通过 / 0 失败
+pnpm test           → 413 通过 / 0 失败（新增 3 条轨迹用例 + 2 条提示词用例）
 pnpm probe:log-leak → 6 项检查全绿
+```
+
+**本轮完成后仍未覆盖的**（转成下一轮候选，不留在本文件当尾巴）：
+
+```text
+· 用一段时间收集幻觉的真实频率 —— 这是决定「要不要做过滤模块」的唯一依据
+· agentRunId 没进轨迹（runAgent 内部生成，没往上传）
+· 单次 LLM 调用耗时没单独记录（只有 agentTotal 与 retrieval）
 ```
 
 ---
@@ -125,7 +147,7 @@ pnpm probe:log-leak → 6 项检查全绿
 `iterations=2` 说明那一轮**调了工具** —— 而工具调用的名字、参数、返回
 一个都没留下。也就是说：**故障恰好发生在唯一没有记录的那一步上。**
 
-于是我写重放脚本跑了 16 次（见 §6.1 与 §7 的工具），一次都没复现，
+于是我写重放脚本跑了 16 次（见 §1 的 ⑥ 与 §7 的工具），一次都没复现，
 只能得出「这是一次低概率采样事故」的结论 —— 而**无法回答**
 「它当时查了什么、拿到什么、是哪一版提示词」。
 
@@ -293,49 +315,61 @@ toLogError(err)   只输出 5 个安全字段：
 
 ---
 
-## 6. 未完成（下次从这里继续）
+## 6. 过程中的发现与教训（留档）
 
-### 6.1 🔴 还没有用真实数据验证轨迹真的落库了
+### 6.1 🔴 顺带发现：日志**正在**泄露用户正文
+
+见 §5.4。这里只记「怎么发现的」，因为方法比结论更有复用价值：
 
 ```text
-现状：typecheck 过、408 测试过、泄漏探针过 —— 但**还没有真发一条消息**，
-      也没有查库确认 messages.metadata 里出现了 agent 轨迹。
+做法：不靠读代码猜，而是**用真实 logger 打一次真实的数据库错误**，
+      把 stdout 抓下来看里面有什么。
+      造错误的方式：往 uuid 列塞一个非 uuid 的字符串 ——
+      这样错误对象上必然带 parameters，而 parameters 里就是被写入的值。
 
-这是本次交付最大的缺口，必须第一步做掉：
-
-  1. 起服务（pnpm dev），在界面上随手发一条消息
-  2. psql 查那条 assistant 消息的 metadata：
-       SELECT metadata FROM messages WHERE role='assistant' ORDER BY created_at DESC LIMIT 1;
-  3. 确认出现 agent.{promptVersion, model, retrieval, injectedMemories, toolCalls, timingsMs}
-  4. 顺便确认：metadata 里**没有**任何正文（拿消息 content 去 LIKE 一遍）
+结果：三处同时泄露（错误消息里、stack 里、params 数组本身）。
 ```
 
-### 6.2 还有几处日志没接上注入的 logger
+教训：**「我以为已经防住了」和「实际防住了」是两件事。**
+代码里 5 处 `describeError` 的注释都写着「不打印整个 error 对象」——
+意图明确，但实现只取 `err.message`，而 Drizzle 恰恰把参数值拼进了 message。
+所以那 5 份副本都没有真正挡住正文。
+
+### 6.2 测试断言的假失败与假成功
+
+两处都踩到了，值得记下来：
 
 ```text
-已接：chat-service（检索失败、轨迹校验失败）
-未接（仍用 console.*，因此丢了 request_id）：
-  · conversation/extraction-trigger.ts
-  · conversation/summary-trigger.ts
-  · conversation/title-trigger.ts
-  · memory/retriever.ts
-  · conversation/settings-service.ts
+假失败：probe-log-leak 里断言 SQL 文本存在，写成 /insert into "messages"/，
+        但日志是 JSON，引号被转义成 \" —— 文本明明在，断言错了。
+        教训：断言日志内容时要考虑序列化后的形态。
 
-这几个是 fire-and-forget 的后台任务，本身不在请求上下文里，
-接 logger 需要把 Fastify logger 传进触发器 —— 属于改动面更大的事，
-因此留到下一步。当前它们的日志本身已脱敏（共享 describeError），
-只是缺少 request_id 关联。
+假成功（更危险）：写 DOM 回归测试时，「不抛错」的断言在故意写坏顺序后
+        依然全绿 —— 因为我加了防御性 return，错误变成了静默失败。
+        教训：断言要落在**期望的结果**上，不能落在「没有异常」上。
+        验证方法是**故意把 bug 放回去，看测试是否变红**。
 ```
 
-### 6.3 其他已知缺口（不阻塞，但记下来）
+### 6.3 工具层面的坑
 
 ```text
+· Windows PowerShell 5.1 的 `>` 重定向与 Set-Content 会破坏 UTF-8：
+    · git diff 的补丁经 `>` 落盘后 git apply 报 "No valid patches in input"
+    · Set-Content 往 .md 写会加 BOM
+  两次都改用 Node 处理字节流解决。AGENTS.md §4.2.1 早有记录，仍然踩了。
+
+· `git rebase -i` 的 todo 清单**必须覆盖范围内的每一个提交**：
+  只列要改的那几个，其余会被**直接丢掉**（本次丢了 4 个提交，
+  其中一个含 6 个新文件）。从 reflog 全部找回，但过程本可避免。
+```
+
+### 6.4 仍未覆盖的（转下一轮候选）
+
+```text
+· 用一段时间收集幻觉的真实频率 —— 这是决定「要不要做过滤模块」的唯一依据
 · agentRunId 没进轨迹：runAgent 内部生成，没往上传。
-  当前靠 requestId 关联已够用；要看单次 Agent 执行内部的 LLM/工具调用链时再补。
-· docs/03 §10.5 的白名单尚未按新结构更新（见 §1 的 P3）
-· docs/03 §16.3 的「Zod 校验 JSONB」此前一直是空话，现在有实现了，
-  但文档里没有指向实现的位置
-· LLM 单次调用耗时没有单独记录（timingsMs 里只有 agentTotal 与 retrieval）
+  当前靠 requestId 关联已够用；要看单次 Agent 执行内部的调用链时再补
+· 单次 LLM 调用耗时没有单独记录（timingsMs 里只有 agentTotal 与 retrieval）
 ```
 
 ---
@@ -394,5 +428,13 @@ pnpm replay:hallucination N  重放 09-29 那一轮 ×N（会真调 LLM，只读
    「用户没说过」并非不在场证明 —— 模型完全可能从别处合理推断。
 ```
 
-**下一步的顺序**：先做 §6.1（验证落库）→ §6.2（补 logger）→ 再回提示词那条约束。
-用一段时间收集真实频率数据之后，才谈得上要不要做过滤。
+**下一步的顺序**（本轮已把前三项做完，见 §1 的 ⑥⑦⑧）：
+
+```text
+✅ ① 可观测性补上（轨迹 + 日志脱敏）—— 本轮
+✅ ② 提示词补上「用问句」那条约束 —— 本轮 §1 的 ⑧
+⬜ ③ 用一段时间收集幻觉的真实频率 —— **现在只差这一步**
+     这是决定「要不要做过滤模块」的唯一依据。
+     有了 §1 的轨迹之后，判断「这次是不是同一个原因」也变便宜了：
+     直接查 messages.metadata 里当轮的 injectedMemories 与 toolCalls。
+```

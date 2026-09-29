@@ -21,6 +21,7 @@
 import { generateConversationTitle, type GenerateTitleResult } from './conversation-title.js';
 import type { LLMProvider } from '../llm/provider.js';
 import { describeError } from '../shared/error-info.js';
+import { logError, logInfo } from '../shared/app-logger.js';
 
 export interface TitleTriggerOptions {
   /**
@@ -116,7 +117,8 @@ export class TitleTrigger {
       if (this.options.onError) {
         this.options.onError({ conversationId, error: err });
       } else {
-        console.error(`[title] 会话 ${conversationId} 标题生成失败：${describeError(err)}`);
+        // 后台任务用进程级日志器（见 shared/app-logger.ts）
+        logError({ conversationId, reason: describeError(err) }, '标题生成失败');
       }
     } finally {
       entry.running = false;
@@ -155,7 +157,7 @@ export function getDefaultTitleTrigger(
     ...options,
     onResult: ({ conversationId }) => {
       // 只记「生成了」，不记标题正文（§29.1）
-      console.info(`[title] 会话 ${conversationId} 已生成标题`);
+      logInfo({ conversationId }, '会话标题已生成');
     },
   });
 

@@ -20,6 +20,7 @@
 import { maybeSummarize, type SummarizeResult } from './summarizer.js';
 import type { LLMProvider } from '../llm/provider.js';
 import { describeError } from '../shared/error-info.js';
+import { logError, logInfo } from '../shared/app-logger.js';
 
 export interface SummaryTriggerOptions {
   /** 覆盖默认阈值（§12.3 规定 30） */
@@ -129,7 +130,8 @@ export class SummaryTrigger {
       if (this.options.onError) {
         this.options.onError({ conversationId, error: err });
       } else {
-        console.error(`[summary] 会话 ${conversationId} 摘要失败：${describeError(err)}`);
+        // 后台任务用进程级日志器（见 shared/app-logger.ts）
+        logError({ conversationId, reason: describeError(err) }, '摘要生成失败');
       }
     } finally {
       entry.running = false;
@@ -170,9 +172,13 @@ export function getDefaultSummaryTrigger(
     ...options,
     onResult: ({ conversationId, result }) => {
       // 只记区间，不记摘要正文（§29.1）
-      console.info(
-        `[summary] 会话 ${conversationId} 已生成摘要：` +
-          `覆盖 ${result.covered?.from}-${result.covered?.to}`
+      logInfo(
+        {
+          conversationId,
+          coveredFrom: result.covered?.from,
+          coveredTo: result.covered?.to,
+        },
+        '会话摘要已生成'
       );
     },
   });

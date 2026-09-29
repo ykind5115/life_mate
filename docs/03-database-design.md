@@ -732,14 +732,67 @@ RETURNING *;
 
 ```jsonc
 {
-  "model": "xxx",
-  "provider": "openai-compatible",
-  "token_usage": { "input": 123, "output": 456 },
-  "latency_ms": 1800,
-  "finish_reason": "stop",
-  "tool_calls": [],
-  "loop_truncated": false,
-  "extractor_version": "v1"
+  "agent": {
+    // ---- 本次执行是谁、用什么跑的 ----
+    "requestId": "req_01J...",          // 与访问日志、X-Request-Id 对应（§04 §42）
+    "agentRunId": "run_...",            // Agent 执行标识（§04 §43 的概念）
+    "promptVersion": "v2",              // 系统提示词版本
+    "provider": "deepseek",
+    "model": "deepseek-flash",
+    "finishReason": "stop",
+    "truncatedBy": "max_iterations",    // 可选：max_iterations | max_tool_calls | timeout
+
+    // ---- 成本与耗时 ----
+    "iterations": 2,
+    "toolCallsExecuted": 1,
+    "usage": { "inputTokens": 1388, "outputTokens": 101, "reasoningTokens": 60 },
+    "timingsMs": { "agentTotal": 1136, "retrieval": 116 },
+
+    // ---- 上下文规模（全是计数，不含内容）----
+    "context": {
+      "historyCount": 0,
+      "injectedMemoryCount": 8,
+      "droppedMemoryCount": 0,
+      "approxTokens": 1449,
+      "timeMarkerCount": 0,
+      "summaryCount": 0,
+      "timezone": "Asia/Shanghai"
+    },
+
+    // ---- 检索过程 ----
+    "retrieval": {
+      "performed": true,
+      "skippedReason": "failed",        // 可选：not_implemented | disabled | failed
+      "channelHits": { "vector": 38, "keyword": 0, "slot": 0 },
+      "fusedCount": 38,
+      "returned": 8,
+      "degradations": ["embedding_unavailable"],
+      "timingsMs": { "embedding": 79, "channels": 34, "rerank": 2, "total": 115 }
+    },
+
+    // ---- 注入了哪几条记忆：**只存指针，不存正文** ----
+    "injectedMemories": [
+      { "id": "uuid", "type": "fact", "score": 0.499 }
+    ],
+
+    // ---- 调了哪些工具：**参数只存键名，不存值** ----
+    "toolCalls": [
+      {
+        "name": "search_memory",
+        "turn": 1,
+        "argumentKeys": ["query"],
+        "resultChars": 3120,
+        "truncated": false,
+        "ms": 42,
+        "error": "工具执行超时（>10000ms）"
+      }
+    ],
+
+    "answerChars": 73
+  },
+
+  // ---- 抽取流水线在关联消息上的标注 ----
+  "extractorVersion": "v1"
 }
 ```
 
@@ -752,6 +805,33 @@ RETURNING *;
          metadata 同样受 §21 的日志脱敏约束，
          若 tool_calls 中含用户正文，必须在落库前裁剪。
 ```
+
+**以上两条「必须」的实现位置（2026-09-29 补）：**
+
+```text
+白名单与 Zod 校验   src/database/schema/message-metadata.ts
+                    · messageMetadataSchema 用 .strict()：多一个键就报错
+                      （不是静默丢弃 —— 那会让「我写了怎么查不到」变成新谜题）
+                    · 校验点在 appendMessage 内部，即**写入处**，
+                      不信任何调用方
+                    · 校验失败时**放弃轨迹但不让对话失败**：
+                      一轮对话已花掉真实 token，不能因为记录观测数据而丢掉它
+
+工具调用怎么采集     src/conversation/trace-collector.ts
+                    · 在工具边界包一层 execute，**不改 Agent Loop**
+                      （Loop 的事件是 SSE progress 的来源，为观测改它代价不对等）
+                    · summarizeToolArguments() 把参数裁剪成「只有键名」
+
+为什么只存指针      §16.2 禁止「任何级别的敏感正文副本」进入 JSONB。
+                    工具参数里最常见的就是用户原话
+                    （search_memory({ query: "…" })），因此值一律丢弃。
+                    要看正文时 JOIN 回 messages / memories —— 正文本来就在那儿。
+```
+
+> ⚠️ **此前这套约束一直没有实现**（`appendMessage` 直接接收
+> `Record<string, unknown>`，任何结构都能写进去，包括整段对话正文）。
+> 2026-09-29 排查一次幻觉时发现「故障恰好发生在唯一没有记录的那一步」，
+> 才把它补上。过程见 `docs/13-observability-plan.md`。
 
 ## 10.6 与抽取流水线的关系
 
@@ -2906,6 +2986,49 @@ latency
 【必须】 使用结构化日志 + 白名单，而不是黑名单过滤。
          永不记录的字段：message.content、memory.content、relationship.name
          开发环境同样默认脱敏（避免样例数据泄露到日志文件）。
+```
+
+**实现位置与实测教训（2026-09-29 补）：**
+
+```text
+src/shared/error-info.ts    toLogError() / describeError()
+  · 只输出 5 个安全字段：errType / message / code / constraint / stack
+  · 并把**命中在文本里的参数值**替换成 [已脱敏]
+
+🔴 为什么需要它 —— 这是一次实测事故，不是假想：
+   `log.error({ err })` 会把数据库错误的**参数值**打进日志：
+
+     {"err":{"message":"Failed query: insert into \"messages\" …
+                       params: 用户的私密对话内容-应绝不出现在日志里,user,x,1",
+             "stack":"…params: 用户的私密对话内容…",
+             "params":["用户的私密对话内容-应绝不出现在日志里","user","x",1]}}
+
+   三处同时泄露（消息里、stack 里、params 数组本身）。
+   而泄露点是通用错误处理器 —— 任何一次 5xx 都可能把用户正文写进日志文件。
+   pino 的默认 err 序列化器会把 enumerable 属性（含 params）原样带上，
+   连 cause 链一起；那是为通用场景设计的，不适合存私密数据的系统。
+
+保留与丢弃的分界：
+  保留 SQL 语句文本（只有表名列名与 $1 占位符，**没有值**，排查最有用）、
+       约束名、postgres 错误码 —— 都是 schema 层面的信息
+  丢弃 params / parameters / values / detail / where —— 那些就是值
+
+两个踩出来的细节：
+  · 错误类名要用 `constructor.name`，不能用 `err.name`
+    （Drizzle 的 DrizzleQueryError 把 name 设成了 'Error'）
+  · 日志键名不能用 `type` 或 `name` —— pino 的 err 序列化器会覆盖它们
+    （实测把自定义的 type 渲染成 "Object"），因此用 `errType`
+
+回归防线：`pnpm probe:log-leak`（6 项检查）。
+它会在有人「为了调试」改回 `{ err }` 时变红。
+```
+
+```text
+后台任务的日志       src/shared/app-logger.ts
+  抽取/摘要/标题触发器、检索、设置解析都是 fire-and-forget，
+  **不在请求上下文里**，拿不到 request.log，于是它们的日志此前
+  没有任何关联键。做法是启动时 initializeAppLogger(app.log) 绑定一次，
+  各处用 logInfo/logWarn/logError。未绑定时静默跳过（脚本不初始化它）。
 ```
 
 ## 29.2 出网数据

@@ -34,6 +34,7 @@ import { getDefaultTitleTrigger, type TitleTrigger } from '../../conversation/ti
 import { ok } from '../errors.js';
 import { env } from '../../shared/env.js';
 import { toLogError } from '../../shared/error-info.js';
+import { logWarn } from '../../shared/app-logger.js';
 import { chatRequestSchema, toChatParams } from '../schemas.js';
 import { fingerprintChat, IdempotencyStore } from '../idempotency.js';
 import { parseIdempotencyKey, SseStream } from '../sse.js';
@@ -125,13 +126,20 @@ async function defaultRetrieve(params: {
     /**
      * 只记录降级类型与耗时，**不记录查询词与记忆正文**（docs/03 §29.1）。
      * 降级必须可见：否则「Agent 今天怎么想不起我了」永远查不出原因。
+     *
+     * 用进程级日志器：本函数没有 request 对象，拿不到 request.log，
+     * 此前用 console 导致这条日志**没有任何关联键**（见 shared/app-logger.ts）。
+     * 检索诊断本身已随消息落库（见上面的 lastRetrievalDiagnostics），
+     * 这里的日志用于「检索出问题时立刻能看见」。
      */
-    console.info(
-      `[retrieval] 降级：${result.diagnostics.degradations.join(',')} ` +
-        `命中 向量${result.diagnostics.channelHits.vector}/` +
-        `关键词${result.diagnostics.channelHits.keyword}/` +
-        `槽位${result.diagnostics.channelHits.slot}，` +
-        `返回 ${result.diagnostics.returned} 条，耗时 ${result.diagnostics.timings.total}ms`
+    logWarn(
+      {
+        degradations: [...result.diagnostics.degradations],
+        channelHits: result.diagnostics.channelHits,
+        returned: result.diagnostics.returned,
+        totalMs: result.diagnostics.timings.total,
+      },
+      '记忆检索降级'
     );
   }
 

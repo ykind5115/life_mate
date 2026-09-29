@@ -31,6 +31,7 @@ import {
 } from '../database/repository/retrieval-queries.js';
 import type { Memory } from '../database/schema/memories.js';
 import { describeError } from '../shared/error-info.js';
+import { logError, logWarn } from '../shared/app-logger.js';
 import {
   CHANNEL_LIMIT,
   FUSION_LIMIT,
@@ -133,8 +134,9 @@ export async function retrieveMemories(
      * 降级而不是失败。记录原因，让「为什么这次没想起我」可排查 ——
      * 静默返回少量结果会让这类问题永远查不出来。
      */
-    console.warn(
-      `[retrieval] embedding 不可用，跳过向量通道：${describeError(err)}`
+    logWarn(
+      { reason: describeError(err) },
+      'embedding 不可用，跳过向量通道'
     );
     diagnostics.degradations.push('embedding_unavailable');
   }
@@ -182,7 +184,7 @@ export async function retrieveMemories(
     await Promise.all(tasks);
   } catch (err) {
     // 数据库失败：本次检索无结果，但聊天继续（调用方会降级为无记忆上下文）
-    console.error(`[retrieval] 通道查询失败：${describeError(err)}`);
+    logError({ reason: describeError(err) }, '检索通道查询失败');
     diagnostics.degradations.push('database_error');
     diagnostics.timings.channels = Date.now() - channelStart;
     diagnostics.timings.total = Date.now() - startedAt;
@@ -246,7 +248,7 @@ export async function retrieveMemories(
       for (const [id, score] of filled) vectorScores.set(id, score);
     } catch (err) {
       // 回填失败只是让这些候选的向量项为 0，不影响其余候选
-      console.warn(`[retrieval] 向量分回填失败：${describeError(err)}`);
+      logWarn({ reason: describeError(err) }, '向量分回填失败');
     }
   }
 

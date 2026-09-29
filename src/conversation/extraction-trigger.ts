@@ -25,6 +25,7 @@ import { db } from '../database/client.js';
 import { messages } from '../database/schema/messages.js';
 import { runExtraction, type ExtractionSummary } from '../memory/extraction-pipeline.js';
 import { describeError } from '../shared/error-info.js';
+import { logError, logInfo } from '../shared/app-logger.js';
 
 export interface ExtractionTriggerOptions {
   /**
@@ -172,8 +173,14 @@ export class ExtractionTrigger {
           if (this.options.onError) {
             this.options.onError({ conversationId, error: err });
           } else {
-            console.error(
-              `[extraction] 会话 ${conversationId} 抽取失败：${describeError(err)}`
+            /**
+             * 用进程级日志器而不是 console：后台任务不在请求上下文里，
+             * 拿不到 request.log，于是它的日志此前**没有任何关联键**。
+             * 见 shared/app-logger.ts 的说明。
+             */
+            logError(
+              { conversationId, reason: describeError(err) },
+              '抽取失败'
             );
           }
         }
@@ -215,15 +222,22 @@ export function getDefaultExtractionTrigger(): ExtractionTrigger {
        * 只记录计数与诊断指标，**不记录任何记忆正文或消息内容**（§29.1）。
        * 槽位命中率下降意味着结构化抽取在退化，被丢弃条目增多意味着
        * 模型输出偏离契约 —— 两者都该被看见。
+       *
+       * 字段化而不是拼字符串：这样能按 outcomes.conflict > 0 之类的条件
+       * 直接筛日志，而拼好的中文句子只能靠人眼扫。
        */
-      console.info(
-        `[extraction] 会话 ${conversationId} 完成：` +
-          `范围 ${summary.coveredRange?.from}-${summary.coveredRange?.to}，` +
-          `新增 ${summary.outcomes.created}、合并 ${summary.outcomes.merged}、` +
-          `替代 ${summary.outcomes.superseded}、冲突 ${summary.outcomes.conflict}，` +
-          `槽位命中 ${summary.diagnostics.slotCoverage.withSlot}/${summary.diagnostics.slotCoverage.total}，` +
-          `丢弃 ${summary.diagnostics.dropped.length}、降级 ${summary.diagnostics.degradations.length}，` +
-          `向量 成功${summary.embeddings.succeeded}/失败${summary.embeddings.failed}`
+      logInfo(
+        {
+          conversationId,
+          coveredFrom: summary.coveredRange?.from,
+          coveredTo: summary.coveredRange?.to,
+          outcomes: summary.outcomes,
+          slotCoverage: summary.diagnostics.slotCoverage,
+          droppedCount: summary.diagnostics.dropped.length,
+          degradationCount: summary.diagnostics.degradations.length,
+          embeddings: summary.embeddings,
+        },
+        '记忆抽取完成'
       );
     },
   });

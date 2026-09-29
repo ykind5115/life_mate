@@ -18,6 +18,7 @@ import { eq } from 'drizzle-orm';
 import { db } from '../database/client.js';
 import { users, type User } from '../database/schema/users.js';
 import type { ExecutorOption } from '../database/repository/types.js';
+import { logWarn } from '../shared/app-logger.js';
 
 /**
  * users.settings 的白名单（docs/03 §8.4）。
@@ -66,8 +67,9 @@ export function resolveSettings(user: Pick<User, 'settings'>): UserSettings {
   const parsed = userSettingsSchema.safeParse(user.settings ?? {});
   if (!parsed.success) {
     // 只记录问题条数，不打印内容（settings 可能有 display_name 等个人信息）
-    console.warn(
-      `[settings] users.settings 中存在非法内容（${parsed.error.issues.length} 处），已忽略非法部分`
+    logWarn(
+      { issueCount: parsed.error.issues.length },
+      'users.settings 中存在非法内容，已忽略非法部分'
     );
     return {};
   }
