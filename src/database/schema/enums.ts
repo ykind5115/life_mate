@@ -194,6 +194,17 @@ export type EventCategory = (typeof EVENT_CATEGORIES)[number];
 export const EVENT_SOURCE_TYPES = ['conversation', 'manual', 'system'] as const;
 export type EventSourceType = (typeof EVENT_SOURCE_TYPES)[number];
 
+/**
+ * event_time 的精度（2026-09-29 新增）。
+ *
+ * 加这一列的原因：日期级事件此前被落库成 UTC 零点，在北京显示成 08:00 ——
+ * 时间线上所有事件都写着「早上八点」，一个不存在的规律。
+ * 精度是**事实属性**（我们到底知不知道时刻），必须显式表达，
+ * 不能用一个假时刻来掩盖。
+ */
+export const EVENT_PRECISIONS = ['day', 'minute'] as const;
+export type EventPrecision = (typeof EVENT_PRECISIONS)[number];
+
 // ============================================================
 // §21 goals
 // ============================================================

@@ -21,6 +21,7 @@ import {
   type ListEventsFilter,
 } from '../database/repository/event-store.js';
 import type { Event } from '../database/schema/events.js';
+import { DEFAULT_TIMEZONE, formatLocalMonthSafe } from '../shared/local-time.js';
 import type { EventCategory } from '../database/schema/enums.js';
 
 /** §20.3 的效果图按月分组。这里是分组的粒度定义 */
@@ -58,6 +59,11 @@ export async function getTimeline(
     limit?: number;
     offset?: number;
     granularity?: 'month';
+    /**
+     * 用户时区。按月分组与日期边界都按它算 ——
+     * 用 UTC 会让北京用户月末/月初的事件分到错误的月份。
+     */
+    timezone?: string;
   },
   options: Parameters<typeof listEvents>[1] = {}
 ): Promise<TimelineResult> {
@@ -84,6 +90,7 @@ export async function getTimeline(
         userId: params.userId,
         ...(params.from !== undefined ? { from: params.from } : {}),
         ...(params.to !== undefined ? { to: params.to } : {}),
+        ...(params.timezone !== undefined ? { timezone: params.timezone } : {}),
       },
       options
     ),
@@ -95,19 +102,26 @@ export async function getTimeline(
     byMonth.set(month, { month, total: n, events: [] });
   }
 
+  /** 与 countEventsByMonth 同一个口径，否则计数与条目会对不上（见 monthKeyOf） */
+  const timezone = params.timezone ?? DEFAULT_TIMEZONE;
+
   for (const event of page.items) {
-    const month = monthKeyOf(event.eventTime);
+    const month = monthKeyOf(event.eventTime, timezone);
     const bucket = byMonth.get(month);
     if (bucket) {
       bucket.events.push(event);
     } else {
       /**
        * 兜底：条目所在的月份不在计数结果里。
-       * 理论上不该发生（两个查询用同一套过滤条件），
+       * 理论上不该发生（两个查询用同一套过滤条件与同一个时区口径），
        * 但若发生了（例如并发写入），静默丢条目比显示一个
        * 计数为 0 却有内容的月份更糟 —— 因此补一个 bucket。
        */
-      byMonth.set(month, { month, total: bucketFallbackTotal(page.items, month), events: [event] });
+      byMonth.set(month, {
+        month,
+        total: bucketFallbackTotal(page.items, month, timezone),
+        events: [event],
+      });
     }
   }
 
@@ -190,14 +204,25 @@ export function resolvePeriod(
 // 内部
 // ============================================================
 
-/** YYYY-MM。用 UTC 口径与 event_time 一致 */
-function monthKeyOf(d: Date): string {
-  return d.toISOString().slice(0, 7);
+/**
+ * 取条目所属的「月」，YYYY-MM。
+ *
+ * ⚠️ 必须与 `countEventsByMonth` 用**同一个口径**（用户时区）。
+ *    2026-09-29 实测踩到：计数改成按用户时区之后，这里仍是 UTC ——
+ *    于是北京 8 月 1 日 00:00 的事（UTC 7 月 31 日 16:00）
+ *    被计数算进 8 月、却被归入 7 月那一组，
+ *    界面上出现「2026-08 共 2 条」却只列出 1 条。
+ *
+ *    两处口径不一致时，症状不是崩溃而是**数字自己对不上** ——
+ *    比崩溃更难发现。因此这个函数与 countEventsByMonth 必须一起改。
+ */
+function monthKeyOf(d: Date, timezone: string): string {
+  return formatLocalMonthSafe(d, timezone);
 }
 
 /** 兜底 bucket 的 total：数本页里该月的条目 */
-function bucketFallbackTotal(items: Event[], month: string): number {
-  return items.filter((e) => monthKeyOf(e.eventTime) === month).length;
+function bucketFallbackTotal(items: Event[], month: string, timezone: string): number {
+  return items.filter((e) => monthKeyOf(e.eventTime, timezone) === month).length;
 }
 
 function startOfUtcDay(d: Date): Date {

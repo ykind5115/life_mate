@@ -33,6 +33,7 @@ import {
   updateTimelineEventSchema,
 } from '../schemas.js';
 import { getTimeline } from '../../timeline/timeline-service.js';
+import { DEFAULT_TIMEZONE, localDayStartUtc } from '../../shared/local-time.js';
 
 export async function registerTimelineRoutes(app: FastifyInstance): Promise<void> {
   // ==========================================================
@@ -44,8 +45,14 @@ export async function registerTimelineRoutes(app: FastifyInstance): Promise<void
 
     const result = await getTimeline({
       userId: user.id,
-      ...(query.start !== undefined ? { from: parseDateBoundary(query.start, 'start') } : {}),
-      ...(query.end !== undefined ? { to: parseDateBoundary(query.end, 'end') } : {}),
+      // 按用户时区分月与算日期边界 —— 用 UTC 会让月末/月初的事件分错月份
+      timezone: user.timezone,
+      ...(query.start !== undefined
+        ? { from: parseDateBoundary(query.start, 'start', user.timezone) }
+        : {}),
+      ...(query.end !== undefined
+        ? { to: parseDateBoundary(query.end, 'end', user.timezone) }
+        : {}),
       ...(query.category !== undefined ? { category: query.category } : {}),
       limit: query.page_size,
       offset: toOffset(query.page, query.page_size),
@@ -228,14 +235,23 @@ function toEventDto(e: Event) {
  *
  * 若 end 按 00:00:00 处理，用户查「2026 年整年」时 12 月 31 日
  * 当天的事件会全部消失 —— 这是个很隐蔽、很难被发现的错误。
+ *
+ * ⚠️ 边界按**用户时区**的当天首尾算，不是 UTC。
+ *    早先用 `T00:00:00Z`：北京用户的 09-29 其实是从 08:00 开始的，
+ *    于是「查 9 月 29 日」会漏掉当天 0-8 点的事件，
+ *    而 end 又会多算到次日 08:00 之前 —— 两头都错。
  */
-function parseDateBoundary(value: string, kind: 'start' | 'end'): Date {
+function parseDateBoundary(
+  value: string,
+  kind: 'start' | 'end',
+  timezone: string = DEFAULT_TIMEZONE
+): Date {
   const dateOnly = /^(\d{4})-(\d{2})-(\d{2})$/.exec(value);
 
   if (dateOnly) {
-    const base = new Date(`${value}T00:00:00Z`);
-    if (Number.isNaN(base.getTime())) throw badRequest(`${kind} 不是合法日期`);
-    return kind === 'start' ? base : new Date(base.getTime() + 86400_000 - 1);
+    const start = localDayStartUtc(value, timezone);
+    if (start === null) throw badRequest(`${kind} 不是合法日期`);
+    return kind === 'start' ? start : new Date(start.getTime() + 86400_000 - 1);
   }
 
   const parsed = new Date(value);

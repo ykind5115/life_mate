@@ -17,6 +17,7 @@
  */
 import { PREDICATE_KEYS } from '../database/schema/enums.js';
 import type { LLMMessage } from '../llm/types.js';
+import { DEFAULT_TIMEZONE, formatLocalDateTime } from '../shared/local-time.js';
 
 /**
  * 槽位词表的分组说明。
@@ -146,12 +147,26 @@ ${buildPredicateTable()}
 
 ### eventTime 的写法（最容易出错的地方）
 
+**eventTime 是「这件事在现实中发生的时间」，不是「用户什么时候告诉你的」。**
+两者经常不是同一天：用户今天说「我上周三搬到杭州」，
+那 eventTime 是上周三，而不是今天。填错会让时间线上出现一个
+用户没经历过的节点 —— 比缺一个节点更糟。
+
 - **必须输出绝对时间**（ISO 8601），不能写「上周三」「去年」这种相对表述 ——
   事件要落库排序，相对时间无法存储，而且几周后再看就无法解析了
-- 用上面给你的「当前日期」自己换算：
+- 用上面给你的「当前时间」自己换算：
   「上周」→ 当前日期减 7 天左右的**具体日期**
+  「昨天」「今天上午」→ 按当前时间往前推
   「去年三月」→ 去年的 3 月（具体到日时用 1 号）
-- 只知道年月、不知道具体哪天 → 用该月 1 号，不要编造具体日期
+
+- **精度按你知道的写，不要为了显得精确而编造时刻：**
+  · 知道日期，也知道大概几点 → 写时刻，如 \`2026-09-29T10:00:00+08:00\`
+    （用户说「上午」「中午」「下午三点」这类都算知道）
+  · **只知道日期** → 就写 \`2026-09-29\`
+  · 只知道年月、不知道具体哪天 → 写该月 1 号，不要编造具体日期
+  ⚠️ **不要输出 \`T00:00:00\` 来表示「只知道日期」** —— 那不是「零点发生」，
+     是一个编造出来的时刻，它会让时间线上所有事件都显示成同一个时间。
+
 - **推算不出来就不要输出这个事件** —— 宁可少一个节点，
   也不要一个时间错误、让用户在时间线上看到自己没做过的事
 
@@ -220,23 +235,31 @@ ${buildPredicateTable()}
  *   ① 让模型能区分用户自述与 AI 的推测（后者不可作为记忆来源）
  *   ② 序号便于 evidence 溯源时定位
  *
- * ⚠️ 必须告知**当前日期**，否则事件抽取做不了：
+ * ⚠️ 必须告知**当前日期与时刻、以及时区**，否则事件抽取做不了：
  *    event_time 是 TIMESTAMPTZ，存不了「上周三」。
  *    模型需要知道"现在"才能把相对时间换算成绝对时间。
- *    用 UTC 表示并显式标注 —— 让模型自己处理时区比我们猜更可靠。
+ *
+ *    ⚠️ 只给日期是不够的（2026-09-29 修正）：
+ *      · 用户说「今天上午面试了两个人」，模型需要知道今天几号**且**
+ *        现在是下午还是晚上，才能判断「上午」是哪半天
+ *      · 北京凌晨 1 点说的话，UTC 还是前一天 —— 只给 UTC 日期
+ *        会让「昨天/今天」整体错一天
+ *    因此改成：给出**用户当地**的日期 + 时刻 + 时区名，并显式标注时区。
  */
 export function buildExtractionUserMessage(
   messages: { role: string; content: string }[],
-  options: { conversationTime?: Date } = {}
+  options: { conversationTime?: Date; timezone?: string } = {}
 ): LLMMessage {
   const lines = messages.map((m, i) => {
     const speaker = m.role === 'user' ? '用户' : m.role === 'assistant' ? 'AI' : m.role;
     return `[${i + 1}] ${speaker}：${m.content}`;
   });
 
+  const timezone = options.timezone ?? DEFAULT_TIMEZONE;
+
   const timeHint = options.conversationTime
-    ? `当前日期：${formatDateForPrompt(options.conversationTime)}（UTC）。\n` +
-      `抽取事件时用它来换算「上周」「去年三月」这类相对时间。\n\n`
+    ? `当前时间：${formatDateTimeForPrompt(options.conversationTime, timezone)}（${timezone}）。\n` +
+      `抽取事件时用它来换算「上周」「去年三月」「今天上午」这类相对时间。\n\n`
     : '';
 
   return {
@@ -247,9 +270,16 @@ export function buildExtractionUserMessage(
   };
 }
 
-/** 格式化为 YYYY-MM-DD。不用 toLocaleDateString：输出依赖运行环境 locale */
-function formatDateForPrompt(d: Date): string {
-  return d.toISOString().slice(0, 10);
+/**
+ * 把时刻渲染成「YYYY-MM-DD HH:mm」。
+ *
+ * ⚠️ 按**用户时区**渲染，不是 UTC。
+ *    旧写法 `toISOString().slice(0, 10)` 给的是 UTC 日期 ——
+ *    用户在北京凌晨说的话，模型会以为那是前一天，于是把
+ *    「昨天」算错一天。同类问题在仓库里曾有 9 处，见 shared/local-time.ts。
+ */
+function formatDateTimeForPrompt(d: Date, timezone: string): string {
+  return formatLocalDateTime(d, timezone);
 }
 
 /**
@@ -257,7 +287,7 @@ function formatDateForPrompt(d: Date): string {
  */
 export function buildExtractionMessages(
   conversation: { role: string; content: string }[],
-  options: { conversationTime?: Date } = {}
+  options: { conversationTime?: Date; timezone?: string } = {}
 ): LLMMessage[] {
   return [
     { role: 'system', content: EXTRACTION_SYSTEM_PROMPT },

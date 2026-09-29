@@ -20,7 +20,8 @@ import { and, asc, count, desc, eq, gte, isNull, lte, sql, type SQL } from 'driz
 
 import { db } from '../client.js';
 import { events, type Event } from '../schema/events.js';
-import type { EventCategory } from '../schema/enums.js';
+import type { EventCategory, EventPrecision } from '../schema/enums.js';
+import { DEFAULT_TIMEZONE, isKnownTimezone } from '../../shared/local-time.js';
 import type { ExecutorOption, Paginated } from './types.js';
 
 /** 未删除的事件谓词。所有面向用户的查询都必须带上 */
@@ -150,9 +151,14 @@ export async function findSameDayEventByTitle(
  * 在前端分组也可行，但分页会把同一个月拆到两页，
  * 那时前端无法知道「这个月还有没有更多」——
  * 因此分组与计数必须在库层算。
+ *
+ * ⚠️ 分组按**用户时区**的月份，不是 UTC 月份。
+ *    早先写死 `AT TIME ZONE 'UTC'`：北京用户 10 月 1 日凌晨做的事
+ *    在 UTC 还是 9 月 30 日，会被分到 9 月 ——
+ *    于是「10 月」那一组里少一条，9 月里多一条。
  */
 export async function countEventsByMonth(
-  params: { userId: string; from?: Date; to?: Date },
+  params: { userId: string; from?: Date; to?: Date; timezone?: string },
   options: ExecutorOption = {}
 ): Promise<{ month: string; n: number }[]> {
   const exec = options.executor ?? db;
@@ -165,7 +171,25 @@ export async function countEventsByMonth(
   if (params.from) conds.push(gte(events.eventTime, params.from));
   if (params.to) conds.push(lte(events.eventTime, params.to));
 
-  const month = sql<string>`to_char(${events.eventTime} AT TIME ZONE 'UTC', 'YYYY-MM')`;
+  /**
+   * ⚠️ 时区名**作为 SQL 字面量拼进去**，而不是绑定参数。
+   *
+   * 这个取舍是踩出来的，不是图省事：
+   *   `to_char(event_time AT TIME ZONE $1, 'YYYY-MM')` 在 psql 里
+   *   （显式声明参数类型为 text）能跑，但经 node-postgres 发送时
+   *   参数类型是 unknown，PostgreSQL 无法把 SELECT 与 GROUP BY 里
+   *   那两个表达式判定为相同，直接报
+   *     column "events.event_time" must appear in the GROUP BY clause
+   *   试过 `$1::text` 也没用 —— 报错信息完全指不到「参数类型」这个真因。
+   *
+   * 拼字面量在这里是安全的，因为**白名单式校验**已经把关：
+   *   `pickTimezone` 先确认 Intl 认识它，再用 /^[A-Za-z0-9_+\-/]+$/ 限制字符集，
+   *   不满足就退回缺省值。于是进入 SQL 的只可能是一个时区名，
+   *   不含引号、分号、注释符号 —— 这是白名单，不是转义。
+   */
+  const timezone = pickTimezone(params.timezone);
+  const tzLiteral = sql.raw(`'${timezone}'`);
+  const month = sql<string>`to_char(${events.eventTime} AT TIME ZONE ${tzLiteral}, 'YYYY-MM')`;
 
   const rows = await exec
     .select({ month, n: count() })
@@ -176,6 +200,19 @@ export async function countEventsByMonth(
     .orderBy(desc(month));
 
   return rows.map((r) => ({ month: r.month, n: Number(r.n) }));
+}
+
+/**
+ * 取一个能安全交给 PostgreSQL 的时区名。
+ *
+ * 两层把关：
+ *   ① Intl 是否认识它（挡住拼写错误与任意字符串）
+ *   ② 形态白名单：只允许 `区域/城市` 这类字符集
+ * 不合法时退回 DEFAULT_TIMEZONE —— 一个写错的时区不该让时间线打不开。
+ */
+function pickTimezone(input: string | undefined): string {
+  if (!input || !isKnownTimezone(input)) return DEFAULT_TIMEZONE;
+  return /^[A-Za-z0-9_+\-/]+$/.test(input) ? input : DEFAULT_TIMEZONE;
 }
 
 /**
@@ -215,6 +252,8 @@ export interface CreateEventInput {
   title: string;
   description?: string | null;
   eventTime: Date;
+  /** event_time 的精度。缺省 'day' —— 见 schema/events.ts 的说明 */
+  eventPrecision?: EventPrecision;
   category?: EventCategory | null;
   importanceScore?: number;
   sourceType?: 'conversation' | 'manual' | 'system';
@@ -236,6 +275,7 @@ export async function createEvent(
       title: input.title,
       description: input.description ?? null,
       eventTime: input.eventTime,
+      eventPrecision: input.eventPrecision ?? 'day',
       category: input.category ?? null,
       importanceScore: input.importanceScore ?? 0.5,
       sourceType: input.sourceType ?? 'conversation',

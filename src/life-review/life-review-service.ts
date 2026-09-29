@@ -34,6 +34,7 @@ import { listSummariesInRange } from '../database/repository/summary-store.js';
 import type { Event } from '../database/schema/events.js';
 import type { Memory } from '../database/schema/memories.js';
 import type { Goal } from '../database/schema/goals.js';
+import { formatLocalDateSafe } from '../shared/local-time.js';
 
 const REVIEW_SYSTEM_PROMPT = `你是 LifeMate，正在帮用户回顾一段时间的生活。
 
@@ -407,8 +408,16 @@ export function parseReviewContent(raw: string): ReviewContent {
 // 内部
 // ============================================================
 
+/**
+ * 格式化为 YYYY-MM-DD（按用户时区）。
+ *
+ * ⚠️ 这里的日期会进**给模型的回顾材料**与用户看到的周期标签
+ *    （「9月28日 至 9月30日」）。用 UTC 日期会让周期边界与
+ *    事件日期都差一天 —— 用户看到「这段时间」里少一件或多一件。
+ *    走共享时区工具，见 shared/local-time.ts。
+ */
 function formatDate(d: Date): string {
-  return d.toISOString().slice(0, 10);
+  return formatLocalDateSafe(d, undefined);
 }
 
 /** 延迟导入以避免在不需要 LLM 的路径上加载 env 校验 */

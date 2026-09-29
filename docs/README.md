@@ -23,6 +23,7 @@
 | 11 | [11-User Experience.md](./11-User%20Experience.md) | 首次真实使用的原始反馈（六条，未整理） | — | 归档性质，勿修改 |
 | 12 | [12-ux-improvement-plan.md](./12-ux-improvement-plan.md) | 首次真实使用的问题分析与改进方案 | — | **已实施（第 1、2 批）** |
 | 13 | [13-observability-plan.md](./13-observability-plan.md) | 可观测性补全（幻觉排查的产物） | — | ✅ 本轮已完成 |
+| 14 | [14-timeline-conflict-plan.md](./14-timeline-conflict-plan.md) | Timeline 冲突问题分析与方案 | — | ✅ 已实施（只修时间，不做替代） |
 
 **归档：**
 

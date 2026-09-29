@@ -227,7 +227,7 @@ export function buildChatContext(params: BuildChatContextParams): BuiltChatConte
     { role: 'system', content: `${systemPrompt}\n\n${buildNowLine(now, timezone)}` },
   ];
 
-  const knownFacts = buildKnownFactsSection(kept);
+  const knownFacts = buildKnownFactsSection(kept, timezone);
   if (knownFacts !== null) {
     messages.push({ role: 'system', content: knownFacts });
   }

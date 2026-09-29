@@ -30,6 +30,10 @@ import { memories } from '../database/schema/memories.js';
 import { conversations } from '../database/schema/conversations.js';
 import { messages } from '../database/schema/messages.js';
 import { memorySources } from '../database/schema/memory-sources.js';
+import { events } from '../database/schema/events.js';
+import { goals } from '../database/schema/goals.js';
+import { relationships } from '../database/schema/relationships.js';
+import { extractionRuns } from '../database/schema/extraction-runs.js';
 import { runExtraction } from '../memory/extraction-pipeline.js';
 import { getLLMProvider } from '../llm/index.js';
 import { currentDatabaseName, isTestDatabaseName } from '../shared/test-guard.js';
@@ -237,32 +241,69 @@ function guardDatabase(): void {
   process.exit(1);
 }
 
-/** 删除本次评测创建的全部数据（用户 → 级联不到记忆，需按顺序删） */
+/**
+ * 删除本次评测创建的全部数据。
+ *
+ * ⚠️ 顺序不能变，而且**必须覆盖所有指向 users 的外键**。
+ *    实测（2026-09-29）：原先只清 relations/conversations/messages，
+ *    结果 `delete from users` 被 events 的 RESTRICT 外键挡住，
+ *    评测跑完却留下一整个用户与它的全部数据 —— 而且报错发生在
+ *    「评测失败」的提示里，看起来像评测本身失败了（其实指标已经算完）。
+ *
+ * 指向 users 且为 RESTRICT 的表（查 pg_constraint 得到的完整清单）：
+ *    conversations / events / goals / memories / relationships
+ * 引用链上还要先清：
+ *    memory_sources（→ memories 级联、→ messages/events/goals 为 SET NULL）
+ *    extraction_runs（→ conversations 级联）
+ *    conversation_summaries（→ conversations 级联）
+ *
+ * 依赖级联不代表可以省略：RESTRICT 会先拦住父行删除。
+ */
 async function cleanup(userId: string): Promise<void> {
   const convs = await db
     .select({ id: conversations.id })
     .from(conversations)
     .where(eq(conversations.userId, userId));
-
   const convIds = convs.map((c) => c.id);
 
+  const mems = await db
+    .select({ id: memories.id })
+    .from(memories)
+    .where(eq(memories.userId, userId));
+  const memIds = mems.map((m) => m.id);
+
+  // ① 来源行：它同时引用 memory / message / event / goal，四个方向都会挡
+  if (memIds.length > 0) {
+    await db.delete(memorySources).where(inArray(memorySources.memoryId, memIds));
+  }
   if (convIds.length > 0) {
     const msgs = await db
       .select({ id: messages.id })
       .from(messages)
       .where(inArray(messages.conversationId, convIds));
     const msgIds = msgs.map((m) => m.id);
-
-    // 顺序不能变：来源行 → 记忆（连带向量级联）→ 消息 → 会话
-    // memory_sources.message_id 是 ON DELETE RESTRICT，不先删会挡住消息删除
     if (msgIds.length > 0) {
       await db.delete(memorySources).where(inArray(memorySources.messageId, msgIds));
     }
-    await db.delete(memories).where(eq(memories.userId, userId));
+    // extraction_runs 对 conversations 是级联，但显式删更稳（且便于排查）
+    await db.delete(extractionRuns).where(inArray(extractionRuns.conversationId, convIds));
+  }
+
+  // ② 记忆与向量（embeddings 对 memories 是级联）
+  await db.delete(memories).where(eq(memories.userId, userId));
+
+  // ③ 事件 / 目标 / 人际关系 —— 原先漏了这三张表，就是它们挡住了用户删除
+  await db.delete(events).where(eq(events.userId, userId));
+  await db.delete(goals).where(eq(goals.userId, userId));
+  await db.delete(relationships).where(eq(relationships.userId, userId));
+
+  // ④ 消息与会话（summaries 对 conversations 是级联）
+  if (convIds.length > 0) {
     await db.delete(messages).where(inArray(messages.conversationId, convIds));
     await db.delete(conversations).where(eq(conversations.userId, userId));
   }
 
+  // ⑤ 最后才是用户
   await db.delete(users).where(eq(users.id, userId));
   console.log('已清理评测数据。');
 }

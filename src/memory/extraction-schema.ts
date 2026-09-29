@@ -58,6 +58,7 @@ import {
   PREDICATE_KEYS,
   EVENT_CATEGORIES,
 } from '../database/schema/enums.js';
+import { DEFAULT_TIMEZONE, formatLocalDateSafe, localDayStartUtc, zonedOffsetMs } from '../shared/local-time.js';
 
 /**
  * 抽取器返回的单条候选记忆。
@@ -201,6 +202,15 @@ export interface CandidateEvent {
   title: string;
   description?: string | null | undefined;
   eventTime: string;
+  /**
+   * eventTime 的精度。
+   *
+   * ⚠️ 由 `resolveEventTime` 判定，**不是**模型给的字段 ——
+   *    模型只输出时间字符串，判精度是解析层的职责
+   *    （模型说「2026-09-29T00:00:00Z」时它并不知道自己在表达日期还是零点）。
+   *    因此这里可选：手工构造测试数据的老写法仍然可用，缺省按 'day' 处理。
+   */
+  eventPrecision?: 'day' | 'minute' | undefined;
   category?: (typeof EVENT_CATEGORIES)[number] | null | undefined;
   importance?: number | undefined;
   evidence?: string | undefined;
@@ -361,6 +371,11 @@ export function parseExtractionResultWithDiagnostics(
      * 保留为参数是为了让调用方显式表态，也便于将来若改变策略时不必改签名。
      */
     conversationTime?: Date;
+    /**
+     * 用户时区。日期级事件要落在「当地零点」，因此解析时就需要它。
+     * 缺省 Asia/Shanghai（见 shared/local-time.ts 的说明）。
+     */
+    timezone?: string;
   } = {}
 ): ParseOutcome {
   const jsonText = extractJsonBlock(raw);
@@ -426,7 +441,8 @@ export function parseExtractionResultWithDiagnostics(
   // ---------- ⑤ 事件：同样的分级策略 ----------
   const eventsOutcome = parseCandidateEvents(
     container.data.events ?? [],
-    params.conversationTime
+    params.conversationTime,
+    params.timezone ?? DEFAULT_TIMEZONE
   );
 
   return {
@@ -468,7 +484,8 @@ export function parseExtractionResultWithDiagnostics(
  */
 export function parseCandidateEvents(
   rawEvents: unknown[],
-  conversationTime?: Date
+  conversationTime?: Date,
+  timezone: string = DEFAULT_TIMEZONE
 ): {
   events: CandidateEvent[];
   diagnostics: ExtractionDiagnostics['events'];
@@ -485,8 +502,8 @@ export function parseCandidateEvents(
     }
 
     const candidate = check.data;
-    const parsedTime = resolveEventTime(candidate.eventTime, conversationTime);
-    if (parsedTime === null) {
+    const parsed = resolveEventTime(candidate.eventTime, conversationTime, timezone);
+    if (parsed === null) {
       droppedForBadTime++;
       continue;
     }
@@ -508,7 +525,9 @@ export function parseCandidateEvents(
     events.push({
       title: candidate.title,
       description: candidate.description ?? null,
-      eventTime: parsedTime.toISOString(),
+      eventTime: parsed.at.toISOString(),
+      /** 精度一路传下去：落库要它、显示也要它（见 ResolvedEventTime 的说明） */
+      eventPrecision: parsed.precision,
       category,
       importance: candidate.importance,
       evidence: candidate.evidence,
@@ -527,45 +546,79 @@ export function parseCandidateEvents(
 }
 
 /**
- * 把模型给出的时间字符串解析成 Date。
+ * 解析出的时间 + 它的精度。
+ *
+ * 精度是**事实属性**（我们到底知不知道时刻），必须一路传下去 ——
+ * 落库时用它决定怎么存（日级存当地零点），显示时用它决定怎么渲染
+ * （日级只显示日期，不显示 00:00 或 08:00 这种假时刻）。
+ */
+export interface ResolvedEventTime {
+  at: Date;
+  precision: 'day' | 'minute';
+}
+
+/**
+ * 把模型给出的时间字符串解析成 Date，并判断精度。
  *
  * 容忍几种常见形态：
- *   · 完整 ISO 8601             2026-09-10T00:00:00+08:00
- *   · 只有日期                  2026-09-10
- *   · 带中文字的时间描述         2026年9月10日  ← 实测模型会这样输出
+ *   · 完整 ISO 8601 带偏移   2026-09-10T15:30:00+08:00  → minute
+ *   · 完整 ISO 8601 无偏移   2026-09-10T15:30:00        → minute
+ *   · 只有日期               2026-09-10                 → day
+ *   · 带中文字的时间描述      2026年9月10日               → day
+ *   · 带中文字且有时刻        2026年9月10日 15:30         → minute
+ *
+ * 【为什么需要判断精度，而不是统一当成时刻】
+ *   2026-09-29 用户报告时间线上两条记录冲突，其中一个成因是
+ *   **所有事件的时间都显示成 08:00**：日期级事件被落库成 UTC 零点，
+ *   在北京显示就是当天 08:00。于是时间线看起来像「这些事都发生在早上八点」——
+ *   一个不存在的规律。
+ *
+ *   把「只知道日期」也写成某个时刻，等于**编造时刻**。
+ *   精度未知时按 day 处理，由显示层选择不渲染时刻 ——
+ *   而不是替用户编一个。
+ *
+ * 【day 精度落在「当地零点」】
+ *   返回的是该日期的**当地零点**对应的 UTC 时刻（如北京 09-29 00:00
+ *   = 09-28T16:00Z）。这样任何按当地时区显示的界面都会还原成 09-29。
+ *   若返回 UTC 零点，北京会显示成当天 08:00。
  *
  * @returns 解析结果；无法解析返回 null（调用方应丢弃该事件）
  */
 export function resolveEventTime(
   raw: string,
-  _conversationTime?: Date
-): Date | null {
+  _conversationTime?: Date,
+  timezone: string = DEFAULT_TIMEZONE
+): ResolvedEventTime | null {
   const text = raw.trim();
   if (text.length === 0) return null;
 
-  // 中文字日期 → ISO 形式
-  const cn = /^(\d{4})年(\d{1,2})月(\d{1,2})日?$/.exec(text);
+  // 中文字日期（可能带时刻）→ 归一成 ISO 形式再走下面的分支
+  const cn = /^(\d{4})年(\d{1,2})月(\d{1,2})日?(?:[ T](\d{1,2}):(\d{2}))?$/.exec(text);
   if (cn) {
-    const [, y, m, d] = cn;
-    const date = new Date(
-      `${y}-${String(m).padStart(2, '0')}-${String(d).padStart(2, '0')}T00:00:00Z`
-    );
-    return Number.isNaN(date.getTime()) ? null : date;
+    const [, y, m, d, hh, mm] = cn;
+    const datePart = `${y}-${String(m).padStart(2, '0')}-${String(d).padStart(2, '0')}`;
+
+    if (hh === undefined) {
+      return dayPrecision(datePart, timezone);
+    }
+    /**
+     * 中文表述带时刻时，时刻是**用户当地**的（用户说的是「下午三点」）。
+     * 归一成带 +08:00 偏移的 ISO 再解析，语义才不会丢。
+     */
+    const at = new Date(`${datePart}T${hh.padStart(2, '0')}:${mm}:00${offsetSuffix(timezone, datePart)}`);
+    return Number.isNaN(at.getTime()) ? null : gate({ at, precision: 'minute' }, timezone);
   }
 
-  // 「2026年9月」这种只有年月 → 取该月 1 号
+  // 「2026年9月」这种只有年月 → 取该月 1 号，按日级处理
   const cnMonth = /^(\d{4})年(\d{1,2})月$/.exec(text);
   if (cnMonth) {
     const [, y, m] = cnMonth;
-    const date = new Date(`${y}-${String(m).padStart(2, '0')}-01T00:00:00Z`);
-    return Number.isNaN(date.getTime()) ? null : date;
+    return dayPrecision(`${y}-${String(m).padStart(2, '0')}-01`, timezone);
   }
 
-  // 只有日期（YYYY-MM-DD）→ 按 UTC 零点
-  const dateOnly = /^(\d{4})-(\d{2})-(\d{2})$/.exec(text);
-  if (dateOnly) {
-    const date = new Date(`${text}T00:00:00Z`);
-    return Number.isNaN(date.getTime()) ? null : date;
+  // 只有日期（YYYY-MM-DD）→ 当地零点，日级精度
+  if (/^\d{4}-\d{2}-\d{2}$/.test(text)) {
+    return dayPrecision(text, timezone);
   }
 
   // 标准 ISO 与其他 Date 能认的格式
@@ -573,17 +626,87 @@ export function resolveEventTime(
   if (Number.isNaN(date.getTime())) return null;
 
   /**
-   * 拒绝明显不合理的时间：早于 1900 或晚于未来 1 年。
+   * 到这里说明输入带时刻（形如 `...T15:30:00`）—— 上面几条
+   * 「只有日期」的分支已经把它们拦掉了。
    *
-   * 为什么需要：模型偶尔会把「2026」当成时间戳（1970 年附近），
-   * 或把相对时间算错成很远的未来。这类值会污染时间线排序，
-   * 而且看起来像是系统坏了。
+   * ⚠️ 但有一类边界：`2026-09-10T00:00:00Z` 这种「时刻恰为零点」的输入，
+   *    它是模型照旧示例写的伪时刻，不代表真的发生在零点。
+   *    判据是本条是否落在**某个时区的 UTC 零点**上 —— 若是，
+   *    按 day 处理并归到当地零点，避免时间线上又出现一片 00:00/08:00。
    */
-  const year = date.getUTCFullYear();
-  if (year < 1900) return null;
-  if (date.getTime() > Date.now() + 365 * 24 * 3600 * 1000) return null;
+  if (isUtcMidnight(date)) {
+    return dayPrecision(date.toISOString().slice(0, 10), timezone);
+  }
 
-  return date;
+  return gate({ at: date, precision: 'minute' }, timezone);
+}
+
+/**
+ * 所有解析结果都必须过的最后一道闸门。
+ *
+ * ⚠️ 为什么要有它：合理性判据（isPlausibleTime）原先只写在 ISO 分支里，
+ *    于是 `1899-12-31` 走「只有日期」分支、带时刻的越界值走 minute 分支时
+ *    都能绕过它 —— 时间线上凭空出现 19 世纪的节点。
+ *
+ *    把闸门收敛到一个函数，新增解析分支时**不可能忘记**加检查：
+ *    只要 return 之前调 gate()，规则就只有一处。
+ */
+function gate(result: ResolvedEventTime, timezone: string): ResolvedEventTime | null {
+  return isPlausibleTime(result.at, timezone) ? result : null;
+}
+
+/** 按日级精度解析：日期 + 时区 → 当地零点 */
+function dayPrecision(date: string, timezone: string): ResolvedEventTime | null {
+  const start = localDayStartUtc(date, timezone);
+  return start === null ? null : gate({ at: start, precision: 'day' }, timezone);
+}
+
+/**
+ * 拒绝明显不合理的时间：早于 1900 或晚于未来 1 年。
+ *
+ * 为什么需要：模型偶尔会把年份算错，或把相对时间算成很远的未来。
+ * 这类值会污染时间线排序，而且看起来像是系统坏了。
+ *
+ * ⚠️ 年份按**用户时区**判断，不是 UTC。
+ *    实测踩到：`1900-01-01` 在北京是 `1899-12-31T16:00:00Z`，
+ *    用 UTC 年份判断会把它算成 1899 而拒绝 ——
+ *    用户输入的是 1900，看到的也应该是 1900。
+ *    判据必须与用户看到的口径一致，否则边界上会出现「明明合法却被拒」。
+ */
+function isPlausibleTime(at: Date, timezone: string): boolean {
+  const localYear = Number(formatLocalDateSafe(at, timezone).slice(0, 4));
+  if (localYear < 1900) return false;
+  if (at.getTime() > Date.now() + 365 * 24 * 3600 * 1000) return false;
+  return true;
+}
+
+/** 判断某时刻是否恰好落在 UTC 零点 */
+function isUtcMidnight(at: Date): boolean {
+  return (
+    at.getUTCHours() === 0 &&
+    at.getUTCMinutes() === 0 &&
+    at.getUTCSeconds() === 0 &&
+    at.getUTCMilliseconds() === 0
+  );
+}
+
+/**
+ * 取某时区在某天的 UTC 偏移后缀，如 `+08:00`。
+ *
+ * 用于把「用户当地的三点」这类中文表述归一成 ISO ——
+ * 不带偏移地解析会让它按服务器时区（通常是 UTC）解释，
+ * 于是「下午三点」变成当地晚上十一点。
+ */
+function offsetSuffix(timezone: string, date: string): string {
+  const start = localDayStartUtc(date, timezone);
+  if (start === null) return 'Z';
+
+  const offsetMinutes = Math.round(zonedOffsetMs(start, timezone) / 60_000);
+  const sign = offsetMinutes < 0 ? '-' : '+';
+  const abs = Math.abs(offsetMinutes);
+  const hh = String(Math.floor(abs / 60)).padStart(2, '0');
+  const mm = String(abs % 60).padStart(2, '0');
+  return `${sign}${hh}:${mm}`;
 }
 
 /**

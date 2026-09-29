@@ -683,6 +683,40 @@ function memoryCard(m, extraTags = []) {
 // 时间线
 // ============================================================
 
+/**
+ * 把服务端返回的时刻渲染成日期。
+ *
+ * ⚠️ 用**浏览器所在时区**换算，不能 `slice(0, 10)`。
+ *    event_time 是带时区的 ISO（如 `2026-09-28T16:00:00.000Z`），
+ *    `slice(0, 10)` 取的是 UTC 日期 —— 北京用户会看到前一天。
+ *    （服务端那侧同类写法有 9 处，见 src/shared/local-time.ts；
+ *      前端这一处是第 10 处，修法相同。）
+ *
+ * 用浏览器时区而不是 users.timezone：用户看着自己的屏幕，
+ * 浏览器的时区就是他的时区 —— 这比配置里的值更不会错。
+ */
+function eventDate(iso) {
+  const d = new Date(iso);
+  if (Number.isNaN(d.getTime())) return '';
+  const p2 = (n) => String(n).padStart(2, '0');
+  return `${d.getFullYear()}-${p2(d.getMonth() + 1)}-${p2(d.getDate())}`;
+}
+
+/**
+ * 事件的日期 + 时刻（仅当精度到分钟时才有时刻）。
+ *
+ * 日期级事件只显示「2026-09-29」—— 它的 event_time 落在当地零点，
+ * 显示成「00:00」会让人以为「这件事发生在半夜」。
+ */
+function eventDateTime(e) {
+  const date = eventDate(e.event_time);
+  if (e.event_precision !== 'minute') return date;
+
+  const d = new Date(e.event_time);
+  const p2 = (n) => String(n).padStart(2, '0');
+  return `${date} ${p2(d.getHours())}:${p2(d.getMinutes())}`;
+}
+
 async function loadTimeline() {
   const box = $('#tl-list');
   box.replaceChildren(el('div', { class: 'dim', text: '加载中…' }));
@@ -719,7 +753,7 @@ async function loadTimeline() {
       for (const e of month.items) {
         const children = [
           el('div', { class: 'item-head' }, [
-            el('span', { class: 'dim', text: e.event_time.slice(0, 10) }),
+            el('span', { class: 'dim', text: eventDateTime(e) }),
             ...(e.category ? [el('span', { class: 'tag', text: e.category })] : []),
             ...(e.source_type === 'conversation' ? [el('span', { class: 'dim', text: '来自对话' })] : []),
           ]),

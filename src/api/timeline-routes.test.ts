@@ -284,10 +284,21 @@ test('GET /timeline end=YYYY-MM-DD 包含当天（回归：曾按 00:00:00 处�
   });
 });
 
-test('GET /timeline start=YYYY-MM-DD 从当天 00:00 开始', async () => {
+test('GET /timeline start=YYYY-MM-DD 从当天 00:00 开始（按用户时区）', async () => {
+  /**
+   * ⚠️ 这个用例原先断言的是**错误的行为**，2026-09-29 修正：
+   *    它把 `start=2026-09-01` 理解成 UTC 零点（`2026-09-01T00:00:00Z`），
+   *    但用户在北京 —— 他的「9 月 1 日」是从 `2026-08-31T16:00:00Z` 开始的。
+   *    按 UTC 切会让当天 0-8 点的事全部漏掉。
+   *
+   *    改用**北京时间的墙上时间**来构造夹具，语义才不含糊：
+   *      边界当天   = 北京 09-01 00:00:00  （= UTC 08-31 16:00:00）
+   *      边界前一天 = 北京 08-31 23:59:59  （= UTC 08-31 15:59:59）
+   *    两者相差 1 秒，跨过北京的一天边界 —— 这才真的在测边界。
+   */
   await withTimeline(async ({ app, seedEvent }) => {
-    await seedEvent({ title: '边界当天', eventTime: new Date('2026-09-01T00:00:00Z') });
-    await seedEvent({ title: '边界前一天', eventTime: new Date('2026-08-31T23:59:59Z') });
+    await seedEvent({ title: '边界当天', eventTime: new Date('2026-08-31T16:00:00Z') });
+    await seedEvent({ title: '边界前一天', eventTime: new Date('2026-08-31T15:59:59Z') });
 
     const res = await req(app, {
       method: 'GET',
@@ -295,7 +306,7 @@ test('GET /timeline start=YYYY-MM-DD 从当天 00:00 开始', async () => {
     });
 
     const titles = (res.json().data.items as { title: string }[]).map((e) => e.title);
-    assert.deepEqual(titles, ['边界当天']);
+    assert.deepEqual(titles, ['边界当天'], 'start 应按北京时间的当天零点切，不是 UTC 零点');
   });
 });
 

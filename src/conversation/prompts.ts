@@ -25,6 +25,7 @@
  *    并在提交信息里说明改了什么 —— 提示词变更会改变模型行为，
  *    与代码变更一样需要可追溯。
  */
+import { DEFAULT_TIMEZONE, formatLocalDateSafe } from '../shared/local-time.js';
 
 /**
  * 提示词版本。变更提示词时递增，便于把行为变化与版本对应起来。
@@ -36,7 +37,6 @@
  *   · 补上人格定位与身份边界（参考用户提供的人格基调）
  */
 export const AGENT_PROMPT_VERSION = 'v2';
-
 /**
  * 对话系统提示词。
  *
@@ -110,6 +110,17 @@ export interface KnownFactInput {
 /**
  * 组装「你记得的事」段落。
  *
+ * @param timezone 用于把 validFrom 渲染成日期。
+ *
+ * ⚠️ 为什么必须传时区：早先这里用 `toISOString().slice(0, 10)`，
+ *    取的是 **UTC 日期**。用户在北京，凌晨发生的「生效」会被写成前一天，
+ *    模型据此回答「你什么时候开始的」就会错一天。
+ *    此类写法在仓库里曾有 9 处，见 shared/local-time.ts 的说明。
+ */
+
+/**
+ * 组装「你记得的事」段落。
+ *
  * 【为什么标题是「你记得的」而不是「已知信息（来自长期记忆）」】
  *   v1 的写法把机制的说明直接摆进上下文，模型于是照着复述：
  *   「以上是系统检索到的部分记忆，可能不完整」——
@@ -131,11 +142,14 @@ export interface KnownFactInput {
  * 而不是插入一个空的「你记得的事：（无）」。空段落会被模型当成
  * 「确实没有」，而实际上可能只是本次没有触发检索。
  */
-export function buildKnownFactsSection(facts: KnownFactInput[]): string | null {
+export function buildKnownFactsSection(
+  facts: KnownFactInput[],
+  timezone: string = DEFAULT_TIMEZONE
+): string | null {
   if (facts.length === 0) return null;
 
   const lines = facts.map((f) => {
-    const when = f.validFrom ? `（${formatDate(f.validFrom)} 起）` : '';
+    const when = f.validFrom ? `（${formatLocalDateSafe(f.validFrom, timezone)} 起）` : '';
     return `- [${f.type}] ${f.content}${when}`;
   });
 
@@ -146,9 +160,4 @@ export function buildKnownFactsSection(facts: KnownFactInput[]): string | null {
     '这些是你记得的部分，不是全部 —— 不要因为这里没有就断言对方没说过。',
     '提到它们时说「你之前提过」，不要说成对方刚刚说的。',
   ].join('\n');
-}
-
-/** 格式化为 YYYY-MM-DD。不用 toLocaleDateString：它的输出依赖运行环境 locale */
-function formatDate(d: Date): string {
-  return d.toISOString().slice(0, 10);
 }

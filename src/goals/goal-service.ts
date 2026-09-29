@@ -31,6 +31,7 @@ import { db } from '../database/client.js';
 import { memories } from '../database/schema/memories.js';
 import { memoryEmbeddings } from '../database/schema/memory-embeddings.js';
 import type { Goal } from '../database/schema/goals.js';
+import { formatLocalDateSafe } from '../shared/local-time.js';
 import type { GoalStatus } from '../database/schema/enums.js';
 import {
   createGoal,
@@ -82,9 +83,15 @@ const STATUS_TEXT: Record<string, string> = {
   archived: '已归档',
 };
 
-/** 格式化为 YYYY-MM-DD。不用 toLocaleDateString：输出依赖运行环境 locale */
+/**
+ * 格式化为 YYYY-MM-DD（按用户时区）。
+ *
+ * ⚠️ 这里会进**投影记忆的正文**，而记忆正文是模型长期引用的东西 ——
+ *    用 UTC 日期会让「完成于 9月28日」在用户眼里差一天。
+ *    因此走共享的时区工具（见 shared/local-time.ts 的说明）。
+ */
 function formatDate(d: Date): string {
-  return d.toISOString().slice(0, 10);
+  return formatLocalDateSafe(d, undefined);
 }
 
 /**

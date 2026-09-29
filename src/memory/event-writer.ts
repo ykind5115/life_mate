@@ -83,6 +83,12 @@ export async function writeExtractedEvents(
         title: e.title,
         description: e.description ?? null,
         eventTime,
+        /**
+         * 缺省 'day'：手工构造的测试数据不带这个字段，
+         * 而「只知道日期」是保守且正确的缺省 —— 显示层会因此不渲染时刻，
+         * 而不是渲染一个编造出来的 00:00。
+         */
+        eventPrecision: e.eventPrecision ?? 'day',
         category: (e.category ?? null) as EventCategory | null,
         ...(e.importance !== undefined ? { importanceScore: e.importance } : {}),
         sourceType: 'conversation',

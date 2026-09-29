@@ -47,6 +47,8 @@ import {
 } from '../llm/embedding.js';
 import type { LLMProvider } from '../llm/provider.js';
 import { buildExtractionMessages } from './extraction-prompt.js';
+import { findUserById } from '../database/repository/user-store.js';
+import { DEFAULT_TIMEZONE, formatLocalDateSafe } from '../shared/local-time.js';
 import { LlmSlotAdjudicator } from './slot-adjudicator.js';
 import {
   normalizeCandidate,
@@ -236,10 +238,29 @@ export async function runExtraction(
      */
     const conversationTime = msgs[msgs.length - 1]!.createdAt;
 
+    /**
+     * 用户时区。
+     *
+     * 【为什么必须传下去，而不是用 UTC】
+     *   日期级事件要落在「用户当地那一天的零点」——
+     *   用 UTC 会让它们显示成当天 08:00，时间线上所有事件都像发生在早上八点
+     *   （2026-09-29 用户报告的现象之一，见 docs/14）。
+     *   而且「今天是几号」这个告诉模型的锚点本身也依赖时区：
+     *   北京凌晨 1 点说的话，UTC 还是前一天。
+     *
+     * 取不到用户时（不该发生）用缺省 Asia/Shanghai —— 与
+     * conversation/context-builder 的口径一致，而不是退回 UTC。
+     */
+    const userId = await userIdOfConversation(params.conversationId, ex);
+    const user = await findUserById(userId, ex);
+    const timezone = user?.timezone ?? DEFAULT_TIMEZONE;
+
     const res = await provider.generate({
       messages: buildExtractionMessages(
         msgs.map((m) => ({ role: m.role, content: m.content })),
-        { conversationTime }
+        // 时区一并给模型：它要据此换算「今天」与「上午」。
+        // 只给日期而不给时区，模型算「凌晨 1 点说的话算哪天」时只能瞎猜。
+        { conversationTime, timezone }
       ),
       // 抽取要输出结构化 JSON（10~20 条记忆），需要足够的回答空间。
       // 且推理模型思考与回答共享预算，必须留余量（见 env.ts 的说明）。
@@ -251,13 +272,15 @@ export async function runExtraction(
 
     // 用带诊断的解析：丢弃与降级的事实必须被记录，
     // 否则槽位命中率下降这类质量退化会静默发生（见 extraction-schema 的分级策略）
-    const parsed = parseExtractionResultWithDiagnostics(res.content, { conversationTime });
+    const parsed = parseExtractionResultWithDiagnostics(res.content, {
+      conversationTime,
+      timezone,
+    });
     const extraction = parsed.result;
     const candidates = extraction.memories.map(normalizeCandidate);
 
     // ---------- ⑤ 逐条判定并落库（事务 A：每条一个事务）----------
     const messageIds = msgs.map((m) => m.id);
-    const userId = await userIdOfConversation(params.conversationId, ex);
     const outcomes: CandidateOutcome[] = [];
 
     for (const candidate of candidates) {
@@ -292,7 +315,7 @@ export async function runExtraction(
     // ---------- ⑥ 生成并写入向量（事务外 → 事务 B）----------
     const shouldEmbed = params.generateEmbeddings ?? true;
     const embedStats = shouldEmbed
-      ? await embedOutcomes(outcomes, ex)
+      ? await embedOutcomes(outcomes, ex, timezone)
       : { succeeded: 0, failed: 0, pending: [] as string[] };
 
     // ---------- ⑦ 记录本次抽取的产出 ----------
@@ -384,7 +407,12 @@ async function userIdOfConversation(conversationId: string, options: ExecutorOpt
  * 逐条而非批量：审计 F-12 记录了「TEI 批量返回顺序未经验证」的风险。
  * 一次抽取通常只有 1~5 条，逐条的吞吐损失可忽略。
  */
-async function embedOutcomes(outcomes: CandidateOutcome[], options: ExecutorOption): Promise<{
+async function embedOutcomes(
+  outcomes: CandidateOutcome[],
+  options: ExecutorOption,
+  /** 渲染 valid_from 用。见调用处注释与 shared/local-time.ts */
+  timezone: string = DEFAULT_TIMEZONE
+): Promise<{
   succeeded: number;
   failed: number;
   pending: string[];
@@ -405,7 +433,7 @@ async function embedOutcomes(outcomes: CandidateOutcome[], options: ExecutorOpti
       subject: memory.subjectKey ?? 'user',
       content: memory.content,
       timeHint: memory.validFrom
-        ? `${memory.validFrom.toISOString().slice(0, 10)} 起有效`
+        ? `${formatLocalDateSafe(memory.validFrom, timezone)} 起有效`
         : null,
     });
 

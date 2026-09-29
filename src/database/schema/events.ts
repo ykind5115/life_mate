@@ -24,7 +24,12 @@ import {
 } from 'drizzle-orm/pg-core';
 
 import { createdAt, nullableTime, primaryId, requiredTime, updatedAt } from './_columns.js';
-import { EVENT_CATEGORIES, EVENT_SOURCE_TYPES, inClause } from './enums.js';
+import {
+  EVENT_CATEGORIES,
+  EVENT_PRECISIONS,
+  EVENT_SOURCE_TYPES,
+  inClause,
+} from './enums.js';
 import { messages } from './messages.js';
 import { users } from './users.js';
 
@@ -42,6 +47,35 @@ export const events = pgTable(
 
     /** 事件在现实中发生的时间（业务时间），与 created_at 不同 */
     eventTime: requiredTime('event_time'),
+
+    /**
+     * event_time 的精度（2026-09-29 新增）。
+     *
+     * 【为什么需要单独一列】
+     *   只知日期、不知时刻的事件（大多数）此前被落库成 UTC 零点
+     *   `T00:00:00Z` —— 在北京显示成 **08:00**。
+     *   于是时间线上所有日期级事件都写着 08:00，看起来像
+     *   「这些事都发生在早上八点」，一个不存在的规律。
+     *
+     *   而事件时间**事实上是有精度的**，只是以前无处表达：
+     *     · 「上周三搬到杭州」        → 只知道日期，时刻不存在
+     *     · 「今天上午面试了两个人」  → 知道大概时段
+     *     · 用户明确说「下午三点」    → 知道时刻
+     *   把三者都写成同一个 08:00，等于**编造了时刻**。
+     *
+     * 【取值】
+     *   day    —— 只知道日期。event_time 落在**用户当地那一天的零点**
+     *             （存成 UTC，如北京 09-29 00:00 = 09-28T16:00Z）。
+     *             界面只显示日期，不显示时刻。
+     *   minute —— 知道到分钟。event_time 是真实时刻，界面显示到分钟。
+     *
+     * ⚠️ 为什么「当地零点」而不是「UTC 零点」：
+     *    两者都只表示「这一天」，但当地零点在任何按当地时区显示的
+     *    界面上都会还原成正确的日期；UTC 零点在北京会变成当天 08:00。
+     */
+    eventPrecision: varchar('event_precision', { length: 10 })
+      .notNull()
+      .default('day'),
 
     /** work | study | project | life | health | other，可空 */
     category: varchar('category', { length: 50 }),
@@ -66,6 +100,10 @@ export const events = pgTable(
   (t) => [
     check('chk_events_source_type', sql`${t.sourceType}${sql.raw(inClause(EVENT_SOURCE_TYPES))}`),
     check('chk_events_importance', sql`${t.importanceScore} BETWEEN 0 AND 1`),
+    check(
+      'chk_events_precision',
+      sql`${t.eventPrecision}${sql.raw(inClause(EVENT_PRECISIONS))}`
+    ),
 
     /**
      * C37：category 的库层 CHECK。

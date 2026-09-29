@@ -139,6 +139,47 @@ C39 的落地细节（三处，缺一不可）：
   「用否定记录去抑制后续抽取」属于抽取策略变更，不在本次范围内。
 ```
 
+### 0.3.3 时间精度修订（C40）
+
+C40 来自用户实测：时间线上两条记录看起来互相冲突，排查后发现
+其中一个成因是**所有事件的时间都显示成 08:00**。
+
+| 编号 | 修订 | 类型 | 依据 |
+| ---- | ---- | ---- | ---- |
+| C40 | `events` 新增 **`event_precision`**（`day` / `minute`）；日期级事件的 `event_time` 落在**用户当地零点**而不是 UTC 零点 | 🟠 新增字段 + 数据订正 | 只知日期的事件被写成 UTC 零点，在北京显示成 08:00 —— 时间线上所有事件都像发生在早上八点，一个不存在的规律。精度是**事实属性**，不能用一个假时刻掩盖 |
+
+```text
+C40 的落地细节：
+
+① 精度必须显式表达
+   「上周三搬到杭州」        → day（时刻不存在）
+   「今天上午面试了两个人」  → minute（知道大概时段）
+   把两者写成同一个时刻 = 编造
+
+② 日期级事件落在**当地零点**
+   北京 2026-09-29 00:00 = UTC 2026-09-28T16:00
+   这样任何按当地时区显示的界面都会还原成 09-29；
+   而 UTC 零点在北京会变成当天 08:00。
+   迁移 0005 把已有行从 UTC 零点平移到当地零点（−8 小时）。
+   ⚠️ 实施时第一版写成 +8 小时（方向反了），
+      靠核对「北京墙上时间是否正好是 00:00」才发现 ——
+      改时间数据的迁移必须断言换算后的墙上时间，只看 UPDATE N 看不出方向错。
+
+③ 解析层同时新增两条保护
+   · 落在 UTC 零点上的输入按 day 处理（模型常照旧示例写 T00:00:00Z）
+   · 合理性判据（1900 ≤ 年 ≤ 未来 1 年）收敛为一个 gate()，
+     所有分支共用 —— 此前只有 ISO 分支做了检查，
+     `1899-12-31` 走「只有日期」分支时会被放行
+
+④ 顺带修掉一个**系统性**的时区缺陷
+   全仓库曾有 9 处用 `toISOString().slice(0, 10)` 取「日期」——
+   那取的是 UTC 日期，用户在北京时凌晨 0-8 点的事会被算成前一天。
+   涉及：给 Agent 看的事件日期、事实生效日期、目标日期、
+         回顾周期、抽取提示词的「当前日期」、Retrieval 的 embeddedText。
+   这类错误一直没暴露，只因为事件时间恰好都是 00:00Z（= 当地 08:00，同一天）。
+   现已统一到 `shared/local-time.ts`，全部按 users.timezone 取。
+```
+
 ## 0.4 与 V1.0 的不兼容说明
 
 ```text
@@ -2214,6 +2255,14 @@ ALTER TABLE events             ADD CONSTRAINT chk_events_category
 -- 🟠 C37：conversation_summaries.status 同样只有说明、无库层约束
 ALTER TABLE conversation_summaries ADD CONSTRAINT chk_summaries_status
   CHECK (status IN ('active','stale'));
+
+-- 🟠 C40（2026-09-29）：event_precision
+-- 事件时间**事实上是有精度的**，而此前无处表达 ——
+-- 日期级事件被写成 UTC 零点，在北京显示成 08:00，
+-- 于是时间线上所有事件都像发生在早上八点（一个不存在的规律）。
+ALTER TABLE events             ADD COLUMN event_precision VARCHAR(10) NOT NULL DEFAULT 'day';
+ALTER TABLE events             ADD CONSTRAINT chk_events_precision
+  CHECK (event_precision IN ('day','minute'));
 ```
 
 ## 19.2 取值范围
@@ -3469,6 +3518,7 @@ CREATE TABLE events (
   title             VARCHAR(200) NOT NULL,
   description       TEXT,
   event_time        TIMESTAMPTZ NOT NULL,
+  event_precision   VARCHAR(10) NOT NULL DEFAULT 'day',   -- 🟠 C40
   category          VARCHAR(50),
   importance_score  REAL NOT NULL DEFAULT 0.5,
   source_type       VARCHAR(20) NOT NULL DEFAULT 'conversation',
@@ -3480,7 +3530,8 @@ CREATE TABLE events (
   CONSTRAINT chk_events_source_type CHECK (source_type IN ('conversation','manual','system')),
   CONSTRAINT chk_events_importance  CHECK (importance_score BETWEEN 0 AND 1),
   CONSTRAINT chk_events_category    CHECK (category IS NULL
-    OR category IN ('work','study','project','life','health','other'))
+    OR category IN ('work','study','project','life','health','other')),
+  CONSTRAINT chk_events_precision   CHECK (event_precision IN ('day','minute'))
 );
 CREATE INDEX idx_events_user_time     ON events (user_id, event_time DESC);
 CREATE INDEX idx_events_user_category ON events (user_id, category);

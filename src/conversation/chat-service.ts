@@ -413,7 +413,14 @@ export async function chat(
    *   工具让 Agent 能主动再查一次，而不是只能回答「我这边没有」。
    */
   const tools =
-    deps.tools ?? (deps.enableMemoryTools === false ? [] : createMemoryTools({ userId: user.id }));
+    deps.tools ??
+    (deps.enableMemoryTools === false
+      ? []
+      : /**
+         * 传时区给工具：它们返回的日期会被模型直接用来回答
+         * 「你什么时候面试的」，用 UTC 日期会答错一天（见 tools.ts 的说明）。
+         */
+        createMemoryTools({ userId: user.id, timezone: user.timezone }));
 
   /**
    * 包一层采集器，记录模型这次到底调了什么工具。

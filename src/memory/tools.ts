@@ -33,6 +33,7 @@ import { retrieveMemories } from './retriever.js';
 import { findByIdIncludingInactive } from '../database/repository/memory-queries.js';
 import { getTimeline } from '../timeline/timeline-service.js';
 import type { Memory } from '../database/schema/memories.js';
+import { formatLocalDateSafe, DEFAULT_TIMEZONE, localDayStartUtc } from '../shared/local-time.js';
 
 /**
  * 工具输出的条数上限。
@@ -47,6 +48,15 @@ const MAX_TIMELINE_EVENTS = 20;
 export interface MemoryToolDeps {
   /** 当前用户。V1.0 单用户，但仍显式传入而不是工具内部去查 */
   userId: string;
+  /**
+   * 用户时区，用于把时间渲染成日期。
+   *
+   * ⚠️ 为什么工具需要它：工具返回的日期会**直接被模型用来回答**
+   *    「你什么时候面试的」。早先用 `toISOString().slice(0, 10)`（UTC 日期），
+   *    北京用户晚上发生的事会被模型看成第二天 —— 答错一天。
+   *    缺省用 DEFAULT_TIMEZONE（见 shared/local-time.ts）。
+   */
+  timezone?: string;
 }
 
 /**
@@ -56,7 +66,7 @@ export interface MemoryToolDeps {
  * 而 userId 在构造 ToolDefinition 时才知道。
  */
 export function createMemoryTools(deps: MemoryToolDeps): ToolDefinition[] {
-  return [searchMemoryTool(deps), getMemoryTool(), getTimelineTool(deps)];
+  return [searchMemoryTool(deps), getMemoryTool(deps), getTimelineTool(deps)];
 }
 
 // ============================================================
@@ -104,7 +114,7 @@ function searchMemoryTool(deps: MemoryToolDeps): ToolDefinition {
           content: m.content,
           type: m.type,
           /** 事实生效时间。让模型能正确表述「你之前提到过」而不是「你刚才说」 */
-          valid_from: m.validFrom ? m.validFrom.toISOString().slice(0, 10) : null,
+          valid_from: m.validFrom ? formatLocalDateSafe(m.validFrom, deps.timezone) : null,
         })),
         /**
          * 把降级信息告诉模型。
@@ -126,7 +136,7 @@ function searchMemoryTool(deps: MemoryToolDeps): ToolDefinition {
 // get_memory
 // ============================================================
 
-function getMemoryTool(): ToolDefinition {
+function getMemoryTool(deps: MemoryToolDeps): ToolDefinition {
   return {
     name: 'get_memory',
     description:
@@ -157,7 +167,7 @@ function getMemoryTool(): ToolDefinition {
         };
       }
 
-      return toMemoryDetail(memory);
+      return toMemoryDetail(memory, deps.timezone);
     },
   };
 }
@@ -169,7 +179,7 @@ function getMemoryTool(): ToolDefinition {
  *    模型看到 `status: 'superseded'` 未必知道该怎么向用户表述。
  *    给一句人话（status_hint）能显著减少「它说的话很奇怪」的情况。
  */
-function toMemoryDetail(m: Memory) {
+function toMemoryDetail(m: Memory, timezone?: string) {
   return {
     content: m.content,
     type: m.type,
@@ -178,8 +188,8 @@ function toMemoryDetail(m: Memory) {
     subject_key: m.subjectKey,
     predicate_key: m.predicateKey,
     object_value: m.objectValue,
-    valid_from: m.validFrom ? m.validFrom.toISOString().slice(0, 10) : null,
-    valid_until: m.validUntil ? m.validUntil.toISOString().slice(0, 10) : null,
+    valid_from: m.validFrom ? formatLocalDateSafe(m.validFrom, timezone) : null,
+    valid_until: m.validUntil ? formatLocalDateSafe(m.validUntil, timezone) : null,
     importance: m.importanceScore,
     source_count: m.sourceCount,
   };
@@ -226,8 +236,8 @@ function getTimelineTool(deps: MemoryToolDeps): ToolDefinition {
       const end = readString(args, 'end');
       const category = readString(args, 'category');
 
-      const from = start ? parseDateBoundary(start, 'start') : undefined;
-      const to = end ? parseDateBoundary(end, 'end') : undefined;
+      const from = start ? parseDateBoundary(start, 'start', deps.timezone) : undefined;
+      const to = end ? parseDateBoundary(end, 'end', deps.timezone) : undefined;
 
       /**
        * 直接复用 getTimeline（与 /api/v1/timeline 同一套逻辑）。
@@ -239,6 +249,7 @@ function getTimelineTool(deps: MemoryToolDeps): ToolDefinition {
        */
       const result = await getTimeline({
         userId: deps.userId,
+        ...(deps.timezone !== undefined ? { timezone: deps.timezone } : {}),
         ...(from !== undefined ? { from } : {}),
         ...(to !== undefined ? { to } : {}),
         ...(category !== undefined
@@ -253,7 +264,7 @@ function getTimelineTool(deps: MemoryToolDeps): ToolDefinition {
         .map((e) => ({
           title: e.title,
           description: e.description,
-          event_time: e.eventTime.toISOString().slice(0, 10),
+          event_time: formatLocalDateSafe(e.eventTime, deps.timezone),
           category: e.category,
         }));
 
@@ -303,11 +314,19 @@ function readString(args: unknown, key: string): string | undefined {
  * 与 timeline 路由的同名函数保持一致（start 含当天 00:00，
  * end 含当天 23:59:59.999）—— 两处不一致会导致
  * 「模型查 12 月 31 日」与「用户在界面上查 12 月 31 日」得到不同结果。
+ *
+ * ⚠️ 同样按**用户时区**的当天首尾算。用 UTC 会让北京用户的
+ *    「9 月 29 日」从当天 08:00 才开始 —— 漏掉凌晨的事，
+ *    而 end 又多算到次日 08:00。两处一起改才一致。
  */
-function parseDateBoundary(value: string, kind: 'start' | 'end'): Date | undefined {
-  const dateOnly = /^(\d{4})-(\d{2})-(\d{2})$/.exec(value);
-  const parsed = dateOnly ? new Date(`${value}T00:00:00Z`) : new Date(value);
+function parseDateBoundary(
+  value: string,
+  kind: 'start' | 'end',
+  timezone: string = DEFAULT_TIMEZONE
+): Date | undefined {
+  const dateOnly = /^(\d{4})-(\d{2})-(\d{2})$/.test(value);
+  const parsed = dateOnly ? localDayStartUtc(value, timezone) : new Date(value);
 
-  if (Number.isNaN(parsed.getTime())) return undefined;
+  if (parsed === null || Number.isNaN(parsed.getTime())) return undefined;
   return kind === 'start' ? parsed : new Date(parsed.getTime() + 86400_000 - 1);
 }
