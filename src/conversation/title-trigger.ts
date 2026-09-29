@@ -20,6 +20,7 @@
  */
 import { generateConversationTitle, type GenerateTitleResult } from './conversation-title.js';
 import type { LLMProvider } from '../llm/provider.js';
+import { describeError } from '../shared/error-info.js';
 
 export interface TitleTriggerOptions {
   /**
@@ -132,12 +133,6 @@ export class TitleTrigger {
       }
     }
   }
-}
-
-/** 只取错误描述，不打印整个 error 对象（可能带上对话正文） */
-function describeError(err: unknown): string {
-  if (err instanceof Error) return `${err.name}: ${err.message}`;
-  return '未知错误';
 }
 
 /**

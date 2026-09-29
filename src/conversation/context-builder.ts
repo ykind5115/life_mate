@@ -88,6 +88,14 @@ export interface ContextMessage {
 export interface ContextMemory extends KnownFactInput {
   id: string;
   importanceScore?: number;
+  /**
+   * 重排后的最终得分。
+   *
+   * 只用于**观测**（落进 messages.metadata 的轨迹），不参与组装 ——
+   * 选谁注入在检索阶段就定了，Context Builder 只按传入顺序裁剪。
+   * 留着它的价值：事后能看出「这条回答是不是被一条低分记忆带偏的」。
+   */
+  score?: number;
 }
 
 /**

@@ -28,6 +28,7 @@ import {
 import type { ExtractionTrigger } from '../conversation/extraction-trigger.js';
 import { HttpError, internalError, ok, validationError } from './errors.js';
 import { IdempotencyConflictError } from './idempotency.js';
+import { toLogError } from '../shared/error-info.js';
 import { registerChatRoutes, type ChatRouteDeps } from './routes/chat.js';
 import { registerConversationRoutes } from './routes/conversations.js';
 import { registerMemoryRoutes } from './routes/memories.js';
@@ -133,10 +134,23 @@ export async function buildServer(options: BuildServerOptions = {}): Promise<Fas
      * 日志分两档：
      *   4xx 是客户端问题，用 warn（不记 stack，避免噪音与被滥用的日志膨胀）
      *   5xx 是服务端问题，用 error 并带 stack
-     * 两档都**只带 err.message**，不带 body。
+     * 两档都**只带安全字段**，不带 body。
+     *
+     * 🔴 早先这里写的是 `request.log.error({ err, code })` ——
+     *    实测会把数据库错误里的**参数值**打进日志：
+     *      {"err":{"message":"Failed query: insert into \"messages\" … params: <用户原话>",
+     *              "params":["<用户原话>","user","x",1]}}
+     *    因为 pino 的默认 err 序列化器会把参数的 enumerable 属性（含 params）
+     *    原样带上，连 cause 链一起。这是**通用**错误处理器 ——
+     *    任何一次 5xx（写消息失败、写记忆失败…）都可能把用户正文写进日志文件，
+     *    违反 §29.1 与 §16.2。
+     *
+     *    toLogError 只输出 5 个安全字段（type/code/constraint/message/stack），
+     *    并把命中在文本里的参数值替换掉。约束名与 SQL 文本保留 ——
+     *    它们是 schema 层面的信息，不含用户数据，而排查时最有用。
      */
     if (mapped.status >= 500) {
-      request.log.error({ err, code: mapped.code }, '请求处理失败');
+      request.log.error({ err: toLogError(err), code: mapped.code }, '请求处理失败');
     } else {
       request.log.warn({ code: mapped.code, message: mapped.message }, '请求被拒绝');
     }

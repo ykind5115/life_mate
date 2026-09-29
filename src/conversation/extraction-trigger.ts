@@ -24,6 +24,7 @@ import { eq, sql } from 'drizzle-orm';
 import { db } from '../database/client.js';
 import { messages } from '../database/schema/messages.js';
 import { runExtraction, type ExtractionSummary } from '../memory/extraction-pipeline.js';
+import { describeError } from '../shared/error-info.js';
 
 export interface ExtractionTriggerOptions {
   /**
@@ -193,12 +194,6 @@ async function countConversationMessages(conversationId: string): Promise<number
     .where(eq(messages.conversationId, conversationId));
 
   return rows[0]?.n ?? 0;
-}
-
-/** 只取错误描述，不打印整个 error 对象（可能带上用户消息正文） */
-function describeError(err: unknown): string {
-  if (err instanceof Error) return `${err.name}: ${err.message}`;
-  return '未知错误';
 }
 
 /**

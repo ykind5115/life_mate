@@ -30,6 +30,7 @@ import {
   type VectorCandidate,
 } from '../database/repository/retrieval-queries.js';
 import type { Memory } from '../database/schema/memories.js';
+import { describeError } from '../shared/error-info.js';
 import {
   CHANNEL_LIMIT,
   FUSION_LIMIT,
@@ -275,8 +276,3 @@ export async function retrieveMemories(
 // ============================================================
 // 内部
 // ============================================================
-
-function describeError(err: unknown): string {
-  if (err instanceof Error) return `${err.name}: ${err.message}`;
-  return '未知错误';
-}

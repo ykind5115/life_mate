@@ -13,6 +13,7 @@ import { buildServer } from './server.js';
 import { env } from '../shared/env.js';
 import { closePool } from '../database/client.js';
 import { ensureDefaultUser } from '../database/repository/user-store.js';
+import { toLogError } from '../shared/error-info.js';
 
 async function main(): Promise<void> {
   /**
@@ -38,7 +39,7 @@ async function main(): Promise<void> {
       await closePool();
       process.exit(0);
     } catch (err) {
-      app.log.error({ err }, '退出过程中出错');
+      app.log.error({ err: toLogError(err) }, '退出过程中出错');
       process.exit(1);
     }
   };

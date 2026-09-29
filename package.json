@@ -25,7 +25,9 @@
     "eval:extraction": "node --env-file=.env --env-file-if-exists=.env.eval --import tsx src/evaluation/run-extraction-eval.ts",
     "eval:retrieval": "node --env-file=.env --env-file-if-exists=.env.eval --import tsx src/evaluation/run-retrieval-eval.ts",
     "eval:prompt-compare": "node --env-file=.env --import tsx src/evaluation/run-prompt-compare.ts",
-    "db:studio": "drizzle-kit studio"
+    "db:studio": "drizzle-kit studio",
+    "replay:hallucination": "node --env-file=.env --import tsx audit/replay-hallucination.ts",
+    "probe:log-leak": "node --env-file=.env --import tsx audit/probe-log-leak.ts"
   },
   "dependencies": {
     "@fastify/static": "^10.1.4",

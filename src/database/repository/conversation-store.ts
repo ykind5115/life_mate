@@ -23,6 +23,10 @@ import { and, asc, count, desc, eq, inArray, isNull, ne, notInArray, sql } from 
 import { db } from '../client.js';
 import { conversations, type Conversation } from '../schema/conversations.js';
 import { messages, type Message } from '../schema/messages.js';
+import {
+  parseMessageMetadata,
+  type MessageMetadata,
+} from '../schema/message-metadata.js';
 import { conversationSummaries } from '../schema/conversation-summaries.js';
 import { memories } from '../schema/memories.js';
 import { memoryEmbeddings } from '../schema/memory-embeddings.js';
@@ -40,6 +44,14 @@ export const DELETED_CONVERSATION_TITLE = '[已删除的对话]';
 function aliveConversationCondition() {
   return and(isNull(conversations.deletedAt), ne(conversations.status, 'deleted'))!;
 }
+
+/**
+ * appendMessage 接受的 metadata 形状。
+ *
+ * 用具名别名而不是 `Record<string, unknown>`：调用方在编译期就能看到
+ * 允许哪些键，而不是运行时才被 Zod 拒绝。
+ */
+export type MessageMetadataInput = MessageMetadata;
 
 // ============================================================
 // 会话
@@ -242,13 +254,19 @@ export async function touchConversation(
  * ⚠️ 唯一约束仍然是最终防线：真正的并发下仍可能有一个请求拿到 23505，
  *    调用方（服务层）应把它当作「可重试的序号冲突」而不是内部错误。
  *    单用户场景下不会发生，但不能假设它不会。
+ *
+ * ⚠️ metadata 在**这里**校验，而不是信调用方（§16.3 的强制要求）。
+ *    白名单之外的键会抛 ZodError —— 这是刻意的：
+ *    静默丢弃会让「我明明写了为什么查不到」变成新的谜题，
+ *    而允许任意键则等于 §16.2 那条「不得存正文副本」形同虚设。
  */
 export async function appendMessage(
   input: {
     conversationId: string;
     role: Message['role'];
     content: string;
-    metadata?: Record<string, unknown>;
+    /** 白名单结构，见 database/schema/message-metadata.ts */
+    metadata?: MessageMetadataInput;
   },
   options: ExecutorOption = {}
 ): Promise<Message> {
@@ -260,7 +278,7 @@ export async function appendMessage(
       conversationId: input.conversationId,
       role: input.role,
       content: input.content,
-      metadata: input.metadata ?? {},
+      metadata: parseMessageMetadata(input.metadata),
       sequence: sql`(
         SELECT COALESCE(MAX(${messages.sequence}), 0) + 1
           FROM ${messages}

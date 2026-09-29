@@ -20,6 +20,7 @@ import {
   type ChatServiceDeps,
 } from '../../conversation/chat-service.js';
 import type { ContextMemory } from '../../conversation/context-builder.js';
+import type { RetrievalTrace } from '../../database/schema/message-metadata.js';
 import { retrieveMemories } from '../../memory/retriever.js';
 import {
   getDefaultExtractionTrigger,
@@ -32,6 +33,7 @@ import {
 import { getDefaultTitleTrigger, type TitleTrigger } from '../../conversation/title-trigger.js';
 import { ok } from '../errors.js';
 import { env } from '../../shared/env.js';
+import { toLogError } from '../../shared/error-info.js';
 import { chatRequestSchema, toChatParams } from '../schemas.js';
 import { fingerprintChat, IdempotencyStore } from '../idempotency.js';
 import { parseIdempotencyKey, SseStream } from '../sse.js';
@@ -73,10 +75,25 @@ function idempotencyOf(deps: ChatRouteDeps): IdempotencyStore<ChatResult> {
 }
 
 /**
+ * 上一次检索的诊断信息。
+ *
+ * ⚠️ 为什么用模块级变量这种「土」办法：诊断数据产生在 defaultRetrieve 里，
+ *    而 ChatService 只拿到返回的 memories 数组。让它多返回一个诊断对象
+ *    要改 retrieveMemories 的签名与所有调用方（含离线评测）；
+ *    加一个读取器代价最小。
+ *
+ * ⚠️ 这是**进程内单用户**场景。并发两个请求时后一个会覆盖前一个，
+ *    最坏结果是某一轮记错诊断 —— 观测数据的轻微失真，
+ *    不影响注入本身（注入用的是各自的返回值，不走这个变量）。
+ *    真要做到严格，得把诊断塞进返回值，那是更大的改动，等真有第二个用户再说。
+ */
+let lastRetrievalDiagnostics: RetrievalTrace | undefined;
+
+/**
  * 默认的记忆检索实现。
  *
  * 把检索结果映射成 Context Builder 需要的形状（ContextMemory），
- * 只保留注入需要的最小字段 —— Content Builder 不该看到 status / 向量等内部细节。
+ * 只保留注入需要的最小字段 —— Context Builder 不该看到 status / 向量等内部细节。
  *
  * ⚠️ 这里**不抛错**：retrieveMemories 自身已把各种依赖失败降级为
  *    「返回空 + 记录 degradation」，因此聊天不会因检索出问题而失败（§45 的同类原则）。
@@ -86,6 +103,23 @@ async function defaultRetrieve(params: {
   query: string;
 }): Promise<ContextMemory[]> {
   const result = await retrieveMemories({ userId: params.userId, query: params.query });
+
+  /**
+   * 存下诊断供落库。
+   *
+   * 排查 2026-09-29 那次幻觉时，我要问「当时检索各通道命中多少、有没有降级」，
+   * 而答案只在那行**仅在降级时**才打印的 console 里 —— 事后完全查不到。
+   */
+  lastRetrievalDiagnostics = {
+    performed: true,
+    channelHits: result.diagnostics.channelHits,
+    fusedCount: result.diagnostics.fusedCount,
+    returned: result.diagnostics.returned,
+    ...(result.diagnostics.degradations.length > 0
+      ? { degradations: [...result.diagnostics.degradations] }
+      : {}),
+    timingsMs: { ...result.diagnostics.timings },
+  };
 
   if (result.diagnostics.degradations.length > 0) {
     /**
@@ -101,13 +135,30 @@ async function defaultRetrieve(params: {
     );
   }
 
-  return result.memories.map((m) => ({
-    id: m.id,
-    content: m.content,
-    type: m.type,
-    validFrom: m.validFrom,
-    importanceScore: m.importanceScore,
-  }));
+  /**
+   * 先建 id → 分数 的索引再映射。
+   *
+   * 用 Map 而不是在 map 里 `candidates.find(...)`：后者是 O(n×m)，
+   * 虽然当前 n≤8、m≤30 无所谓，但这是纯粹的写法问题，没有理由留个平方复杂度。
+   */
+  const scoreById = new Map(result.candidates.map((c) => [c.memory.id, c.finalScore]));
+
+  return result.memories.map((m) => {
+    const score = scoreById.get(m.id);
+    return {
+      id: m.id,
+      content: m.content,
+      type: m.type,
+      validFrom: m.validFrom,
+      importanceScore: m.importanceScore,
+      /**
+       * 只用于落库的观测轨迹（见 ContextMemory.score）。
+       * 条件展开而不是直接赋 undefined：tsconfig 开了
+       * exactOptionalPropertyTypes，显式 undefined 不算「缺省」。
+       */
+      ...(score !== undefined ? { score } : {}),
+    };
+  });
 }
 
 export async function registerChatRoutes(
@@ -169,6 +220,13 @@ export async function registerChatRoutes(
     ...(titleTrigger !== undefined ? { titleTrigger } : {}),
     ...(deps.provider !== undefined ? { provider: deps.provider } : {}),
     ...(retrieveMemories !== undefined ? { retrieveMemories } : {}),
+    /**
+     * 诊断读取器只在用**真实检索**时才有意义：注入了自定义 retrieveMemories
+     * 的测试不产生诊断，硬接上去会读到上一次真实请求留下的旧值（串数据）。
+     */
+    ...(retrieveMemories === defaultRetrieve
+      ? { retrieveDiagnostics: () => lastRetrievalDiagnostics }
+      : {}),
   };
 
   // ==========================================================
@@ -190,7 +248,11 @@ export async function registerChatRoutes(
     const signal = abortSignalOf(request);
 
     const result = await idempotency.run(idempotencyKey, fingerprintChat(params), () =>
-      chat({ ...params, signal }, serviceDeps)
+      chat(
+        { ...params, signal },
+        // request.log 带 request_id：服务层的日志从此能与这次访问对上
+        { ...serviceDeps, logger: request.log, requestId: request.id }
+      )
     );
 
     if (result.replayed) {
@@ -235,6 +297,8 @@ export async function registerChatRoutes(
         { ...params, signal: controller.signal },
         {
           ...serviceDeps,
+          logger: request.log,
+          requestId: request.id,
           onToken: (token) => stream.write({ type: 'token', content: token }),
         }
       );
@@ -287,8 +351,12 @@ export async function registerChatRoutes(
       /**
        * 流已经开始，改不了状态码，只能把错误作为事件发出去。
        * ⚠️ 不发送原始 message：可能是 SQL 或上游返回的片段（docs/04 §44）。
+       *
+       * ⚠️ 日志同样不能给原始 err：pino 会带出 params（见 shared/error-info.ts
+       *    文件头的实测记录）。这条路径专门捕获数据库错误，
+       *    而 messages 表的 content 就是用户原话。
        */
-      request.log.error({ err }, 'SSE 对话失败');
+      request.log.error({ err: toLogError(err), requestId: request.id }, 'SSE 对话失败');
       stream.write({ type: 'error', code: sseErrorCode(err), message: sseErrorMessage(err) });
     } finally {
       stream.close();

@@ -27,7 +27,6 @@
  *      因此「补跑」是安全的：下次该会话有新消息时会一并覆盖。
  */
 import type { LLMProvider } from '../llm/provider.js';
-import { LLMError } from '../llm/provider.js';
 import type { ToolDefinition } from '../agent/loop.js';
 import { runAgent } from '../agent/loop.js';
 import { db } from '../database/client.js';
@@ -53,11 +52,33 @@ import type { ExtractionTrigger } from './extraction-trigger.js';
 import type { SummaryTrigger } from './summary-trigger.js';
 import type { TitleTrigger } from './title-trigger.js';
 import { buildPlaceholderTitle } from './conversation-title.js';
+import { applyToolEvents, createTraceCollector } from './trace-collector.js';
 import { isAutoExtractEnabled } from './settings-service.js';
 import { createMemoryTools } from '../memory/tools.js';
+import { AGENT_PROMPT_VERSION } from './prompts.js';
+import {
+  buildMessageMetadata,
+  type InjectedMemoryRef,
+  type RetrievalTrace,
+} from '../database/schema/message-metadata.js';
+import type { AgentEvent } from '../agent/loop.js';
+import { describeError } from '../shared/error-info.js';
 
 /** 从历史消息中排除的角色：system / tool 不属于「短期对话上下文」 */
 const CONTEXT_ROLES = new Set(['user', 'assistant']);
+
+/**
+ * 日志器缺省值。直接调用 chat() 的脚本（重放、e2e 检查）不该被迫构造 logger，
+ * 而观测代码绝不能因为「没传 logger」而抛错。
+ */
+const consoleLogger = {
+  warn: (obj: Record<string, unknown>, msg: string): void => {
+    console.warn(msg, obj);
+  },
+  error: (obj: Record<string, unknown>, msg: string): void => {
+    console.error(msg, obj);
+  },
+};
 
 export interface ChatParams {
   /** 为 null / undefined 时新建会话 */
@@ -169,6 +190,40 @@ export interface ChatServiceDeps {
    * 生产代码传固定值会让上下文里的「今天」永远停在那一刻。
    */
   now?: Date;
+  /**
+   * 请求级日志器。
+   *
+   * 【为什么必须注入，而不是让服务层用 console】
+   *   routes/chat.ts 里用的是 `request.log`（带 request_id），
+   *   而服务层此前用 `console.error` —— 后者**没有 request_id**。
+   *   于是「这一次回答为什么怪」要去日志里捞，却没有任何关联键。
+   *
+   *   接口类型只要求 warn/error 两个方法：这样测试传一个记录数组即可，
+   *   不必引入 pino。Fastify 的 request.log 天然满足这个形状。
+   *
+   * 缺省回退到 console —— 直接调用 chat() 的脚本（重放、e2e 检查）
+   * 不该被迫构造一个 logger。
+   */
+  logger?: {
+    warn: (obj: Record<string, unknown>, msg: string) => void;
+    error: (obj: Record<string, unknown>, msg: string) => void;
+  };
+  /**
+   * HTTP 请求 id（docs/04 §42）。落进轨迹，用于把一次回答与访问日志对上。
+   */
+  requestId?: string;
+  /**
+   * 取上一次检索的诊断信息。
+   *
+   * 为什么是「取」而不是「传」：诊断数据产生在 retrieveMemories 内部
+   * （routes/chat.ts 的 defaultRetrieve 拿到了它），
+   * 而 ChatService 只看到返回的 memories 数组。
+   * 让 retrieveMemories 多返回一个诊断对象会改变它的签名、
+   * 影响所有调用方；加一个「取上一次结果」的读取器代价最小。
+   *
+   * ⚠️ 约定：必须在 retrieveMemories 之后调用才有效。
+   */
+  retrieveDiagnostics?: () => RetrievalTrace | undefined;
 }
 
 /**
@@ -196,6 +251,7 @@ export async function chat(
   deps: ChatServiceDeps = {}
 ): Promise<ChatResult> {
   const provider = deps.provider ?? (await defaultProvider());
+  const log = deps.logger ?? consoleLogger;
 
   // ---------- ② 解析会话 ----------
   const user = await getOrCreateDefaultUser();
@@ -288,22 +344,50 @@ export async function chat(
    *    两者的区别对排查很重要：前者是功能没开，后者是服务出问题。
    */
   let retrieval: MemoryRetrieval;
+  /**
+   * 检索阶段的可观测数据，随消息落库。
+   *
+   * ⚠️ 此前这些数据**只有日志里有过一行**（routes/chat.ts 打的降级日志），
+   *    而且只在有降级时才打。排查 09-29 那次幻觉时我要问
+   *    「当时注入了哪几条记忆」，翻遍库和日志都答不上来。
+   */
+  let retrievalTrace: RetrievalTrace | undefined;
+  /** 注入用的记忆指针（id + type + 分数），不含正文 */
+  let injectedRefs: InjectedMemoryRef[] = [];
+  let retrievalMs: number | undefined;
+
   if (deps.retrieveMemories) {
+    const retrievalStartedAt = Date.now();
     try {
       const memories = await deps.retrieveMemories({ userId: user.id, query: params.message });
+      retrievalMs = Date.now() - retrievalStartedAt;
       retrieval = { performed: true, memories };
+      injectedRefs = memories.map((m) => ({
+        id: m.id,
+        type: m.type,
+        ...(m.score !== undefined ? { score: m.score } : {}),
+      }));
+      retrievalTrace = deps.retrieveDiagnostics?.() ?? { performed: true };
     } catch (err) {
+      retrievalMs = Date.now() - retrievalStartedAt;
       /**
        * 检索失败降级为「没有记忆」而不是让聊天失败。
        *
        * 判断依据：检索是**增强**，不是完成对话的必要条件；
        * 而用户此刻在等一次回答。失败原因记录下来（不含正文）。
+       *
+       * 用注入的 logger 而不是 console：见 ChatServiceDeps.logger 的说明。
        */
-      console.error('[chat] 记忆检索失败，降级为无记忆上下文：', describeError(err));
+      log.error(
+        { requestId: deps.requestId, reason: describeError(err) },
+        '记忆检索失败，降级为无记忆上下文'
+      );
       retrieval = { performed: true, skippedReason: 'failed', memories: [] };
+      retrievalTrace = { performed: true, skippedReason: 'failed' };
     }
   } else {
     retrieval = { performed: false, skippedReason: 'not_implemented', memories: [] };
+    retrievalTrace = { performed: false, skippedReason: 'not_implemented' };
   }
 
   const context = buildChatContext({
@@ -331,15 +415,90 @@ export async function chat(
   const tools =
     deps.tools ?? (deps.enableMemoryTools === false ? [] : createMemoryTools({ userId: user.id }));
 
+  /**
+   * 包一层采集器，记录模型这次到底调了什么工具。
+   *
+   * 为什么必须记：2026-09-29 那次幻觉里，出问题的那一轮 `iterations=2`
+   * （说明它调了工具），而工具调用的名字、参数、返回**一个都没留下**——
+   * 故障恰好发生在唯一没有记录的那一步。这是最糟的排查处境。
+   *
+   * 采集器只记键名与长度，不记内容（§16.2 禁止正文副本进入 JSONB）。
+   */
+  const collector = createTraceCollector(tools);
+  /** 采集 Loop 的事件，用于回填「截断」与「执行前失败」两类信息 */
+  const agentEvents: AgentEvent[] = [];
+
+  const agentStartedAt = Date.now();
   const agentResult = await runAgent({
     provider,
     messages: context.messages,
-    tools,
+    tools: collector.tools,
+    onEvent: (e) => agentEvents.push(e),
     ...(params.signal !== undefined ? { signal: params.signal } : {}),
     ...(deps.onToken !== undefined ? { onToken: deps.onToken } : {}),
   });
+  const agentTotalMs = Date.now() - agentStartedAt;
+
+  const toolCalls = collector.summary();
+  applyToolEvents(toolCalls, agentEvents);
 
   // ---------- ⑤ 落库：会话（首次）→ 用户消息 → 助手消息 ----------
+  /**
+   * 组装要落库的轨迹（白名单校验在 buildMessageMetadata 里做）。
+   *
+   * ⚠️ 校验失败**不让对话失败** —— 只放弃这次轨迹，并记一行日志。
+   *    理由：一轮对话已经花掉真实 token 与几十秒，
+   *    不能因为「记录观测数据时多了个字段」而丢掉用户的对话。
+   *    三种损失里，少记一次轨迹是最轻的那种。
+   */
+  const { metadata: assistantMetadata, problem: metadataProblem } = buildMessageMetadata({
+    ...(deps.requestId !== undefined ? { requestId: deps.requestId } : {}),
+    promptVersion: AGENT_PROMPT_VERSION,
+    provider: provider.providerName,
+    model: agentResult.model,
+    finishReason: agentResult.finishReason,
+    ...(agentResult.truncatedBy !== undefined ? { truncatedBy: agentResult.truncatedBy } : {}),
+    iterations: agentResult.iterations,
+    toolCallsExecuted: agentResult.toolCallsExecuted,
+    usage: agentResult.usage,
+    timingsMs: {
+      agentTotal: agentTotalMs,
+      ...(retrievalMs !== undefined ? { retrieval: retrievalMs } : {}),
+    },
+    context: {
+      historyCount: context.meta.historyCount,
+      injectedMemoryCount: context.meta.injectedMemoryCount,
+      droppedMemoryCount: context.meta.droppedMemoryCount,
+      approxTokens: context.meta.approxTokens,
+      timeMarkerCount: context.meta.timeMarkerCount,
+      timezone: user.timezone,
+      summaryCount: context.meta.summaryCount,
+    },
+    ...(retrievalTrace !== undefined ? { retrieval: retrievalTrace } : {}),
+    /** 只存 id 与类型：正文留在 memories 表里，要看时 JOIN 过去 */
+    injectedMemories: context.messages
+      .length === 0
+      ? []
+      : injectedRefs.map((m) => ({
+          id: m.id,
+          type: m.type,
+          ...(m.score !== undefined ? { score: m.score } : {}),
+        })),
+    toolCalls,
+    answerChars: agentResult.content.length,
+  });
+
+  if (metadataProblem !== undefined) {
+    /**
+     * 用注入的 logger 而不是 console：服务层的 console.* 会丢掉 request_id，
+     * 那正是排查时最先要的东西（见 ChatServiceDeps.logger 的说明）。
+     */
+    log.warn(
+      { requestId: deps.requestId, problem: metadataProblem },
+      '消息轨迹未通过白名单校验，已放弃记录（不影响对话）'
+    );
+  }
+
   /**
    * ⚠️ 三条写入放在**同一个事务**里。
    *
@@ -381,17 +540,21 @@ export async function chat(
         role: 'assistant',
         content: agentResult.content,
         /**
-         * 元数据里只放**可观测指标**，不放正文（§29.1）。
-         * 模型与用量值得留：排查「为什么这次答得怪」时，
-         * 第一件事就是看用的哪个模型、是否被截断。
+         * 只放**可观测指标**，不放正文（§29.1）。
+         *
+         * 结构见 database/schema/message-metadata.ts —— 那里是白名单的
+         * 唯一出处，且由 Zod 强制（§16.3）。这里只负责把数据凑齐。
+         *
+         * 排查 2026-09-29 那次幻觉需要回答的七件事，逐一对应下面的字段：
+         *   ① 当时是哪版提示词？   → promptVersion
+         *   ② 注入了哪几条记忆？   → injectedMemories（只存 id，正文 JOIN 回表）
+         *   ③ 检索各通道命中多少？ → retrieval
+         *   ④ 调了什么工具、拿到多少？ → toolCalls
+         *   ⑤ 耗时与 token？        → timingsMs / usage
+         *   ⑥ 有没有被截断？        → truncatedBy
+         *   ⑦ 与哪次 HTTP 请求对应？ → requestId
          */
-        metadata: {
-          model: agentResult.model,
-          iterations: agentResult.iterations,
-          ...(agentResult.truncatedBy !== undefined
-            ? { truncatedBy: agentResult.truncatedBy }
-            : {}),
-        },
+        metadata: assistantMetadata,
       },
       { executor: tx }
     );
@@ -554,16 +717,4 @@ export class ConversationDeletedError extends Error {
 async function defaultProvider(): Promise<LLMProvider> {
   const mod = await import('../llm/index.js');
   return mod.getLLMProvider();
-}
-
-/**
- * 生成可安全记录的简短错误描述。
- *
- * ⚠️ 只取 message，不打印整个 error 对象：LLM 客户端库的异常里
- *    常带上请求体（含用户消息）与请求头（含 API Key）。
- */
-function describeError(err: unknown): string {
-  if (err instanceof LLMError) return `${err.name}: ${err.message}`;
-  if (err instanceof Error) return `${err.name}: ${err.message}`;
-  return '未知错误';
 }
