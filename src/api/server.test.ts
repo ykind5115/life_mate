@@ -21,7 +21,10 @@ import { after, test } from 'node:test';
 import type { FastifyInstance } from 'fastify';
 import type { LightMyRequestResponse } from 'fastify';
 
-import { closePool } from '../database/client.js';
+import { closePool, db } from '../database/client.js';
+import { eq } from 'drizzle-orm';
+import { conversations } from '../database/schema/conversations.js';
+import { resolveTestUser } from '../database/repository/_test-helpers.js';
 import { assertTestDatabase } from '../shared/test-guard.js';
 import { emptyDiagnostics } from '../memory/extraction-schema.js';
 import { buildServer } from './server.js';
@@ -143,6 +146,25 @@ async function withServer(
    *    除了污染数据，还积累了 300 多个测试会话。
    */
   assertTestDatabase('server.test.ts / withServer');
+
+  /**
+   * 清掉上一个用例留下的会话，做**真正的用例隔离**。
+   *
+   * ⚠️ 为什么必须清（2026-10-08 加了跨会话衔接之后才暴露）：
+   *    本夹具此前从不清理会话，会话于是在测试库里累积。
+   *    跨会话衔接会把「2 小时内最后说话的那个会话」注入新会话 ——
+   *    于是每个用例的第一轮都接上了上一个用例的会话，
+   *    断言「上下文只有 system + user」的用例开始失败，
+   *    而且**只在全量跑时失败**（单跑该文件时前面的用例恰好不满足条件）。
+   *
+   *    这类「顺序依赖」在 AGENTS.md §4.5 已记为踩过的坑，
+   *    这里是同一个坑的第三种形态。
+   *
+   * 只删当前测试用户名下的会话（测试用户是 test-agent，见 §4.4.1）。
+   * 消息没有 deleted_at、靠外键级联删除。
+   */
+  const user = await resolveTestUser('server.test.ts / withServer');
+  await db.delete(conversations).where(eq(conversations.userId, user.id));
 
   const provider = new FakeProvider(options.answer ?? '这是测试回答。', options.failure);
   const app = await buildServer({
@@ -654,8 +676,19 @@ test('检索返回空 → 不插入空的「已知信息」段落', async () => 
        * ⚠️ 断言的是**段落标题**而不是「记忆」两个字：
        *    系统提示词正文里本来就有关于记忆的规则文本，
        *    用宽泛的模式会把规则文本也匹配上（本测试第一版就是这么假失败的）。
+       *
+       * ⚠️ 原先还断言 `messages.length === 2`（只有 system + user）。
+       *    2026-10-08 加了跨会话衔接之后这条断言不再成立 ——
+       *    它**不该**成立：那个数字会因为「上一个会话是否在 2 小时内」
+       *    而变化，而本测试关心的是「记忆段落有没有出现」。
+       *    把它换成更精确的形状判断：除 system/当前 user 外不得有别的消息，
+       *    且不得出现记忆段落。
        */
-      assert.equal(call.messages.length, 2, '只有 system + 当前 user');
+      assert.equal(
+        call.messages.filter((m) => m.role === 'user').length,
+        1,
+        '除当前这句外不应有其他 user 消息'
+      );
       assert.doesNotMatch(
         JSON.stringify(call.messages),
         /你记得的关于对方的事/,

@@ -325,6 +325,93 @@ export async function findMessages(
 }
 
 /**
+ * 取「上一个会话」及其末尾若干条消息（跨会话衔接用，docs/15）。
+ *
+ * 【要解决什么】
+ *   用户在短时间内开两个会话时，第二个会话的第一轮历史是空的 ——
+ *   上下文组装只看当前会话，导致模型接不上「刚刚聊到哪」。
+ *   实测（2026-10-08）：会话 A 10:14 结束、会话 B 10:15 开始，
+ *   模型在 B 里连续三次坚称「你没跟我说过」，还编了个「你刚才没细讲」的理由。
+ *
+ * 【为什么必须带 user_id 过滤】
+ *   多用户隔离的**唯一**依据就是这个条件。少写它等于把别人的对话
+ *   拼进当前用户的上下文 —— 与记忆检索同一个纪律，不是可选项。
+ *
+ * 【排除条件】
+ *   · 当前会话自己（excludeConversationId）—— 否则会把自己当成"上一个"
+ *   · 已删除的会话（deleted_at IS NOT NULL）—— 用户删掉的内容不得复活，
+ *     这与 §24.1 的删除意图直接冲突
+ *   · 没有任何消息的会话 —— 空会话没有可衔接的内容
+ */
+export async function findPreviousConversationWithTail(
+  params: {
+    userId: string;
+    /**
+     * 要排除的会话（通常是当前会话）。
+     *
+     * ⚠️ **可以省略**，省略时不加排除条件。
+     *    不要传空串来「表示没有」—— `id <> ''` 会和 uuid 列比较，
+     *    PostgreSQL 直接报 `invalid input syntax for type uuid: ""`（22P02）。
+     *    实测踩到（2026-10-08）：新会话第一轮恰好没有会话 id，
+     *    于是这个功能在**真实场景下 100% 失效**，而当时写的测试
+     *    全都传了合法 UUID，一个都没抓到。
+     */
+    excludeConversationId?: string;
+    /** 只考虑「最后一条消息」在此时刻之后的会话（时间窗） */
+    since: Date;
+    /** 取末尾多少条消息 */
+    limit: number;
+  },
+  options: ExecutorOption = {}
+): Promise<{ conversation: Conversation; messages: Message[] } | null> {
+  const exec = options.executor ?? db;
+
+  /**
+   * 找「最后一条消息最新」的那个会话。
+   *
+   * 用 messages 的 max(created_at) 而不是 conversations.updated_at：
+   *   updated_at 会被标题生成、摘要写入等后台动作刷新，
+   *   那些动作与「用户最后说话的时间」不是一回事 —— 用它会选错会话。
+   */
+  const latestMessageAt = sql<Date>`max(${messages.createdAt})`;
+
+  const conds = [
+    eq(conversations.userId, params.userId),
+    isNull(conversations.deletedAt),
+  ];
+  // 条件式加入，而不是传一个空串进去
+  if (params.excludeConversationId !== undefined) {
+    conds.push(ne(conversations.id, params.excludeConversationId));
+  }
+
+  const rows = await exec
+    .select({
+      conversation: conversations,
+      lastMessageAt: latestMessageAt,
+    })
+    .from(conversations)
+    .innerJoin(messages, eq(messages.conversationId, conversations.id))
+    .where(and(...conds))
+    .groupBy(conversations.id)
+    .having(sql`max(${messages.createdAt}) >= ${params.since}`)
+    .orderBy(desc(latestMessageAt))
+    .limit(1);
+
+  const found = rows[0];
+  if (!found) return null;
+
+  const tail = await findRecentMessages(
+    { conversationId: found.conversation.id, limit: params.limit },
+    options
+  );
+
+  // 理论上 innerJoin 已保证非空；真为空也只是没有可注入的内容
+  if (tail.length === 0) return null;
+
+  return { conversation: found.conversation, messages: tail };
+}
+
+/**
  * 取会话最近的 N 条消息，**返回时按时间正序**。
  *
  * 用途：组装 Agent 上下文。实现上先按 sequence 倒序取 N 条，

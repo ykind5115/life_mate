@@ -114,6 +114,39 @@ export interface MemoryRetrieval {
   memories: ContextMemory[];
 }
 
+/**
+ * 跨会话衔接的时间窗（分钟）—— docs/15。
+ *
+ * 【默认 2 小时的依据】
+ *   与 TIME_GAP_MARKER_MINUTES = 60 同一套口径：超过这个量级就不算
+ *   「同一段连续对话」了。2 小时是「连着聊」的宽松上界 ——
+ *   用户在 20 分钟内换个窗口继续聊，必然落在窗内；
+ *   隔了半天再开新会话，则不该把旧话题硬接上来。
+ *
+ * ⚠️ 用户已明确选择 2 小时（2026-10-08）。改这个值等于改产品行为。
+ */
+export const PREVIOUS_CONVERSATION_WINDOW_MINUTES = 120;
+
+/**
+ * 跨会话衔接注入的条数。
+ *
+ * 6 条 ≈ 3 轮往复：足够看出「刚才在聊什么、聊到哪一步」，
+ * 又不至于喧宾夺主。用户已明确选择 6（2026-10-08）。
+ */
+export const PREVIOUS_CONVERSATION_MESSAGE_LIMIT = 6;
+
+/**
+ * 上一个会话的末尾消息（跨会话衔接用，docs/15）。
+ *
+ * 只在**新会话的第一轮**注入 —— 见 BuildChatContextParams.previousConversation。
+ */
+export interface PreviousConversationTail {
+  /** 上一个会话的标题。可能为空（新会话还没生成标题） */
+  title?: string | null;
+  /** 末尾若干条消息，按时间正序 */
+  messages: ContextMessage[];
+}
+
 export interface BuildChatContextParams {
   /** 会话历史（应已按时间正序，且是**最近**的 N 条） */
   recentMessages: ContextMessage[];
@@ -160,6 +193,22 @@ export interface BuildChatContextParams {
   injectLimit?: number;
   /** 注入 token 预算。缺省 DEFAULT_INJECTION_TOKEN_BUDGET */
   injectTokenBudget?: number;
+  /**
+   * 上一个会话的末尾消息（docs/15 跨会话衔接）。
+   *
+   * 【什么时候该传】
+   *   只在**新会话的第一轮**传。会话进行到第二轮以后，
+   *   当前会话自己的历史已经足够，再塞上一个会话只会白占 token，
+   *   还可能把话题带偏。调用方负责判断（见 chat-service）。
+   *
+   * 【为什么不是「历史消息」而是单独一段】
+   *   它必须被**明确标注来源**。若混进 recentMessages 当成普通历史，
+   *   模型会以为那是当前会话里发生过的 —— 那么当用户说
+   *   「你刚才说的」时，它仍然说不清那是哪个对话里的内容。
+   *   实测场景（2026-10-08）：模型连自己「看过什么」都不知道，
+   *   于是编造「你刚才没细讲」这类理由。
+   */
+  previousConversation?: PreviousConversationTail;
 }
 
 export interface BuiltChatContext {
@@ -180,6 +229,14 @@ export interface BuiltChatContext {
     approxTokens: number;
     /** 实际插入的时间标记条数（观测用：能看出历史是否被切成了多段） */
     timeMarkerCount: number;
+    /**
+     * 跨会话衔接注入了多少条（0 表示没有注入）。
+     *
+     * 只记条数，不记标题与正文（docs/03 §29.1）。
+     * 有它的价值：事后能分清「这次接不上」是因为没注入，
+     * 还是注入了但模型没用上。
+     */
+    previousConversationCount: number;
   };
 }
 
@@ -244,6 +301,22 @@ export function buildChatContext(params: BuildChatContextParams): BuiltChatConte
     messages.push({ role: 'system', content: buildSummarySection(summaries) });
   }
 
+  /**
+   * 跨会话衔接（docs/15）。
+   *
+   * ⚠️ 位置：在摘要之后、当前会话历史之前。
+   *    它讲的是「刚刚在别处发生的事」，排在历史前面才符合时间顺序；
+   *    放到历史后面会被模型当成刚发生的（与摘要同一条理由）。
+   *
+   * 只在调用方传了 previousConversation 时才出现 —— 调用方负责
+   * 「只在新会话第一轮传」，本模块不判断会话轮次（它不查库）。
+   */
+  const previous = params.previousConversation;
+  const previousTail = previous?.messages ?? [];
+  if (previousTail.length > 0) {
+    messages.push({ role: 'system', content: buildPreviousConversationSection(previousTail, now, timezone) });
+  }
+
   /*
    * 历史消息带上时间标记。
    *
@@ -290,8 +363,85 @@ export function buildChatContext(params: BuildChatContextParams): BuiltChatConte
         : {}),
       approxTokens: messages.reduce((n, m) => n + estimateTokens(m.content), 0),
       timeMarkerCount,
+      previousConversationCount: previousTail.length,
     },
   };
+}
+
+/**
+ * 组装「刚刚在另一个对话里聊到」段落（docs/15）。
+ *
+ * 【为什么必须标注来源】
+ *   实测（2026-10-08）：会话 A 结束 1 分钟后开了会话 B，模型在 B 里
+ *   连续三次坚称「你没跟我说过」，第二次还编了个理由
+ *   （「你刚才没细讲项目本身」），第三次改口成「那可能不是在咱们这儿说的」，
+ *   最后反问用户「你再说说当时聊到哪儿了」。
+ *
+ *   根因是它**连自己看过什么都不知道** —— 上下文里只有当前会话，
+ *   于是把「我不知道」合理化为「你没说过」。
+ *   所以这段的措辞同时要解决两件事：
+ *     ① 让它知道自己见过这些内容（来源标注）
+ *     ② 堵住「编个理由解释空缺」这条路（最后两条约束）
+ *
+ * 【为什么把用户的「刚才」直接绑定到这段】
+ *   用户说「我刚才跟你讲的」时，指的极可能就是上一段对话。
+ *   不写这一句，模型仍可能去别处找答案，或者干脆否认。
+ */
+function buildPreviousConversationSection(
+  tail: ContextMessage[],
+  now: Date,
+  timezone: string
+): string {
+  const first = tail[0]?.createdAt;
+  const last = tail[tail.length - 1]?.createdAt;
+
+  /**
+   * 时间范围写清楚，并给出「距今多久」。
+   *
+   * ⚠️ 距今的间隔必须说，因为「刚刚」是个相对判断：
+   *    相隔 1 分钟与相隔 100 分钟，模型该有的语气完全不同
+   *    （前者可以直接说「你刚说」，后者该说「你之前提到」）。
+   */
+  const range =
+    first && last
+      ? `${formatClock(first, timezone)} – ${formatClock(last, timezone)}，距今约 ${formatElapsed(last, now)}`
+      : '刚刚';
+
+  const lines = tail.map((m) => {
+    const speaker = m.role === 'user' ? '对方' : '你';
+    return `${speaker}：${m.content}`;
+  });
+
+  return [
+    `【刚刚在另一个对话里聊到】（${range}）`,
+    '',
+    ...lines,
+    '',
+    '⚠️ 以上是**另一个对话**里的内容，不是当前这段对话 —— 但你确实见过它。',
+    '',
+    '🔴 这一条最重要，它和系统规则里「想不起来就说『你还没跟我说过』」并不冲突：',
+    '   那条规则适用于**你想不起来的记忆**。而上面这些内容此时此刻就在你眼前，',
+    '   不是「想不起来」—— 对方说「我刚才讲的」，指的就是上面这些。',
+    '   所以：不要说你没听过、不要问「是哪个 / 是不是」这种上面已经回答了的问题、',
+    '   也不要说「你只提了 X」来让这个说法成立（上面写着的都是说过的）。',
+    '',
+    '   换个对话窗口继续聊，对你来说仍是同一场谈话。要问就问上面确实还没有的信息。',
+    '   若某件事确实不在上面、你也想不起来，再说「这个我记不清了」不迟。',
+  ].join('\n');
+}
+
+/**
+ * 把「距今多久」写成人话。
+ *
+ * 只给粗粒度：分钟级与小时级足够模型拿捏语气，
+ * 精确到秒反而像机器在报数。
+ */
+function formatElapsed(then: Date, now: Date): string {
+  const minutes = Math.max(0, Math.round((now.getTime() - then.getTime()) / 60_000));
+  if (minutes < 1) return '不到 1 分钟';
+  if (minutes < 60) return `${minutes} 分钟`;
+  const hours = Math.round(minutes / 60);
+  return `${hours} 小时`;
 }
 
 /**

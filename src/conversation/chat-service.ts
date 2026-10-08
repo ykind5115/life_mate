@@ -35,6 +35,7 @@ import {
   createConversation,
   findAliveConversationById,
   findConversationById,
+  findPreviousConversationWithTail,
   findRecentMessages,
   getOrCreateDefaultUser,
   listActiveSummaries,
@@ -45,8 +46,11 @@ import { findFirstUserMessage } from '../database/repository/conversation-querie
 import {
   buildChatContext,
   DEFAULT_RECENT_MESSAGE_LIMIT,
+  PREVIOUS_CONVERSATION_MESSAGE_LIMIT,
+  PREVIOUS_CONVERSATION_WINDOW_MINUTES,
   type ContextMemory,
   type MemoryRetrieval,
+  type PreviousConversationTail,
 } from './context-builder.js';
 import type { ExtractionTrigger } from './extraction-trigger.js';
 import type { SummaryTrigger } from './summary-trigger.js';
@@ -62,7 +66,7 @@ import {
   type RetrievalTrace,
 } from '../database/schema/message-metadata.js';
 import type { AgentEvent } from '../agent/loop.js';
-import { describeError } from '../shared/error-info.js';
+import { describeError, toLogError } from '../shared/error-info.js';
 
 /** 从历史消息中排除的角色：system / tool 不属于「短期对话上下文」 */
 const CONTEXT_ROLES = new Set(['user', 'assistant']);
@@ -190,6 +194,18 @@ export interface ChatServiceDeps {
    * 生产代码传固定值会让上下文里的「今天」永远停在那一刻。
    */
   now?: Date;
+  /**
+   * 跨会话衔接的时间窗（分钟），缺省 PREVIOUS_CONVERSATION_WINDOW_MINUTES。
+   *
+   * 仅测试用 —— 生产不该改它（用户已选 2 小时，见 docs/15）。
+   */
+  previousConversationWindowMinutes?: number;
+  /**
+   * 跨会话衔接注入的条数，缺省 PREVIOUS_CONVERSATION_MESSAGE_LIMIT。
+   *
+   * 仅测试用。
+   */
+  previousConversationMessageLimit?: number;
   /**
    * 请求级日志器。
    *
@@ -325,6 +341,76 @@ export async function chat(
     : [];
 
   /**
+   * 跨会话衔接（docs/15）。
+   *
+   * 【什么时候取】
+   *   只在 `history` 为空时 —— 也就是这个会话还没有任何上下文消息，
+   *   即第一轮。会话进行到第二轮以后，自己的历史已经足够，
+   *   再塞上一个会话只会白占 token、还可能把话题带偏。
+   *
+   *   注意用 `history.length === 0` 而不是 `!existingConversationId`：
+   *   两者不等价 —— 一个已存在的会话若消息都被删了，历史同样是空的。
+   *
+   * 【为什么按 user.id 查而不是别的】
+   *   多用户隔离的唯一依据就是这个条件。少写它等于把别人的对话
+   *   拼进当前用户的上下文（与记忆检索同一个纪律）。
+   *
+   * 【失败不影响对话】
+   *   这只是「让体验更好」的一层。查询出错时按「没有上一个会话」处理，
+   *   绝不因为衔接失败而让整轮对话失败 —— 用户此刻在等回答。
+   */
+  let previousConversation: PreviousConversationTail | undefined;
+  if (history.length === 0) {
+    try {
+      const previous = await findPreviousConversationWithTail({
+        userId: user.id,
+        /**
+         * ⚠️ 条件式传入，不要写 `existingConversationId ?? ''`。
+         *    空串会被拿去和 uuid 列比较，PostgreSQL 报 22P02，
+         *    而这个查询恰好只在新会话第一轮跑 —— 也就是
+         *    `existingConversationId` 为 null 的那一次（功能 100% 失效）。
+         */
+        ...(existingConversationId !== null ? { excludeConversationId: existingConversationId } : {}),
+        since: new Date(
+          (deps.now ?? new Date()).getTime() -
+            (deps.previousConversationWindowMinutes ??
+              PREVIOUS_CONVERSATION_WINDOW_MINUTES) *
+              60_000
+        ),
+        limit:
+          deps.previousConversationMessageLimit ?? PREVIOUS_CONVERSATION_MESSAGE_LIMIT,
+      });
+
+      if (previous) {
+        const tail = previous.messages
+          .filter((m: Message) => CONTEXT_ROLES.has(m.role))
+          .map((m: Message) => ({
+            role: m.role as 'user' | 'assistant',
+            content: m.content,
+            createdAt: m.createdAt,
+          }));
+
+        if (tail.length > 0) {
+          previousConversation = { title: previous.conversation.title, messages: tail };
+        }
+      }
+    } catch (err) {
+      /**
+       * 只记错误类型与脱敏后的原因，不记内容（§29.1）。
+       * 降级为「没有上一个会话」—— 不是「对话失败」。
+       *
+       * 用 toLogError 而不是自己拼 errType：脱敏逻辑集中在那一处，
+       * 各处自己拼容易出现某一处漏掉参数值（2026-09-29 的日志泄露事故）。
+       */
+      const info = toLogError(err);
+      (deps.logger ?? consoleLogger).warn(
+        { errType: info.errType, reason: info.message },
+        '跨会话衔接查询失败，按无上一个会话处理'
+      );
+    }
+  }
+
+  /**
    * 更早对话的摘要（docs/03 §12.4）。
    *
    * 只读已生成的摘要，**不在这里生成** —— 生成要调 LLM（慢且花钱），
@@ -397,6 +483,7 @@ export async function chat(
     summaries,
     // 时间与「现在」都取自同一处：users.timezone 是用户配置的独立列
     timezone: user.timezone,
+    ...(previousConversation !== undefined ? { previousConversation } : {}),
     ...(deps.now !== undefined ? { now: deps.now } : {}),
     ...(deps.injectLimit !== undefined ? { injectLimit: deps.injectLimit } : {}),
   });

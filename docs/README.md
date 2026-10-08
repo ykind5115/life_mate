@@ -24,7 +24,7 @@
 | 12 | [12-ux-improvement-plan.md](./12-ux-improvement-plan.md) | 首次真实使用的问题分析与改进方案 | — | **已实施（第 1、2 批）** |
 | 13 | [13-observability-plan.md](./13-observability-plan.md) | 可观测性补全（幻觉排查的产物） | — | ✅ 本轮已完成 |
 | 14 | [14-timeline-conflict-plan.md](./14-timeline-conflict-plan.md) | Timeline 冲突问题分析与方案 | — | ✅ 已实施（只修时间，不做替代） |
-| 15 | [15-cross-conversation-continuity.md](./15-cross-conversation-continuity.md) | 跨会话衔接缺失（换了对话就接不上） | — | 🔶 **待讨论** |
+| 15 | [15-cross-conversation-continuity.md](./15-cross-conversation-continuity.md) | 跨会话衔接缺失（换了对话就接不上） | — | ✅ 已实施，§7 有保留 |
 
 **归档：**
 
@@ -41,8 +41,9 @@
 - 12 是分析与方案，用户的决定以其中的「批注」字段为准；
   §5 是实施记录，回答「改了哪些文件、踩了哪些坑、还剩什么」
 - 13 是可观测性补全的记录：§1 是进度与验收标准，§6 是过程中的教训
-- 14 与 15 是两次实测反馈的分析：14 已实施（事件时间精度与时区），
-  15 待讨论（跨会话衔接，根因是上下文组装只看当前会话）
+- 14 与 15 是两次实测反馈的分析：14 已实施（事件时间精度与时区）；
+  15 已实施但有保留 —— **先读它的 §7**（跨会话衔接：机制修好了，
+  但模型仍可能否认它看得见的内容，那是元认知问题，不是上下文问题）
 
 ---
 
