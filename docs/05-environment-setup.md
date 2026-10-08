@@ -1765,6 +1765,78 @@ docker system df -v
 
 > ⚠️ `docker system prune --volumes` **会删除数据卷**，包含你的数据库。不要用它。
 
+## 10.9.1 「Docker 引擎没在运行」——但应用报的是 SQL 查询失败
+
+**这是最容易误判的一档**，因为它长得完全不像环境问题。
+
+**症状**（2026-09-29 实测）：
+
+```powershell
+PS> pnpm run dev
+服务启动失败： Failed query: select "id", "name", "timezone", "settings", "created_at",
+              "updated_at" from "users" where "users"."name" = $1 limit $2
+params: me,1
+```
+
+**这行报错具有极强的误导性**：
+
+```text
+✗ 看起来像：users 表结构不对 / 迁移没跑 / SQL 写错了 / Zod 校验炸了
+✓ 实际是：  PostgreSQL 根本没在监听，连接被拒绝（ECONNREFUSED 127.0.0.1:5432）
+```
+
+**原因**：Drizzle 把**任何**底层失败都包装成 `Failed query: <SQL>`，
+真实原因藏在 `error.cause` 里（与 §10.2.1、AGENTS.md 里记的是同一类现象）。
+连接层的 `ECONNREFUSED` 在这一层被吞掉了。
+
+**一句话判断**：
+
+```powershell
+# 引擎在不在
+docker info --format '{{.ServerVersion}}'
+# 报 "open //./pipe/dockerDesktopLinuxEngine: The system cannot find the file specified"
+#   → 引擎没起，就是本档问题（不是 SQL、不是 Schema）
+```
+
+**处理**：
+
+```powershell
+# 启动 Docker Desktop（引擎就绪约需 30~60 秒）
+Start-Process "C:\Program Files\Docker\Docker\Docker Desktop.exe"
+```
+
+```powershell
+# 等引擎就绪（轮询，最多 170 秒）
+$deadline = (Get-Date).AddSeconds(170)
+while ((Get-Date) -lt $deadline) {
+  docker info --format '{{.ServerVersion}}' *> $null
+  if ($LASTEXITCODE -eq 0) { break }
+  Start-Sleep -Seconds 5
+}
+docker info --format '{{.ServerVersion}}'
+```
+
+> 💡 **容器通常不用手动起。** `docker-compose.yml` 里 postgres 与 embedding
+> 都是 `restart: unless-stopped`，引擎一就绪它们会自动回来。
+> 引擎起来后 `docker compose ps` 若是空的再手动 `docker compose up -d`。
+
+**引擎没起时，下面这两条命令是没有意义的**（它们本身也连不上引擎，输出会误导你）：
+
+```text
+docker compose ps              → 报 npipe 连接失败（不是"容器没起"）
+docker compose logs postgres   → 同上
+```
+
+**排查顺序**（不要跳步）：
+
+```text
+① docker info           引擎在不在
+② docker compose ps      容器在不在、health 是否 healthy
+③ 应用启动              前两步都正常才轮到怀疑代码 / Schema
+```
+
+---
+
 ## 10.10 `postgres` 容器起不来
 
 **症状：** `docker compose ps` 里 `postgres` 反复 `Restarting` / `Exited`，或 `docker compose up -d postgres` 直接报错退出。按下面三类原因逐条排查。
