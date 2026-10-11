@@ -11,12 +11,13 @@
  *   本文件的「当前有效」查询返回的 Memory 一定满足 §13.6 的谓词。
  *   历史查询（findValidAt / findSupersedeChain）语义不同，注释中单独说明。
  */
-import { and, asc, count, desc, eq, inArray, isNull, sql } from 'drizzle-orm';
+import { and, asc, count, desc, eq, inArray, isNotNull, isNull, ne, sql } from 'drizzle-orm';
 
 import { db } from '../client.js';
 import { memories, type Memory } from '../schema/memories.js';
 import { memorySources, type MemorySource } from '../schema/memory-sources.js';
 import { messages } from '../schema/messages.js';
+import { conversations } from '../schema/conversations.js';
 import {
   conflictMemoryCondition,
   currentMemoryCondition,
@@ -379,6 +380,66 @@ export async function findConversationIdsByMessageIds(
   return new Map(rows.map((r) => [r.messageId, r.conversationId]));
 }
 
+/**
+ * 按消息 id 反查「这条消息的原文 + 它属于哪个会话（标题）」。
+ *
+ * 【为什么单独一个函数，而不是让前端按 conversation_id 再查一次】
+ *   记忆来源列表通常有 2~5 条，前端逐条回查会话详情会打出 N 个请求，
+ *   而且每个都拉回整个会话（十几条消息）只为拿一个标题。
+ *   一次 JOIN 全取回来是最省的。
+ *
+ * 【为什么正文要截断】
+ *   一条消息可能有几千字，而来源列表只是「让你认出这是哪句话」。
+ *   截断的代价是引用不完整，因此同时返回 `contentChars` ——
+ *   前端据此显示「（已截断，共 N 字）」，而不是假装那是全文。
+ */
+export interface MessageSnippet {
+  messageId: string;
+  conversationId: string;
+  conversationTitle: string | null;
+  /** 截断后的正文。null 表示消息已被物理删除（会话被删过） */
+  content: string | null;
+  /** 正文原始长度；没截断时等于 content.length */
+  contentChars: number;
+  createdAt: Date | null;
+}
+
+export async function findMessageSnippets(
+  params: { messageIds: string[]; maxChars?: number },
+  options: ReadOptions = {}
+): Promise<Map<string, MessageSnippet>> {
+  const exec = options.executor ?? db;
+  if (params.messageIds.length === 0) return new Map();
+
+  const maxChars = params.maxChars ?? 300;
+
+  const rows = await exec
+    .select({
+      messageId: messages.id,
+      conversationId: messages.conversationId,
+      conversationTitle: conversations.title,
+      content: messages.content,
+      createdAt: messages.createdAt,
+    })
+    .from(messages)
+    .innerJoin(conversations, eq(conversations.id, messages.conversationId))
+    .where(inArray(messages.id, params.messageIds));
+
+  return new Map(
+    rows.map((r) => [
+      r.messageId,
+      {
+        messageId: r.messageId,
+        conversationId: r.conversationId,
+        conversationTitle: r.conversationTitle,
+        content: r.content.length > maxChars ? r.content.slice(0, maxChars) : r.content,
+        contentChars: r.content.length,
+        createdAt: r.createdAt,
+      },
+    ])
+  );
+}
+
 /** 统计当前有效记忆数量，用于容量监控与评测 */
 export async function countCurrent(
   userId: string,
@@ -420,4 +481,155 @@ export async function countSlotlessCurrent(
     );
 
   return rows[0]?.n ?? 0;
+}
+
+/**
+ * 列出记忆里出现过的人名（knowledge graph 用）。
+ *
+ * 【为什么「库里有哪些人」这件事只有记忆知道】
+ *   §22.3 明确设计：记忆用 predicate_key='relationship.person' +
+ *   object_value=人名 指向一个人，**不建外键**。
+ *   因此 relationships 表是「用户手动补全的关系信息」，
+ *   而「实际聊到过谁」要从记忆里读。
+ *
+ *   实测（2026-10-08）：relationships 0 行，记忆里有 2 个人名 ——
+ *   只读关系表的话图谱上一个「人」都没有。
+ *
+ * 【为什么排除已删除与 rejected】
+ *   用户删掉或否定过的记忆不该让人名重新出现 —— 那等于
+ *   「我删了它还记得」。conflict 保留：那只是待裁决，内容仍然是真的。
+ */
+export async function listPersonNames(
+  userId: string,
+  limit: number,
+  options: ReadOptions = {}
+): Promise<string[]> {
+  const exec = options.executor ?? db;
+
+  const rows = await exec
+    .select({ name: memories.objectValue, n: count() })
+    .from(memories)
+    .where(
+      and(
+        eq(memories.userId, userId),
+        isNull(memories.deletedAt),
+        eq(memories.predicateKey, 'relationship.person'),
+        isNotNull(memories.objectValue),
+        ne(memories.status, 'rejected')
+      )
+    )
+    .groupBy(memories.objectValue)
+    // 提得多的排前面：聊得多的人更可能是重要的关系
+    .orderBy(desc(count()))
+    .limit(limit);
+
+  return rows.map((r) => r.name).filter((n): n is string => n !== null && n.trim().length > 0);
+}
+
+// ============================================================
+// 概览统计（前端「记忆」页顶部用）
+// ============================================================
+
+export interface MemoryOverview {
+  /** 当前有效 */
+  current: number;
+  /** 待裁决的冲突 */
+  conflict: number;
+  /** 被新事实替代 */
+  superseded: number;
+  /** 已归档（目标完成等） */
+  archived: number;
+  /** 被用户否定 */
+  rejected: number;
+  /** 已软删除 —— 单独计数，前端用来提示「可恢复」 */
+  deleted: number;
+  /** 总计（不含已删除） */
+  total: number;
+}
+
+/**
+ * 记忆状态分布。
+ *
+ * 【为什么要一个专门的查询而不是前端数】
+ *   前端列表是分页的（一页 50 条），拿它统计只能得到「本页的分布」。
+ *   而「有 23 条待裁决」这个数字必须准确 —— 它是用户决定
+ *   「现在要不要去处理」的依据。
+ *
+ * 【为什么用原生 SQL 的 FILTER】
+ *   一次扫表得到全部计数，比 6 个 count(*) 查询便宜得多。
+ *   这里不需要 §13.6 的 currentMemoryCondition —— 统计**就是要**包含
+ *   各种非 active 状态，那正是它的用途。
+ */
+export async function getMemoryOverview(
+  userId: string,
+  options: ReadOptions = {}
+): Promise<MemoryOverview> {
+  const exec = options.executor ?? db;
+
+  const rows = await exec
+    .select({
+      current: sql<number>`count(*) FILTER (WHERE ${memories.status} = 'active' AND ${memories.deletedAt} IS NULL)`,
+      conflict: sql<number>`count(*) FILTER (WHERE ${memories.status} = 'conflict' AND ${memories.deletedAt} IS NULL)`,
+      superseded: sql<number>`count(*) FILTER (WHERE ${memories.status} = 'superseded' AND ${memories.deletedAt} IS NULL)`,
+      archived: sql<number>`count(*) FILTER (WHERE ${memories.status} = 'archived' AND ${memories.deletedAt} IS NULL)`,
+      rejected: sql<number>`count(*) FILTER (WHERE ${memories.status} = 'rejected' AND ${memories.deletedAt} IS NULL)`,
+      deleted: sql<number>`count(*) FILTER (WHERE ${memories.deletedAt} IS NOT NULL)`,
+      total: sql<number>`count(*) FILTER (WHERE ${memories.deletedAt} IS NULL)`,
+    })
+    .from(memories)
+    .where(eq(memories.userId, userId));
+
+  const r = rows[0];
+  const n = (v: unknown): number => Number(v ?? 0);
+
+  return {
+    current: n(r?.current),
+    conflict: n(r?.conflict),
+    superseded: n(r?.superseded),
+    archived: n(r?.archived),
+    rejected: n(r?.rejected),
+    deleted: n(r?.deleted),
+    total: n(r?.total),
+  };
+}
+
+/**
+ * 某个会话**派生出了哪些记忆**（经 memory_sources 反查）。
+ *
+ * 【用途】对话页侧栏「本会话产出了什么」——
+ *   把「说过的话」与「它记住的东西」连起来。
+ *   这是用户最能直接感知「它在学我」的地方。
+ *
+ * 【C22 的约束】memory_sources 没有 conversation_id，
+ *   必须 JOIN messages 才能按会话过滤（§15.4）。
+ */
+export async function findMemoriesByConversation(
+  params: { conversationId: string },
+  options: ReadOptions = {}
+): Promise<Memory[]> {
+  const exec = options.executor ?? db;
+
+  return exec
+    .select({ memory: memories })
+    .from(memories)
+    .innerJoin(memorySources, eq(memorySources.memoryId, memories.id))
+    .innerJoin(messages, eq(messages.id, memorySources.messageId))
+    .where(
+      and(
+        eq(messages.conversationId, params.conversationId),
+        // 已删除的记忆不该出现在这里 —— 尊重删除意图（§29.1）
+        isNull(memories.deletedAt)
+      )
+    )
+    /**
+     * 一个会话可能有多条消息指向同一条记忆（抽取区间重叠时会这样），
+     * 因此必须去重。用 GROUP BY 而不是 DISTINCT ON：
+     * 后者在事务执行器上没有（drizzle 的类型限制），而 GROUP BY 通用。
+     *
+     * 按创建时间正序：用户想看到的是「这段对话里它陆续记住了什么」，
+     * 那个顺序比按重要度排更符合叙事。
+     */
+    .groupBy(memories.id)
+    .orderBy(asc(memories.createdAt))
+    .then((rows) => rows.map((r) => r.memory));
 }

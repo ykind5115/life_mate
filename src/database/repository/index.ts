@@ -17,6 +17,8 @@ export * from './user-store.js';
 export * from './retrieval-queries.js';
 export * from './event-store.js';
 export * from './summary-store.js';
+export * from './relationship-store.js';
+export * from './goal-store.js';
 
 // Schema 类型在这里再导出一次，方便上层使用而不必深入 schema 目录
 export type { Memory, NewMemory } from '../schema/memories.js';
@@ -25,6 +27,7 @@ export type { MemorySource } from '../schema/memory-sources.js';
 export type { Conversation, NewConversation } from '../schema/conversations.js';
 export type { Message, NewMessage } from '../schema/messages.js';
 export type { User } from '../schema/users.js';
+export type { Relationship, NewRelationship } from '../schema/relationships.js';
 export {
   MESSAGE_ROLES,
   CONVERSATION_STATUSES,
@@ -37,6 +40,8 @@ export type {
   MessageRole,
   ConversationStatus,
   EventCategory,
+  EventPrecision,
+  RelationshipStatus,
   SourceType,
   PredicateKey,
 } from '../schema/enums.js';

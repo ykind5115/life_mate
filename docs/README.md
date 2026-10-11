@@ -25,7 +25,7 @@
 | 13 | [13-observability-plan.md](./13-observability-plan.md) | 可观测性补全（幻觉排查的产物） | — | ✅ 本轮已完成 |
 | 14 | [14-timeline-conflict-plan.md](./14-timeline-conflict-plan.md) | Timeline 冲突问题分析与方案 | — | ✅ 已实施（只修时间，不做替代） |
 | 15 | [15-cross-conversation-continuity.md](./15-cross-conversation-continuity.md) | 跨会话衔接缺失（换了对话就接不上） | — | ✅ 已实施，§7 有保留 |
-| 16 | [16-frontend-redesign-plan.md](./16-frontend-redesign-plan.md) | 前端改版方案（把没用上的后端功能端上来） | — | 🔶 **待讨论** |
+| 16 | [16-frontend-redesign-plan.md](./16-frontend-redesign-plan.md) | 前端改版方案（把没用上的后端功能端上来） | — | ✅ 已实施，§8 是实施记录 |
 
 **归档：**
 

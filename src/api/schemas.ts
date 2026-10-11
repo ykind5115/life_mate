@@ -413,6 +413,59 @@ export const deleteGoalQuerySchema = z.object({
 });
 
 // ============================================================
+// Relationships（docs/03 §22；docs/16 前端改版新增）
+// ============================================================
+
+/**
+ * 关系状态。
+ *
+ * 与库层 chk_relationships_status 同源 ——
+ * 新增状态时要同时改 enums.ts、库层 CHECK 与这里。
+ */
+export const RELATIONSHIP_STATUS_ENUM = ['active', 'ended', 'archived'] as const;
+
+export const listRelationshipsQuerySchema = paginationSchema.extend({
+  status: z.enum(RELATIONSHIP_STATUS_ENUM).optional(),
+  /** 按人名模糊搜索 */
+  q: z.string().max(100).optional(),
+});
+
+export const relationshipIdParamSchema = z.object({ id: uuidSchema });
+
+export const createRelationshipSchema = z
+  .object({
+    name: z.string().min(1).max(100),
+    /** family | friend | colleague | mentor | partner 等，自由文本（§22.2） */
+    relation_type: z.string().max(50).nullish(),
+    description: z.string().max(2000).nullish(),
+    status: z.enum(RELATIONSHIP_STATUS_ENUM).optional(),
+  })
+  .strict();
+
+export const updateRelationshipSchema = z
+  .object({
+    name: z.string().min(1).max(100).optional(),
+    relation_type: z.string().max(50).nullish(),
+    description: z.string().max(2000).nullish(),
+    status: z.enum(RELATIONSHIP_STATUS_ENUM).optional(),
+  })
+  .strict();
+
+// ============================================================
+// 知识图谱（docs/16 §3.3）
+// ============================================================
+
+export const graphQuerySchema = z.object({
+  /**
+   * 每类节点的上限。
+   *
+   * 默认 12 —— 力导向布局超过这个数量会糊成一团，
+   * 而且用户看不出结构。上限 30 是防止一次拉太多把前端拖死。
+   */
+  max_per_kind: z.coerce.number().int().min(1).max(30).default(12),
+});
+
+// ============================================================
 // 内部再导出，供 route 做枚举校验
 // ============================================================
 

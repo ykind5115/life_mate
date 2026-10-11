@@ -37,6 +37,8 @@ import { registerSettingsRoutes } from './routes/settings.js';
 import { registerTimelineRoutes } from './routes/timeline.js';
 import { registerLifeReviewRoutes } from './routes/life-review.js';
 import { registerGoalRoutes } from './routes/goals.js';
+import { registerRelationshipRoutes } from './routes/relationships.js';
+import { registerGraphRoutes } from './routes/graph.js';
 import type { IdempotencyStore } from './idempotency.js';
 import type { ChatResult } from '../conversation/chat-service.js';
 
@@ -245,6 +247,8 @@ export async function buildServer(options: BuildServerOptions = {}): Promise<Fas
         ...(options.provider !== undefined ? { provider: options.provider } : {}),
       });
       await registerGoalRoutes(v1);
+  await registerRelationshipRoutes(v1);
+  await registerGraphRoutes(v1);
     },
     { prefix: '/api/v1' }
   );

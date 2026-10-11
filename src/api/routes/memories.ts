@@ -29,7 +29,9 @@ import {
   createMemory,
   findByIdIncludingInactive,
   findConversationIdsByMessageIds,
+  findMessageSnippets,
   findSourcesByMemoryId,
+  getMemoryOverview,
   getOrCreateDefaultUser,
   listCurrent,
   listForManagement,
@@ -50,6 +52,28 @@ import {
 } from '../schemas.js';
 
 export async function registerMemoryRoutes(app: FastifyInstance): Promise<void> {
+  // ==========================================================
+  // GET /api/v1/memories/overview
+  // ==========================================================
+  /**
+   * 记忆状态分布（docs/16）。
+   *
+   * 【为什么需要一个专门端点】
+   *   前端列表是分页的（一页 50 条），拿它统计只能得到「本页的分布」。
+   *   而「有 23 条待裁决」这个数字必须准确 ——
+   *   它是用户决定「现在要不要去处理」的依据。
+   *
+   * ⚠️ 必须在 `/memories/:id` 之前注册也没用 —— Fastify 的路由树
+   *    天然优先匹配静态段，因此 `overview` 不会被 `:id` 抢走。
+   *    但**仍然**不要把它改成 `/memories/:id/overview` 这种形状：
+   *    那会让「id 是 overview」变成一个需要靠 UUID 校验兜底的情况。
+   */
+  app.get('/memories/overview', async () => {
+    const user = await getOrCreateDefaultUser();
+    const overview = await getMemoryOverview(user.id);
+    return ok(overview);
+  });
+
   // ==========================================================
   // GET /api/v1/memories
   // ==========================================================
@@ -176,20 +200,43 @@ export async function registerMemoryRoutes(app: FastifyInstance): Promise<void> 
     const messageIds = sources.map((s) => s.messageId).filter((x): x is string => x !== null);
     const conversationByMessage = await findConversationIdsByMessageIds(messageIds);
 
+    /**
+     * 来源的**原文与所属会话标题**（docs/16 新增）。
+     *
+     * 【为什么要带上正文】
+     *   记忆详情页最有说服力的一栏是「它凭什么记得」——
+     *   而回答那个问题必须让人看到**原话**。
+     *   只给一个 conversation_id，用户点进去还要自己在几十条消息里找。
+     *
+     * 正文截断到 300 字并附带原始长度 ——
+     * 引用不完整时必须说出来，不能假装那是全文。
+     */
+    const snippets = await findMessageSnippets({ messageIds });
+
     return ok({
-      items: sources.map((s) => ({
-        id: s.id,
-        source_type: s.sourceType,
-        message_id: s.messageId,
-        /**
-         * 消息已被物理删除时会是 null（JOIN 不到）。
-         * 前端据此显示「原始对话已删除」（§24.2 末尾的要求）。
-         */
-        conversation_id: s.messageId ? (conversationByMessage.get(s.messageId) ?? null) : null,
-        event_id: s.eventId,
-        goal_id: s.goalId,
-        created_at: s.createdAt,
-      })),
+      items: sources.map((s) => {
+        const snippet = s.messageId ? snippets.get(s.messageId) : undefined;
+        return {
+          id: s.id,
+          source_type: s.sourceType,
+          message_id: s.messageId,
+          /**
+           * 消息已被物理删除时会是 null（JOIN 不到）。
+           * 前端据此显示「原始对话已删除」（§24.2 末尾的要求）。
+           */
+          conversation_id: s.messageId ? (conversationByMessage.get(s.messageId) ?? null) : null,
+          /** 所属会话标题。会话被软删除后标题是占位文案（C38） */
+          conversation_title: snippet?.conversationTitle ?? null,
+          /** 原话（截断）。null 表示来源消息已被物理删除 */
+          message_content: snippet?.content ?? null,
+          /** 原话的完整长度。前端在「已截断」时显示它 */
+          message_chars: snippet?.contentChars ?? null,
+          message_created_at: snippet?.createdAt ?? null,
+          event_id: s.eventId,
+          goal_id: s.goalId,
+          created_at: s.createdAt,
+        };
+      }),
     });
   });
 
