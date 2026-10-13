@@ -26,6 +26,7 @@
 | 14 | [14-timeline-conflict-plan.md](./14-timeline-conflict-plan.md) | Timeline 冲突问题分析与方案 | — | ✅ 已实施（只修时间，不做替代） |
 | 15 | [15-cross-conversation-continuity.md](./15-cross-conversation-continuity.md) | 跨会话衔接缺失（换了对话就接不上） | — | ✅ 已实施，§7 有保留 |
 | 16 | [16-frontend-redesign-plan.md](./16-frontend-redesign-plan.md) | 前端改版方案（把没用上的后端功能端上来） | — | ✅ 已实施，§8 是实施记录 |
+| 17 | [17-warmth-and-stt-plan.md](./17-warmth-and-stt-plan.md) | 人物设定偏冷 + STT 方案（深夜问候反馈） | — | 🔶 **待讨论** |
 
 **归档：**
 
