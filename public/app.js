@@ -36,6 +36,7 @@ import {
   toast,
 } from './core.js';
 import { renderMarkdown } from './markdown.js';
+import { startRecording, RecorderError } from './recorder.js';
 
 const API = '/api/v1';
 
@@ -680,9 +681,188 @@ function renderConvSide() {
   );
 }
 
+// ============================================================
+// 语音转文字（STT，docs/17 §3）
+//
+// 闭环：录音 → 转文字 → **填进输入框等用户确认** → 用户按发送。
+//
+// 【为什么中间必须停一下让用户确认】
+//   STT 一定有错字，而错字进了对话就会进记忆抽取 ——
+//   「张三」听成「张散」，那条记忆就永久错了，而记忆是要长期依赖的。
+//   让用户发送前看一眼，成本一秒，收益是记忆不被污染。
+//   所以这里**只填输入框、不自动发送**。
+// ============================================================
+
+const voice = createStore({
+  /** 服务端 STT 是否可用。不可用时不显示麦克风按钮 */
+  available: false,
+  recording: false,
+  transcribing: false,
+  /** 录音计时（秒），显示在按钮上 */
+  seconds: 0,
+  maxSeconds: 300,
+});
+
+/** 当前录音句柄与计时器 */
+let activeRecorder = null;
+let micTimer = null;
+
+/** 初始化时问一次服务端：STT 能不能用 */
+async function refreshMicAvailability() {
+  try {
+    const s = await api('GET', '/transcribe/status');
+    voice.set({ available: Boolean(s.available), maxSeconds: s.max_seconds ?? 300 });
+  } catch {
+    // 探测失败就当不可用 —— 语音只是可选的输入方式，不该影响打字
+    voice.set({ available: false });
+  }
+  renderMic();
+}
+
+function renderMic() {
+  const btn = document.getElementById('btn-mic');
+  if (!btn) return;
+  const { available, recording, transcribing, seconds } = voice.get();
+
+  /**
+   * 三种状态：
+   *   · STT 不可用 → 整个按钮不显示（而不是显示一个点了会报错的按钮）
+   *   · 正在转写   → 显示 spinner，禁用点击
+   *   · 正在录音   → 高亮 + 显示秒数
+   */
+  btn.classList.toggle('hidden', !available);
+  btn.classList.toggle('recording', recording);
+  btn.disabled = transcribing;
+
+  const timer = document.getElementById('mic-timer');
+  if (timer) {
+    timer.textContent = transcribing
+      ? ''
+      : recording
+        ? `${seconds}s`
+        : '';
+  }
+
+  const icon = btn.querySelector('.mic-icon');
+  if (icon) icon.textContent = transcribing ? '◌' : recording ? '■' : '🎤';
+
+  btn.title = transcribing
+    ? '正在转成文字…'
+    : recording
+      ? '说完按一下结束'
+      : '按一下开始说话';
+}
+
+/** 点麦克风：开始 / 结束 */
+async function toggleRecording() {
+  const { recording, transcribing } = voice.get();
+  if (transcribing) return;
+
+  if (recording) {
+    await finishRecording();
+    return;
+  }
+
+  try {
+    activeRecorder = await startRecording();
+  } catch (err) {
+    // 权限被拒、没有设备这类问题必须说清怎么解决
+    toast(err instanceof RecorderError ? err.message : '打不开麦克风', 'error');
+    return;
+  }
+
+  voice.set({ recording: true, seconds: 0 });
+  renderMic();
+
+  micTimer = setInterval(() => {
+    const secs = Math.round((activeRecorder?.elapsedMs() ?? 0) / 1000);
+    voice.set({ seconds: secs });
+
+    // 到了服务端的上限就自动停 —— 让它继续录只会在上传时被拒
+    if (secs >= voice.get().maxSeconds) {
+      toast(`已经录满 ${voice.get().maxSeconds} 秒，自动结束`, 'info');
+      void finishRecording();
+      return;
+    }
+    renderMic();
+  }, 250);
+}
+
+/** 结束录音 → 转写 → 填进输入框 */
+async function finishRecording() {
+  if (!activeRecorder) return;
+
+  if (micTimer !== null) {
+    clearInterval(micTimer);
+    micTimer = null;
+  }
+
+  const recorder = activeRecorder;
+  activeRecorder = null;
+  voice.set({ recording: false, transcribing: true });
+  renderMic();
+
+  try {
+    const wav = await recorder.stop();
+    if (!wav) {
+      // 录了个空（点一下就停）—— 这不是错误，只是没说话
+      voice.set({ transcribing: false });
+      renderMic();
+      toast('没有录到声音', 'info');
+      return;
+    }
+
+    /**
+     * 直接发原始字节，Content-Type 标明格式。
+     * 不用 multipart —— 只需要传一个音频，而 multipart 要多引一个插件
+     * （见 src/api/routes/transcribe.ts 的文件头）。
+     */
+    const res = await fetch(`${API}/transcribe`, {
+      method: 'POST',
+      headers: { 'content-type': 'audio/wav' },
+      body: wav,
+    });
+
+    const text = await res.text();
+    let json;
+    try {
+      json = text ? JSON.parse(text) : {};
+    } catch {
+      throw new Error(`响应不是 JSON（HTTP ${res.status}）`);
+    }
+    if (!res.ok) throw new Error(json?.error?.message ?? `转写失败（HTTP ${res.status}）`);
+
+    const result = json.data ?? json;
+
+    voice.set({ transcribing: false });
+    renderMic();
+
+    if (result.empty || !result.text) {
+      toast('没听清，再说一次？', 'info');
+      return;
+    }
+
+    /**
+     * 填进输入框 —— **不自动发送**。
+     * 追加而不是覆盖：用户可能先打了一半，又想起来用说的补一句。
+     */
+    const input = document.getElementById('input');
+    if (input) {
+      input.value = input.value.trim().length > 0 ? `${input.value.trim()} ${result.text}` : result.text;
+      input.style.height = 'auto';
+      input.style.height = `${Math.min(200, input.scrollHeight)}px`;
+      input.focus();
+    }
+    toast('转成文字了，确认一下再发', 'success');
+  } catch (err) {
+    voice.set({ transcribing: false });
+    renderMic();
+    toast(err instanceof Error ? err.message : '转写失败', 'error');
+  }
+}
+
 /** 流式发送 */
-async function sendMessage(text) {
-  const { activeId } = chat.get();
+async function sendMessage(text) {  const { activeId } = chat.get();
   if (chat.get().streaming) return;
   chat.set({ streaming: true });
 
@@ -2275,8 +2455,7 @@ function bindChrome() {
     loadRelations();
   }, 320);
 
-  document.getElementById('review-kind').onchange = (e) => {
-    const kind = e.target.value;
+  document.getElementById('review-kind').onchange = (e) => {    const kind = e.target.value;
     review.set({ kind });
     document.getElementById('review-custom').classList.toggle('hidden', kind !== 'custom');
   };
@@ -2287,6 +2466,31 @@ function bindChrome() {
 
   const input = document.getElementById('input');
   const composer = document.getElementById('composer');
+
+  // 麦克风：点一下开始、再点一下结束。STT 不可用时按钮是隐藏的
+  document.getElementById('btn-mic').addEventListener('click', () => {
+    void toggleRecording();
+  });
+
+  /**
+   * 录音期间按 Esc 放弃。
+   * 没有这个出口的话，用户误点麦克风只能等它录完或点结束 ——
+   * 而「点结束」会把内容转写并填进输入框，那也不是他想要的。
+   */
+  document.addEventListener('keydown', (e) => {
+    if (e.key !== 'Escape') return;
+    if (!voice.get().recording || !activeRecorder) return;
+    activeRecorder.cancel();
+    activeRecorder = null;
+    if (micTimer !== null) {
+      clearInterval(micTimer);
+      micTimer = null;
+    }
+    voice.set({ recording: false, seconds: 0 });
+    renderMic();
+    toast('已取消这次录音', 'info');
+  });
+
   input.addEventListener('keydown', (e) => {
     if (e.key === 'Enter' && !e.shiftKey) {
       e.preventDefault();
@@ -2328,6 +2532,8 @@ function boot() {
   checkHealth();
   setInterval(checkHealth, 30_000);
   refreshOverview();
+  // 语音可用性只探一次（它不会自己变好或变坏），失败也不影响打字
+  void refreshMicAvailability();
   loadConversations()
     .then(renderConversations)
     .catch(() => {});
@@ -2368,6 +2574,11 @@ export {
   daySeparator,
   progressBar,
   sourceNode,
+  voice,
+  toggleRecording,
+  finishRecording,
+  renderMic,
+  refreshMicAvailability,
   NODE_COLOR,
   MEMORY_TYPE_LABEL,
   MEMORY_STATUS_META,

@@ -93,6 +93,65 @@ services:
               count: 1
               capabilities: [gpu]
 
+  # ============================================================
+  # 语音转文字（STT，docs/17 §3）
+  # ------------------------------------------------------------
+  # 你说的话 → 转成文字 → 你确认后发给现有的对话接口。
+  # 只做「输入方式」，不做语音助手。
+  #
+  # 与 embedding 同一个模式：本地部署、只绑回环、用 GPU。
+  # 音频因此不出这台机器 —— 这是选本地而不是浏览器 Web Speech 的理由
+  # （后者在中文下依赖服务端识别，音频会离开本机）。
+  # ============================================================
+  stt:
+    # 【镜像选择】
+    #   latest-gpu                  用 openai-whisper（原版），最稳
+    #   latest-gpu-faster-whisper   用 faster-whisper（CTranslate2），快 2~4 倍
+    #
+    # ⚠️ 换 faster-whisper 那版时**必须同时设 ASR_ENGINE=faster_whisper**，
+    #    否则容器起来的服务与镜像里的引擎不一致，请求会失败。
+    #
+    # 默认选前者：少一个必须配对的变量 = 少一种起不来的方式。
+    # 而 large-v3-turbo 本身已经比 large-v3 快很多，够用了。
+    image: onerahmet/openai-whisper-asr-webservice:latest-gpu
+    container_name: lifemate-stt
+    restart: unless-stopped
+
+    environment:
+      # large-v3-turbo：large-v3 的蒸馏版，中文质量与 large 接近而快得多。
+      # 不用 medium —— 语音进来的错字会直接进记忆抽取，
+      # 「张三」听成「张散」，那条记忆就永久错了。
+      ASR_MODEL: large-v3-turbo
+      # 中文。不设 auto：短音频（几秒钟的「嗯」「好」）做语种检测容易判错，
+      # 可能被识别成日文或韩文。
+      ASR_LANGUAGE: zh
+      # 首次启动会从 HuggingFace 下载权重（约 1.6GB），之后复用缓存卷。
+      HF_HOME: /data/hf
+      TZ: Asia/Shanghai
+
+    ports:
+      # 与 postgres / embedding 一致：只绑本机回环
+      - "127.0.0.1:9000:9000"
+
+    volumes:
+      # 模型权重缓存。删掉这个卷会让下次启动重新下载 1.6GB。
+      - lifemate-stt-cache:/data/hf
+
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: 1
+              capabilities: [gpu]
+
+    # ⚠️ 这个服务**没有 healthcheck**：
+    #    容器提供的是 FastAPI 文档页（/docs），它对「模型是否加载完」不敏感，
+    #    刚起来还没加载完模型时也会返回 200，做成健康检查会骗人。
+    #    前端用 GET /api/v1/transcribe/status 判断可用性（那条会真的探 /docs），
+    #    而「能不能转写」最终只能靠一次真实调用确认。
+
 volumes:
   lifemate-pgdata:
   lifemate-hf-cache:
+  lifemate-stt-cache:

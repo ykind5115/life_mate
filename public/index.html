@@ -74,6 +74,21 @@
               </div>
 
               <form id="composer" class="composer">
+                <!--
+                  麦克风按钮：只有 STT 可用时才显示（见 app.js 的 refreshMicAvailability）。
+                  语音是**可选的输入方式** —— 服务没起来时干脆不显示，
+                  而不是让用户点一下、等半天、再报错。
+                -->
+                <button
+                  type="button"
+                  id="btn-mic"
+                  class="btn mic hidden"
+                  title="按一下开始说话，说完再按一下"
+                  aria-label="语音输入"
+                >
+                  <span class="mic-icon">🎤</span>
+                  <span id="mic-timer" class="mic-timer"></span>
+                </button>
                 <textarea
                   id="input"
                   rows="1"

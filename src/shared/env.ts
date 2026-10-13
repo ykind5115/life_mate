@@ -41,6 +41,40 @@ const envSchema = z.object({
   /** 单次请求超时（ms）。本地 GPU 推理，正常在 50ms 内，留足余量 */
   EMBEDDING_TIMEOUT_MS: z.coerce.number().int().positive().default(10_000),
 
+  // ---------- 语音转文字（STT，docs/17 §3）----------
+  /**
+   * 本地 Whisper 服务。与 embedding 同一个模式：本地部署、只绑回环。
+   *
+   * 【为什么不上云】
+   *   语音是「不经过键盘的真心话」，往往比打字更私密
+   *   （记忆里全是前女友、工资、面试、加班吐槽这类事）。
+   *   浏览器自带的那条路（Web Speech API）在中文下依赖服务端识别，
+   *   音频确实会离开这台机器 —— 因此不用。
+   */
+  STT_BASE_URL: z.string().url().default('http://127.0.0.1:9000'),
+  /** 模型标识，仅用于日志与响应回显 */
+  STT_MODEL: z.string().default('large-v3-turbo'),
+  /**
+   * 转写超时（ms）。
+   *
+   * ⚠️ 比 embedding 宽松得多：一段 30 秒的录音，GPU 上大约要 1~3 秒，
+   *    但冷启动（模型首次加载）可能要几十秒。
+   *    60 秒是「够冷启动、又不会让用户干等」的折中。
+   */
+  STT_TIMEOUT_MS: z.coerce.number().int().positive().default(60_000),
+  /**
+   * 单段录音的时长上限（秒）。
+   *
+   * 【为什么必须有限制，而不是任人录】
+   *   转写是同步阻塞的：录 10 分钟就要占着 GPU 与一个 HTTP 连接 10 分钟。
+   *   而且「说话」这种输入形态天然是短句 —— 用户要讲很久的话，
+   *   应该分段说，那样出错也容易改。
+   *   超过上限时**明确拒绝并告知时长**，而不是截断后假装完整。
+   */
+  STT_MAX_SECONDS: z.coerce.number().int().positive().default(300),
+  /** 单次上传的音频大小上限（字节）。5 分钟 16kHz 单声道 WAV 约 9.6MB */
+  STT_MAX_BYTES: z.coerce.number().int().positive().default(12 * 1024 * 1024),
+
   // ---------- LLM Provider（对话模型）----------
   // 决策：V1.0 使用 DeepSeek
   // ⚠️ 密钥只来自环境变量，永不写进代码或示例（架构 §37 / docs/03 §29）

@@ -800,6 +800,68 @@ label > select {
   border-radius: var(--r-lg);
 }
 
+/* ---------- 麦克风（语音转文字，docs/17 §3） ---------- */
+
+.composer .btn.mic {
+  padding: 11px 13px;
+  border-radius: var(--r-lg);
+  border-color: var(--line-strong);
+  background: var(--bg-raised);
+  flex: 0 0 auto;
+  gap: 6px;
+  transition: background 0.15s, border-color 0.15s, color 0.15s;
+}
+
+.composer .btn.mic:hover:not(:disabled) {
+  border-color: var(--accent);
+  color: var(--accent-strong);
+}
+
+/**
+ * 录音中：整颗按钮变红并轻微呼吸。
+ * 视觉反馈必须足够强 —— 用户按完就开始说话，
+ * 如果看不出「正在录」，他会以为没点上而反复点。
+ */
+.composer .btn.mic.recording {
+  background: var(--danger);
+  border-color: var(--danger);
+  color: #fff;
+  animation: mic-pulse 1.4s ease-in-out infinite;
+}
+
+@keyframes mic-pulse {
+  0%,
+  100% {
+    box-shadow: 0 0 0 0 rgba(194, 91, 82, 0.5);
+  }
+  50% {
+    box-shadow: 0 0 0 6px rgba(194, 91, 82, 0);
+  }
+}
+
+.composer .btn.mic .mic-icon {
+  font-size: 15px;
+  line-height: 1;
+}
+
+/** 计时数字用等宽，否则秒数跳动时按钮会左右抖 */
+.composer .btn.mic .mic-timer {
+  font-variant-numeric: tabular-nums;
+  font-size: var(--fs-xs);
+  min-width: 26px;
+  text-align: left;
+}
+
+.composer .btn.mic:disabled {
+  opacity: 0.6;
+}
+
+.composer .btn.mic:disabled .mic-icon {
+  /* 转写中转圈：动画放在图标上，按钮本身不变形 */
+  display: inline-block;
+  animation: spin 0.9s linear infinite;
+}
+
 /* ---------- 流式光标 ---------- */
 
 .cursor {

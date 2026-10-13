@@ -21,6 +21,14 @@ export const ERROR_CODES = {
   FORBIDDEN: 403,
   NOT_FOUND: 404,
   CONFLICT: 409,
+  /**
+   * 413：请求体过大。
+   *
+   * 2026-10-13 为语音转文字加的（docs/17 §3）——
+   * 音频有明确的大小与时长上限，超了要**说清超了多少**，
+   * 而不是让用户对着一个笼统的 400 猜。
+   */
+  PAYLOAD_TOO_LARGE: 413,
   VALIDATION_ERROR: 422,
   RATE_LIMITED: 429,
   INTERNAL_ERROR: 500,
@@ -64,6 +72,10 @@ export const notFound = (message: string): HttpError => new HttpError('NOT_FOUND
 
 export const conflict = (message: string, details?: unknown): HttpError =>
   new HttpError('CONFLICT', message, details);
+
+/** 请求体过大（音频超限）。消息里要说清「多大、上限多少」 */
+export const payloadTooLarge = (message: string, details?: unknown): HttpError =>
+  new HttpError('PAYLOAD_TOO_LARGE', message, details);
 
 export const validationError = (message: string, details?: unknown): HttpError =>
   new HttpError('VALIDATION_ERROR', message, details);

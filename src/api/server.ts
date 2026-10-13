@@ -39,6 +39,7 @@ import { registerLifeReviewRoutes } from './routes/life-review.js';
 import { registerGoalRoutes } from './routes/goals.js';
 import { registerRelationshipRoutes } from './routes/relationships.js';
 import { registerGraphRoutes } from './routes/graph.js';
+import { registerTranscribeRoutes } from './routes/transcribe.js';
 import type { IdempotencyStore } from './idempotency.js';
 import type { ChatResult } from '../conversation/chat-service.js';
 
@@ -249,6 +250,7 @@ export async function buildServer(options: BuildServerOptions = {}): Promise<Fas
       await registerGoalRoutes(v1);
   await registerRelationshipRoutes(v1);
   await registerGraphRoutes(v1);
+  await registerTranscribeRoutes(v1);
     },
     { prefix: '/api/v1' }
   );
