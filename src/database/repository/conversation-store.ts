@@ -128,6 +128,20 @@ export async function findAliveConversationById(
 }
 
 /**
+ * 列表项：会话本身 + 两个聚合出来的字段。
+ *
+ * 前端列表要显示「16 条 · 3 分钟前」，这两个数字都必须来自库 ——
+ * 让前端自己数只能数到当前页，让前端按 updated_at 猜会猜错
+ * （那个字段会被标题生成等后台动作刷新）。
+ */
+export interface ConversationListItem extends Conversation {
+  /** 该会话的消息条数 */
+  messageCount: number;
+  /** 最后一条消息的时间。没有消息时为 null */
+  lastMessageAt: Date | null;
+}
+
+/**
  * 分页列出会话（默认排除已删除与已归档，可按需包含归档）。
  *
  * 返回的 title 已由删除流程置为占位文案，因此这里不需要额外过滤内容。
@@ -141,7 +155,7 @@ export async function listConversations(
     offset?: number;
   },
   options: ExecutorOption = {}
-): Promise<Paginated<Conversation>> {
+): Promise<Paginated<ConversationListItem>> {
   const exec = options.executor ?? db;
   const limit = clampLimit(filter.limit);
   const offset = Math.max(0, filter.offset ?? 0);
@@ -154,11 +168,33 @@ export async function listConversations(
 
   const where = and(...conds);
 
+  /**
+   * 带上消息条数与最后说话时间。
+   *
+   * 【为什么必须一起取，而不是让前端各查一次】
+   *   列表上有 20 个会话，前端逐条查就是 20 个请求。
+   *   这里 LEFT JOIN + GROUP BY 一次拿回。
+   *
+   * 【为什么是 LEFT JOIN 而不是 INNER】
+   *   刚建的会话还没有消息，INNER JOIN 会让它**从列表里消失** ——
+   *   用户刚点「新会话」就发现它不见了。
+   *
+   * 【last_message_at 与 updated_at 的区别】
+   *   updated_at 会被标题生成、摘要写入这些后台动作刷新
+   *   （见 updateConversation 的 withUpdatedAt 注释），
+   *   它不等于「用户最后说话的时间」。列表上要显示的是后者。
+   */
   const [items, totalRows] = await Promise.all([
     exec
-      .select()
+      .select({
+        conversation: conversations,
+        messageCount: count(messages.id),
+        lastMessageAt: sql<Date | null>`max(${messages.createdAt})`,
+      })
       .from(conversations)
+      .leftJoin(messages, eq(messages.conversationId, conversations.id))
       .where(where)
+      .groupBy(conversations.id)
       /**
        * 最近有动静的排前面（用户找的是「刚才聊的那个」）。
        *
@@ -174,7 +210,16 @@ export async function listConversations(
     exec.select({ n: count() }).from(conversations).where(where),
   ]);
 
-  return { items, total: totalRows[0]?.n ?? 0, limit, offset };
+  return {
+    items: items.map((r) => ({
+      ...r.conversation,
+      messageCount: Number(r.messageCount),
+      lastMessageAt: r.lastMessageAt,
+    })),
+    total: totalRows[0]?.n ?? 0,
+    limit,
+    offset,
+  };
 }
 
 /**

@@ -25,6 +25,7 @@ import {
   listConversations,
   updateConversation,
   type Conversation,
+  type ConversationListItem,
   type Memory,
   type Message,
 } from '../../database/repository/index.js';
@@ -53,7 +54,7 @@ export async function registerConversationRoutes(app: FastifyInstance): Promise<
     });
 
     return ok({
-      items: page.items.map(toConversationSummary),
+      items: page.items.map(toConversationListItem),
       pagination: paginate({
         page: query.page,
         pageSize: query.page_size,
@@ -224,6 +225,17 @@ export async function registerConversationRoutes(app: FastifyInstance): Promise<
  *    暴露出去只会让前端产生「这是多用户系统」的错觉。
  *    也不返回 status/deletedAt —— 列表接口本来就只返回未删除的。
  */
+/**
+ * 会话摘要 DTO。
+ *
+ * 【2026-10-13 补 message_count / last_message_at】
+ *   此前只返回 5 个字段，而前端列表要显示「16 条 · 3 分钟前」——
+ *   它写的是 `c.message_count ?? 0`，于是**每一个会话都显示「0 条」**。
+ *
+ *   这是改版时的疏漏：前端写了这个字段，我却没确认后端到底给不给。
+ *   教训是「给某个字段写了渲染代码，就必须有一处断言它真的存在」——
+ *   否则 `?? 0` 这类兜底会把「没数据」和「数据是 0」变成同一个显示。
+ */
 function toConversationSummary(c: Conversation) {
   return {
     id: c.id,
@@ -231,6 +243,28 @@ function toConversationSummary(c: Conversation) {
     summary: c.summary,
     created_at: c.createdAt,
     updated_at: c.updatedAt,
+  };
+}
+
+/**
+ * 列表项 DTO：摘要 + 聚合出来的两个计数。
+ *
+ * 与 toConversationSummary 分开写，因为详情接口不需要这两个数
+ * （详情本来就带 messages），硬塞进去会让 DTO 承担两种形状。
+ */
+function toConversationListItem(c: ConversationListItem) {
+  return {
+    ...toConversationSummary(c),
+    /** 消息条数。前端列表显示「N 条」 */
+    message_count: c.messageCount,
+    /**
+     * 最后一条消息的时间。
+     *
+     * ⚠️ 与 updated_at 不是一回事：updated_at 会被标题生成、
+     *    摘要写入这些后台动作刷新。列表上该显示的是「最后说话的时间」。
+     *    会话还没有消息时为 null —— 前端应回退到 created_at。
+     */
+    last_message_at: c.lastMessageAt,
   };
 }
 

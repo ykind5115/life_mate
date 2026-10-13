@@ -755,6 +755,87 @@ test('GET /conversations 分页结构符合 docs/04 §8', async () => {
   });
 });
 
+test('🔴 列表项必须带 message_count 与 last_message_at（前端靠它显示「N 条」）', async () => {
+  /**
+   * 来源：2026-10-13 用户反馈「历史对话上面显示的怎么全是 0 条」。
+   *
+   * 根因是 DTO 里没有 message_count，而前端写的是
+   *   `${c.message_count ?? 0} 条`
+   * 于是**每一个会话都显示 0 条**。
+   *
+   * 为什么之前没测出来：那条分页用例只断言了 id 与分页结构，
+   * 从没看过列表项里到底有哪些字段。
+   *
+   * 教训：**给某个字段写了渲染代码，就必须有一处断言它真的存在** ——
+   *      否则 `?? 0` 这类兜底会把「后端没给」和「数据就是 0」
+   *      变成同一个显示，而后者永远不会有人怀疑。
+   */
+  await withServer(async ({ app }) => {
+    /**
+     * 先建一个会话，再往它里面发**确定条数**的消息。
+     *
+     * ⚠️ 这条测试写错过两次，都值得记：
+     *   ① 第一版「发两条（以为各建一个新会话）+ 再补一条」，然后断言 2 条。
+     *      实际每个 POST 都可能复用已有会话，结果依赖别的用例的残留数据。
+     *      → 改成显式建会话 + 显式传 conversation_id。
+     *   ② 第二版断言「一问一答 = 2 条消息」，实际是 4 ——
+     *      **一轮对话是 user + assistant 两条**，我把 assistant 那半忘了。
+     *
+     *    教训：夹具要自己造出确定的状态，断言要数清「一条消息」到底指什么。
+     */
+    const first = await postJson(app, '/api/v1/chat', { message: '第一句' });
+    const conversationId = first.json().data.conversation.id;
+    await postJson(app, '/api/v1/chat', { message: '第二句', conversation_id: conversationId });
+
+    const res = await app.inject({ method: 'GET', url: '/api/v1/conversations?page_size=100' });
+    const items = res.json().data.items as Record<string, unknown>[];
+
+    assert.ok(items.length > 0, '应当至少有一个会话');
+
+    for (const item of items) {
+      assert.equal(typeof item['message_count'], 'number', `会话 ${String(item['id'])} 缺少 message_count`);
+      assert.ok('last_message_at' in item, 'last_message_at 必须存在（没有消息时为 null）');
+    }
+
+    // 具体值：两轮对话 = 2 条 user + 2 条 assistant
+    const target = items.find((i) => i['id'] === conversationId);
+    assert.ok(target, '应当能找到刚创建的会话');
+    assert.equal(target['message_count'], 4, '两轮对话 = 4 条消息（每轮 user + assistant）');
+    assert.ok(target['last_message_at'] !== null, '有消息时 last_message_at 不该是 null');
+  });
+});
+
+test('空会话的 message_count 是 0、last_message_at 是 null（不是缺字段）', async () => {
+  /**
+   * 刚点「新会话」还没说话时，列表要显示「0 条」——
+   * 但那个 0 必须是**后端明确告诉它的 0**，而不是 `?? 0` 兜出来的。
+   *
+   * 这条同时守 LEFT JOIN：用 INNER JOIN 的话，
+   * 没有消息的会话会**从列表里整个消失** —— 用户刚建完就找不到了。
+   */
+  const { db } = await import('../database/client.js');
+  const { conversations } = await import('../database/schema/conversations.js');
+
+  await withServer(async ({ app }) => {
+    const user = await resolveTestUser('server.test.ts / 空会话列表');
+    const rows = await db
+      .insert(conversations)
+      .values({ userId: user.id, title: '空会话自检', status: 'active' })
+      .returning({ id: conversations.id });
+    const emptyId = rows[0]!.id;
+
+    const res = await app.inject({ method: 'GET', url: '/api/v1/conversations?page_size=100' });
+    const items = res.json().data.items as Record<string, unknown>[];
+    const target = items.find((i) => i['id'] === emptyId);
+
+    assert.ok(target, '没有消息的会话也必须出现在列表里（LEFT JOIN，不能是 INNER）');
+    assert.equal(target['message_count'], 0);
+    assert.equal(target['last_message_at'], null);
+
+    await db.delete(conversations).where(eq(conversations.id, emptyId));
+  });
+});
+
 test('GET /conversations/:id 返回消息，且 DTO 形状符合 docs/04 §13', async () => {
   await withServer(async ({ app }) => {
     const created = await postJson(app, '/api/v1/chat', { message: '你好' });
