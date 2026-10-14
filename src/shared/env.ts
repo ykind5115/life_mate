@@ -50,8 +50,18 @@ const envSchema = z.object({
    *   （记忆里全是前女友、工资、面试、加班吐槽这类事）。
    *   浏览器自带的那条路（Web Speech API）在中文下依赖服务端识别，
    *   音频确实会离开这台机器 —— 因此不用。
+   *
+   * ⚠️ 端口是 9090 而不是 Whisper 默认的 9000（2026-10-13 实测踩到）：
+   *    Windows 的**端口保留段** 8903-9002 把 9000 圈进去了
+   *    （Hyper-V/WSL 的动态范围，Docker Desktop 用 WSL2 就会有）。
+   *    绑 9000 报的是
+   *      "An attempt was made to access a socket in a way forbidden
+   *       by its access permissions"
+   *    —— 注意**不是**「已被占用」，查监听者也查不到任何东西。
+   *    查证命令：netsh int ipv4 show excludedportrange protocol=tcp
+   *    容器内仍监听 9000，只有宿主机侧映射成 9090。
    */
-  STT_BASE_URL: z.string().url().default('http://127.0.0.1:9000'),
+  STT_BASE_URL: z.string().url().default('http://127.0.0.1:9090'),
   /** 模型标识，仅用于日志与响应回显 */
   STT_MODEL: z.string().default('large-v3-turbo'),
   /**

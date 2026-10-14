@@ -231,6 +231,72 @@ docs/06-design-review.md 也把「明确砍掉…语音…」列为范围控制�
    两个模型同时常驻可能紧张。见 §4 的问题清单。
 ```
 
+---
+
+## 3.7 实施记录（2026-10-13）
+
+### 实际用的镜像与端口
+
+```text
+镜像：onerahmet/openai-whisper-asr-webservice:latest-gpu
+      选它而不是 linuxserver/faster-whisper：后者是 Wyoming 协议（不是 HTTP），
+      接起来要么自己实现协议、要么再加一层。
+
+默认不用 faster-whisper 变体（latest-gpu-faster-whisper）：
+      那需要同时设 ASR_ENGINE=faster_whisper —— 少一个必须配对的变量，
+      就少一种「起不来」的方式。而 large-v3-turbo 本身已经够快。
+```
+
+### 🔴 端口 9000 起不来 —— Windows 保留段（实际踩到）
+
+```text
+报错：
+  Error response from daemon: ports are not available: exposing port
+  TCP 127.0.0.1:9000 -> 127.0.0.1:0: listen tcp4 127.0.0.1:9000: bind:
+  An attempt was made to access a socket in a way forbidden by its
+  access permissions.
+
+关键：报的不是「已被占用」，而是「权限不允许」。
+
+求证（这一步很重要，否则会往「端口冲突」的方向白查）：
+  ① Get-NetTCPConnection -LocalPort 9000  → 查不到任何监听者（没人在用）
+  ② netsh int ipv4 show excludedportrange protocol=tcp
+
+     Start Port    End Port
+          8903        9002     ← 9000 落在里面
+
+  8903-9002 是 Windows 的**端口保留段**（Hyper-V/WSL 的动态端口范围，
+  Docker Desktop 用 WSL2 后端就会有）。没人在用，但 Windows 不让绑。
+
+解决：宿主机侧改用 9090（容器内仍是 9000）
+  9090 不在任何保留段内。同类候选：9099 / 9100 / 9503 / 9600。
+
+教训：
+  · Windows 上「端口绑不上」有两种完全不同的原因 ——
+    「被占用」与「被保留」。报错文案不同，排查方向也不同。
+    前者查监听者，后者查 netsh。
+  · 保留段会随 WSL/Hyper-V 的启动变化，将来可能又撞上。
+    文档里因此写了查证命令，而不只是写死一个新端口。
+```
+
+### 浏览器侧转换（服务端不需要 ffmpeg）
+
+```text
+MediaRecorder 给的是 webm/opus，Whisper 要 WAV。
+用 OfflineAudioContext 在浏览器里重采样成 16kHz 单声道 ——
+零依赖，且把「格式归一」放在数据产生的地方，
+服务端因此只需要处理一种确定的输入。
+```
+
+### 不引 @fastify/multipart
+
+```text
+只传一个音频文件，multipart 是杀鸡用牛刀。
+改成正文直接是音频字节 + Content-Type，
+用 Fastify 原生的 addContentTypeParser（parseAs: 'buffer'）——
+零新增依赖。代价是不能同时传多个字段，但我们只需要一个音频。
+```
+
 ### 3.3 V1 闭环（你描述的四步）
 
 ```text

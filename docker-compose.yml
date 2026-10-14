@@ -131,7 +131,25 @@ services:
 
     ports:
       # 与 postgres / embedding 一致：只绑本机回环
-      - "127.0.0.1:9000:9000"
+      #
+      # 【为什么是 9090 而不是 9000】
+      #   🔴 2026-10-13 实测：绑定 9000 直接失败 ——
+      #      Error: ports are not available: exposing port TCP 127.0.0.1:9000:
+      #        listen tcp4 127.0.0.1:9000: bind: An attempt was made to access
+      #        a socket in a way forbidden by its access permissions.
+      #
+      #   注意报错**不是**「已被占用」，而是「权限不允许」。
+      #   求证：`netsh int ipv4 show excludedportrange protocol=tcp` 显示
+      #        8903 - 9002 是 Windows 的**端口保留段**
+      #        （Hyper-V/WSL 的动态范围，Docker Desktop 用 WSL2 后端就会有）。
+      #        而 `Get-NetTCPConnection -LocalPort 9000` 查不到任何监听者 ——
+      #        没人在用，但 Windows 不让绑。
+      #
+      #   9090 不在任何保留段内（同类候选还有 9099/9100/9503/9600）。
+      #   ⚠️ 保留段会随 WSL/Hyper-V 的启动变化。将来若又撞上，
+      #      先跑上面那条 netsh 命令确认，再换一个不在段内的端口，
+      #      同时改 STT_BASE_URL。
+      - "127.0.0.1:9090:9000"
 
     volumes:
       # 模型权重缓存。删掉这个卷会让下次启动重新下载 1.6GB。
