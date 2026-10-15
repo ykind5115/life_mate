@@ -288,23 +288,115 @@ MediaRecorder 给的是 webm/opus，Whisper 要 WAV。
 服务端因此只需要处理一种确定的输入。
 ```
 
-### 不引 @fastify/multipart
+### ⚠️ 更正：后来加了 @fastify/multipart（实测推翻了上面的判断）
 
 ```text
-只传一个音频文件，multipart 是杀鸡用牛刀。
-改成正文直接是音频字节 + Content-Type，
-用 Fastify 原生的 addContentTypeParser（parseAs: 'buffer'）——
-零新增依赖。代价是不能同时传多个字段，但我们只需要一个音频。
+上面那段「不引 @fastify/multipart」是**动手前的设计**，后来被实测推翻了。
+
+实测（2026-10-13，容器起来之后）：
+  POST /asr  用「原始字节 + Content-Type: audio/wav」
+    → HTTP 422
+      {"detail":[{"type":"missing","loc":["body","audio_file"],
+                  "msg":"Field required"}]}
+
+  /asr 只收 multipart/form-data，字段名 audio_file。
+  查 OpenAPI（GET /openapi.json）确认：
+    · requestBody content-type 只有 multipart/form-data
+    · 查询参数：output=txt|vtt|srt|tsv|json、language=<ISO 639-1>、
+      task=transcribe|translate、encode=bool、initial_prompt
+
+既然上游就是 multipart，我们这边也用同一种格式 ——
+不自己造一套「裸字节」协议，然后为它写一层转换。
+
+于是装了 @fastify/multipart（v10，与 @fastify/static 同世代）。
+理由：自己解析 multipart 是容易写错且安全敏感的代码，
+而插件管住了文件大小上限与流式读取。
+
+教训：**「能不加依赖就不加」不该在没验证上游接口之前就下结论。**
+      我当时的推理（「只传一个文件，用不着 multipart」）本身没错，
+      错在把一个未验证的假设（上游收裸字节）当成了前提。
 ```
 
-### 3.3 V1 闭环（你描述的四步）
+### 3.3 实测确认的响应形状与「Whisper 会编造内容」
 
 ```text
-① 录音        浏览器 MediaRecorder → webm/opus
-② 转文字      前端 POST 到后端 → 后端转发给 STT 容器 → 返回文本
-③ 确认        把文本填进输入框，**不自动发送** —— 用户改完再发
-④ 发送        走现有的 POST /chat/stream（一个字都不用改）
+output=json 的实际响应：
+  { text, language, segments: [
+      { id, seek, start, end, text, tokens, temperature,
+        avg_logprob, compression_ratio, no_speech_prob } ] }
+
+⚠️ 没有 duration 字段 —— 我原来按 duration 取，会永远拿到 null。
+   音频真实时长改为**我们自己解析 WAV 头**得到。
+
+🔴 最重要的发现：Whisper 对非语音会编造内容，而且编得很「自信」。
+
+  用 Windows TTS 合成真实中文语音做对照（同一服务、同一参数）：
+
+  | 输入              | 识别结果                                  | 溢出比 | avg_logprob |
+  |-------------------|-------------------------------------------|--------|-------------|
+  | 中文语音 A        | 逐字正确                                  | 0.8x   | -0.117      |
+  | 中文语音 B        | 逐字正确                                  | 0.5x   | -0.209      |
+  | 静音 1 秒         | 「优优独播剧场——YoYo Television Series…」 | 30x    | -0.153 ⚠️   |
+  | 静音 5 秒         | 「请不吝点赞 订阅 转发 打赏支持…」        | 6x     | -0.099 ⚠️   |
+  | 纯音 2 秒         | 「字幕志愿者 杨茜茜」                     | 1.0x   | -0.401      |
+  | 白噪声 2 秒       | 「 sacrifice」                            | 1.0x   | -2.920      |
+  | 真实语音「嗯」    | 「ben」                                   | 0.6x   | -3.603 ⚠️   |
+
+  两个常见判据**都不能用**：
+    · no_speech_prob 在所有情况下都是 1e-10 量级 —— 完全无区分度
+    · avg_logprob 在静音编造时是 -0.099（比真实语音还高），
+      而真实的「嗯」是 -3.603 —— **两个方向都是反的**
+
+  可用的是**溢出比**：segments 结束时间 ÷ 音频真实时长
+    真实语音 0.5~0.8（说话不可能超出录音长度）
+    静音编造 30x / 6x
+
+  实现：
+    · 溢出比 > 2.5 → suspicious=true，前端**明确提示用户仔细核对**
+      （用 error 级样式，不是普通的「转好了」），但不阻止使用
+    · 音频 < 0.8 秒 → 直接拒绝并说「太短了」，
+      因为实测 1.16 秒的人声都会被识别成 "ben"
+
+  ⚠️ 溢出比抓不到纯音与噪声那两种（恰好贴着 1.0x）。
+    那两种只能靠**用户确认那一步**兜住 —— 这正是「不自动发送」
+    这个设计存在的真正意义：不是为了礼貌，是为了防止垃圾进记忆。
+    静音 2 秒走完整链路实测：suspicious=true，原因写得清楚。
 ```
+
+### 3.4 端到端验证（2026-10-13，容器起来之后）
+
+```text
+脚本：audit/verify-stt-e2e.ts（可重复运行）
+      用 Windows TTS 合成中文语音 → 打我们自己的 /api/v1/transcribe
+
+结果：
+  「今天加班到很晚，回到家已经十一点了」
+    → "今天加班到很晚,回到家已经11点了。"      433ms  suspicious=false ✅
+  「我终于把那个问题解决了，特别开心」
+    → "我终于把那个问题解决了特别开心"         314ms  suspicious=false ✅
+  静音 2 秒
+    → "优优独播剧场——YoYo Television Series…"  suspicious=true ✅
+      原因：「它报告的内容长度（30.0s）远超音频实际时长（2.0s）」
+  过短录音 0.3 秒
+    → HTTP 400「这段录音只有 0.3 秒，太短了」   ✅
+
+同时抓出两个我自己的错误：
+  ① 错误映射写错：「太短」被当成服务故障返回 **503**
+     （「服务暂不可用，稍后再试」）—— 而重试一百次都一样。
+     修法：给 SttError 加 kind（input / unavailable / upstream），
+     按种类映射状态码。
+  ② 测试夹具自己不自洽 + 断言写错（详见提交信息）。
+```
+
+### 3.5 浏览器侧转换（服务端不需要 ffmpeg）
+
+```text
+MediaRecorder 给的是 webm/opus，Whisper 要 WAV。
+用 OfflineAudioContext 在浏览器里重采样成 16kHz 单声道 ——
+零依赖，且把「格式归一」放在数据产生的地方，
+服务端因此只需要处理一种确定的输入。
+```
+
 
 **第 ③ 步「确认」是必须的，不是可选：**
 STT 一定会有错字，而错字进了对话就会进记忆抽取 ——

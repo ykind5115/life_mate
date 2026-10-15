@@ -813,15 +813,17 @@ async function finishRecording() {
     }
 
     /**
-     * 直接发原始字节，Content-Type 标明格式。
-     * 不用 multipart —— 只需要传一个音频，而 multipart 要多引一个插件
-     * （见 src/api/routes/transcribe.ts 的文件头）。
+     * ⚠️ 必须走 multipart/form-data，字段名 audio。
+     *
+     * 最初设计成「正文直接是音频字节 + Content-Type」以省掉一个插件，
+     * 但实测发现上游 whisper 服务**只收 multipart**（原始字节被 422 拒），
+     * 于是我们这边也用同一种格式 —— 不自己造一套协议。
+     * 见 src/api/routes/transcribe.ts 的文件头。
      */
-    const res = await fetch(`${API}/transcribe`, {
-      method: 'POST',
-      headers: { 'content-type': 'audio/wav' },
-      body: wav,
-    });
+    const form = new FormData();
+    form.append('audio', wav, 'speech.wav');
+
+    const res = await fetch(`${API}/transcribe`, { method: 'POST', body: form });
 
     const text = await res.text();
     let json;
@@ -853,7 +855,27 @@ async function finishRecording() {
       input.style.height = `${Math.min(200, input.scrollHeight)}px`;
       input.focus();
     }
-    toast('转成文字了，确认一下再发', 'success');
+
+    /**
+     * 🔴 疑似编造时要**明确提示**，而且用 error 级别的样式。
+     *
+     * Whisper 对非语音会编内容，而且编得很自信（实测：1 秒静音 →
+     * 「优优独播剧场——YoYo Television Series Exclusive」）。
+     * 如果这段文本被发出去，它会进记忆抽取、变成一条假记忆。
+     *
+     * 因此这种情况下的提示不能和「转好了」一样轻 ——
+     * 要让用户停下来看一眼再决定发不发。
+     */
+    if (result.suspicious) {
+      toast(
+        `这段可能不准：${result.suspicion_reason ?? '听起来不像人说话'}。仔细核对再发。`,
+        'error'
+      );
+      return;
+    }
+
+    const secs = typeof result.duration_seconds === 'number' ? `（${result.duration_seconds.toFixed(1)} 秒）` : '';
+    toast(`转成文字了${secs}，确认一下再发`, 'success');
   } catch (err) {
     voice.set({ transcribing: false });
     renderMic();
@@ -862,7 +884,8 @@ async function finishRecording() {
 }
 
 /** 流式发送 */
-async function sendMessage(text) {  const { activeId } = chat.get();
+async function sendMessage(text) {
+  const { activeId } = chat.get();
   if (chat.get().streaming) return;
   chat.set({ streaming: true });
 
