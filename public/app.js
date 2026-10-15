@@ -26,6 +26,7 @@ import {
   createStore,
   onRouteChange,
   navigate,
+  parseHash,
   formatDate,
   formatDateTime,
   formatEventTime,
@@ -258,6 +259,18 @@ const chat = createStore({
   memories: [],
   loading: false,
   streaming: false,
+  /**
+   * 手机上显示哪一栏：'list' 看会话列表，'chat' 看消息。
+   *
+   * 【为什么需要它】桌面版把「历史会话」与「消息」并排放在一起，
+   * 手机竖屏放不下两栏 —— 挤在一起就是用户反馈的「格式乱」。
+   * 手机上改成一次只显示一栏，用返回按钮切换
+   * （见 app.css 的 @media (max-width: 640px) 与 .chat-layout.is-mobile-list）。
+   *
+   * ⚠️ 这个值在桌面宽度下**没有视觉效果**（CSS 类只在 640px 以下生效），
+   *    因此不需要判断屏幕宽度，直接维护它即可。
+   */
+  mobilePane: 'list',
 });
 
 async function loadConversations() {
@@ -266,13 +279,29 @@ async function loadConversations() {
 }
 
 async function openConversation(id, opts = {}) {
-  chat.set({ activeId: id, loading: true, detail: null, messages: [], memories: [] });
+  chat.set({
+    activeId: id,
+    loading: true,
+    detail: null,
+    messages: [],
+    memories: [],
+    // 手机上：选中会话就切到消息栏（桌面宽度下这个值无视觉效果）
+    mobilePane: 'chat',
+  });
+  renderMobilePane();
   if (!opts.silent) navigate(`chat/${id}`);
 
   try {
     const detail = await api('GET', `/conversations/${id}`);
     chat.set({ detail, messages: detail.messages ?? [], loading: false });
     renderMessages();
+    /**
+     * ⚠️ 拿到 detail 之后要**再渲染一次**手机标题栏 ——
+     *    上面那次是为了首帧就切到消息栏（那时还不知道标题，
+     *    只有 activeId，标题栏只能显示占位文字）。
+     *    会话名只能等这条响应回来。
+     */
+    renderMobilePane();
 
     // 派生记忆单独拉 —— 它失败不该影响看对话
     try {
@@ -291,12 +320,34 @@ async function openConversation(id, opts = {}) {
 
 function newChat() {
   closeDrawer();
-  chat.set({ activeId: null, detail: null, messages: [], memories: [] });
+  // 新会话没有内容可看，手机上留在列表栏
+  chat.set({ activeId: null, detail: null, messages: [], memories: [], mobilePane: 'list' });
   navigate('chat');
+  renderMobilePane();
   renderMessages();
   renderConversations();
   renderConvSide();
   document.getElementById('input')?.focus();
+}
+
+/**
+ * 手机上切换「会话列表 ↔ 消息」两栏。
+ *
+ * 只在 640px 以下有视觉效果（CSS 里判断），桌面下调用它没有任何副作用 ——
+ * 这样就不需要在 JS 里到处判断屏幕宽度。
+ */
+function renderMobilePane() {
+  const layout = document.querySelector('.chat-layout');
+  if (!layout) return;
+  const showList = chat.get().mobilePane === 'list';
+  layout.classList.toggle('is-mobile-list', showList);
+
+  // 手机标题栏显示当前会话名，让用户知道自己进了哪一条
+  const title = document.getElementById('mobile-chat-title');
+  if (title) {
+    const { detail, activeId } = chat.get();
+    title.textContent = detail?.title || (activeId ? '对话' : 'LifeMate');
+  }
 }
 
 function renderConversations() {
@@ -679,6 +730,54 @@ function renderConvSide() {
           )
         ))
   );
+}
+
+/**
+ * 「这段对话记住了什么」的抽屉版本。
+ *
+ * 【为什么需要它】桌面上这一栏（#chat-side）常驻在对话右侧，
+ * 手机竖屏放不下第三栏 —— 于是收进抽屉，由标题栏的 🧠 按钮打开。
+ *
+ * 内容与 renderConvSide 保持一致（同一份 memories），
+ * 点击单条仍然进 showMemoryDrawer。
+ */
+function showConvMemoriesDrawer() {
+  const { memories = [], activeId } = chat.get();
+
+  if (!activeId) {
+    toast('先选一条会话', 'info');
+    return;
+  }
+
+  const body = h(
+    'div',
+    {},
+    h('div', { class: 'dim', style: { marginBottom: '12px' } }, `这段对话它记住了 ${memories.length} 条`)
+  );
+
+  if (memories.length === 0) {
+    body.appendChild(
+      h('p', { class: 'dim' }, '还没有整理出记忆。多说几句，后台整理完就会出现。')
+    );
+  } else {
+    for (const m of memories) {
+      body.appendChild(
+        h(
+          'div',
+          {
+            class: 'card',
+            style: { cursor: 'pointer', padding: '10px 12px', marginBottom: '8px' },
+            onclick: () => showMemoryDrawer(m.id),
+          },
+          h('div', { class: 'mem-head' }, typeTag(m.type), ...(m.status !== 'active' ? [memoryStatusTag(m.status)] : [])),
+          h('div', { style: { fontSize: 'var(--fs-sm)', lineHeight: '1.5' } }, m.content),
+          m.valid_from ? h('div', { class: 'dim', style: { marginTop: '5px' } }, `${formatDate(m.valid_from)} 起`) : null
+        )
+      );
+    }
+  }
+
+  openDrawer('这段对话记住了什么', body);
 }
 
 // ============================================================
@@ -2450,6 +2549,29 @@ function renderHealth() {
 
 function bindChrome() {
   document.getElementById('btn-new-chat').onclick = newChat;
+
+  /**
+   * 手机上的两屏切换（桌面下这些按钮是隐藏的，点了也没事）。
+   *
+   * 桌面对话页是「历史会话 | 消息」并排两栏，手机竖屏放不下 ——
+   * 于是手机改成一次只显示一栏，用这两个按钮切换。
+   * 见 app.css 的 @media (max-width: 640px) 与 renderMobilePane。
+   */
+  document.getElementById('btn-mobile-conv-list').onclick = () => {
+    chat.set({ mobilePane: 'list' });
+    renderMobilePane();
+  };
+  document.getElementById('btn-mobile-back-to-chat').onclick = () => {
+    chat.set({ mobilePane: 'chat' });
+    renderMobilePane();
+  };
+  /**
+   * 「这段对话记住了什么」在桌面上常驻右栏，手机上放不下 ——
+   * 复用现有的右侧抽屉。
+   */
+  document.getElementById('btn-mobile-memories').onclick = () => {
+    showConvMemoriesDrawer();
+  };
   document.getElementById('btn-create-memory').onclick = showCreateMemoryDrawer;
   document.getElementById('btn-new-event').onclick = () => showEventForm(null);
   document.getElementById('btn-new-relation').onclick = () => showRelationForm(null);
@@ -2557,6 +2679,23 @@ function boot() {
   refreshOverview();
   // 语音可用性只探一次（它不会自己变好或变坏），失败也不影响打字
   void refreshMicAvailability();
+  /**
+   * 手机上首屏该显示哪一栏？
+   *
+   * 从 hash 判断，而不是写死 'list'：
+   *   #/chat/<id>（例如手机上刷新页面、或从书签进来）→ 直接看消息
+   *   #/chat 或空                                → 先看会话列表
+   *
+   * ⚠️ 上面 onRouteChange 对 #/chat/<id> 也会调 openConversation，
+   *    那条路同样会把 mobilePane 设成 'chat'。这里读 hash 是为了
+   *    **首帧不留白** —— 不等网络返回就决定显示哪一栏。
+   *    桌面下这个类没有视觉效果。
+   */
+  const bootRoute = parseHash(window.location.hash);
+  chat.set({
+    mobilePane: bootRoute.name === 'chat' && bootRoute.params[0] ? 'chat' : 'list',
+  });
+  renderMobilePane();
   loadConversations()
     .then(renderConversations)
     .catch(() => {});

@@ -1702,7 +1702,27 @@ label > select {
 
 /* ============================================================
    响应式
+   ------------------------------------------------------------
+   两档断点：
+     900px  平板 / 窄窗口 —— 侧栏收成图标条，内容区留白收窄
+     640px  手机竖屏     —— 侧栏改**底部标签栏**，对话页改单栏
+
+   ⚠️ 640px 这一档最初写得很薄（只改了 4 个地方），用户实测反馈
+      「在手机上浏览器访问，前端格式乱得很，非常不适合手机竖屏」。
+      实测到的三个原因（读代码确认，不是猜）：
+        ① .nav 是 flex-direction: column，8 个导航项 × 约 44px = 352px，
+           手机可视高约 700px → **侧栏吃掉一半以上高度**
+        ② .chat-layout 在 640px 下变 column，于是左栏「历史会话」
+           (限高 168px) 排到了消息**上面** —— 每进一次对话都要先滚过它
+        ③ .composer / .trace(13 处) / 图谱(7 处) 在 640px 断点里
+           **一处都没覆盖**
+      所以这一档是重写的，不是微调。
    ============================================================ */
+
+/* 只在手机上显示的东西（底部标签栏时代的返回按钮、标题栏等） */
+.mobile-only {
+  display: none;
+}
 
 @media (max-width: 900px) {
   :root {
@@ -1732,19 +1752,215 @@ label > select {
 }
 
 @media (max-width: 640px) {
-  .chat-layout {
-    flex-direction: column;
+  /* ---------- 侧栏 → 底部标签栏 ---------- */
+
+  /**
+   * 关键改动：整页改成上下两段（内容 + 底部栏），
+   * 而不是左右两栏。这样 8 个导航项横着排，只占一行高度。
+   *
+   * 用 box-sizing: border-box + calc 让它与标签栏共存；标签栏高度
+   * 走 --tabbar-h，避免在各个 padding 里硬编码同一个数字。
+   */
+  :root {
+    --tabbar-h: 56px;
   }
-  .conv-list {
-    width: auto;
-    flex: 0 0 auto;
-    max-height: 168px;
+
+  .shell {
+    flex-direction: column-reverse; /* 侧栏在 DOM 里靠前，视觉上要放底部 */
+    height: 100dvh; /* dvh 而非 vh：手机地址栏收起时 vh 会算错 */
+  }
+
+  .sidebar {
+    width: 100%;
+    flex: 0 0 var(--tabbar-h);
+    flex-direction: row;
+    align-items: stretch;
+    padding: 0;
     border-right: none;
-    border-bottom: 1px solid var(--line);
+    border-top: 1px solid var(--line);
+    /* 让底部栏压在内容之上，避免 iOS 上滚到底时的缝隙 */
+    z-index: 10;
   }
+
+  .brand,
+  .sidebar-foot {
+    display: none; /* 手机不需要品牌名与健康指示灯 */
+  }
+
+  .nav {
+    flex-direction: row;
+    flex: 1;
+    gap: 0;
+    overflow: visible; /* 横排不会溢出 */
+  }
+
+  .nav a {
+    flex: 1;
+    flex-direction: column;
+    justify-content: center;
+    gap: 1px;
+    padding: 4px 0;
+    border-radius: 0;
+    font-size: 10px;
+    /* 手指点击区至少 44px 高，这是触屏的可用性下限 */
+    min-height: 44px;
+  }
+
+  .nav a .nav-label {
+    display: block; /* 900px 断点把它藏了，底部栏要显示文字 */
+    font-size: 10px;
+    line-height: 1.2;
+  }
+
+  .nav a .nav-icon {
+    font-size: 18px;
+    line-height: 1;
+  }
+
+  .nav a .badge {
+    position: absolute;
+    top: 2px;
+    right: calc(50% - 20px);
+    margin: 0;
+  }
+
+  /* 手机一次只显示 4 个常用项，其余靠滑动看（8 个平分会窄到点不准） */
+  .nav {
+    overflow-x: auto;
+    scrollbar-width: none;
+  }
+  .nav::-webkit-scrollbar {
+    display: none;
+  }
+  .nav a {
+    flex: 0 0 25%; /* 4 个一屏 */
+  }
+
+  /* ---------- 主内容区 ---------- */
+
+  /**
+   * ⚠️ 不要用 `calc(100dvh - var(--tabbar-h))`：.shell 已经是
+   *    flex 容器且 .main 是 flex: 1，高度自动分配。
+   *    再减一次会**减重**，内容区少 56px。
+   */
+  .main {
+    min-height: 0;
+  }
+
+  .mobile-only {
+    display: flex;
+  }
+
+  /* ---------- 对话页：单栏 + 两屏切换 ---------- */
+
+  /**
+   * 640px 以下不再并排两栏，也不再上下堆叠 ——
+   * 而是**一次只显示一栏**，靠 .is-mobile-list 切换
+   * （见 app.js 的 renderMobilePane）。
+   * 桌面下这个类没有视觉效果。
+   */
+  .chat-layout {
+    position: relative;
+    display: block;
+  }
+
+  .conv-list {
+    width: 100%;
+    flex: none;
+    max-height: none;
+    height: 100%;
+    border-right: none;
+  }
+
+  .chat-main {
+    height: 100%;
+  }
+
+  .chat-layout.is-mobile-list .chat-main {
+    display: none;
+  }
+  .chat-layout:not(.is-mobile-list) .conv-list {
+    display: none;
+  }
+
+  /**
+   * 桌面把「这段对话记住了什么」常驻在对话右侧（见 index.html 的 #chat-side）。
+   * 手机放不下第三栏 —— 收进抽屉，由标题栏的 🧠 打开
+   * （见 app.js 的 showConvMemoriesDrawer）。
+   */
+  #chat-side {
+    display: none;
+  }
+
+  .conv-head {
+    padding: 10px 12px;
+  }
+
+  /* 手机标题栏：会话名 + 返回列表 + 看记忆 */
+  .mobile-bar {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    padding: 8px 10px;
+    border-bottom: 1px solid var(--line);
+    background: var(--bg);
+    flex: 0 0 auto;
+  }
+
+  .mobile-bar-title {
+    flex: 1;
+    min-width: 0;
+    font-size: var(--fs-sm);
+    font-weight: 600;
+    /* 会话名可能很长，截断而不是换行 —— 换行会把消息区挤下去 */
+    white-space: nowrap;
+    overflow: hidden;
+    text-overflow: ellipsis;
+  }
+
+  .icon-only {
+    padding: 8px 10px;
+    font-size: 15px;
+    line-height: 1;
+  }
+
+  /* ---------- 消息区 ---------- */
+
+  .messages {
+    padding: 12px 12px 8px;
+  }
+
+  /* ---------- 输入框 ---------- */
+
+  /**
+   * 手机上要挤下：麦克风 + 输入框 + 发送。
+   * 桌面版的内边距（14/32/20）在 360px 宽下太奢侈，收窄。
+   */
+  .composer {
+    gap: 8px;
+    padding: 10px 12px;
+    /* 底部再让开标签栏，否则输入框会被压在它后面 */
+    padding-bottom: calc(10px + env(safe-area-inset-bottom, 0px));
+  }
+
+  .composer textarea,
+  .composer .btn {
+    /* 🔴 字体必须 ≥16px：iOS Safari 在 <16px 的输入框上会自动放大页面，
+       用户一打字整页就缩放，非常难受（这是「格式乱」的一个隐形来源）。 */
+    font-size: 16px;
+  }
+
+  .composer .btn.mic,
+  .composer .btn.primary {
+    padding: 10px 13px;
+  }
+
+  /* ---------- 其余页面的「能用」程度 ---------- */
+
   .conflict-grid {
     grid-template-columns: 1fr;
   }
+
   .setting {
     flex-direction: column;
     gap: 8px;
@@ -1752,4 +1968,37 @@ label > select {
   .setting .s-label {
     flex: none;
   }
+
+  /* 抽屉在手机上占满宽（桌面 560px 在 360px 屏上会溢出视野） */
+  .drawer {
+    width: 100vw;
+  }
+
+  .view-head {
+    padding: 12px;
+    gap: 8px;
+    flex-wrap: wrap; /* 标题与按钮挤不下时换行，而不是溢出 */
+  }
+
+  .view-head h1 {
+    font-size: var(--fs-lg);
+  }
+
+  /* 图谱：手机上力导向图本来就难操作，给它一个可用的最小高度，
+     并把说明文字收起来（见 §交付说明：图谱定位为「能用」） */
+  .graph-canvas,
+  .graph-svg,
+  #graph-canvas,
+  #graph-svg {
+    min-height: 55dvh;
+  }
+
+  /* 通用：任何横向滚动容器在手机上都要能滚，而不是撑破布局 */
+  .table-wrap,
+  pre,
+  code {
+    overflow-x: auto;
+    -webkit-overflow-scrolling: touch;
+  }
 }
+

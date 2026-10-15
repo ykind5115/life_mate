@@ -21,30 +21,30 @@
           <span class="brand-name">LifeMate</span>
         </div>
 
-        <nav class="nav">
+        <nav class="nav" id="nav">
           <a href="#/chat" data-nav="chat" title="对话">
-            <span>💬</span><span class="nav-label">对话</span>
+            <span class="nav-icon">💬</span><span class="nav-label">对话</span>
           </a>
           <a href="#/memories" data-nav="memories" title="记忆">
-            <span>🧠</span><span class="nav-label">记忆</span>
+            <span class="nav-icon">🧠</span><span class="nav-label">记忆</span>
           </a>
           <a href="#/timeline" data-nav="timeline" title="时间线">
-            <span>📅</span><span class="nav-label">时间线</span>
+            <span class="nav-icon">📅</span><span class="nav-label">时间线</span>
           </a>
           <a href="#/graph" data-nav="graph" title="知识图谱">
-            <span>🕸</span><span class="nav-label">知识图谱</span>
+            <span class="nav-icon">🕸</span><span class="nav-label">知识图谱</span>
           </a>
           <a href="#/relations" data-nav="relations" title="人际关系">
-            <span>👥</span><span class="nav-label">人际关系</span>
+            <span class="nav-icon">👥</span><span class="nav-label">人际关系</span>
           </a>
           <a href="#/goals" data-nav="goals" title="目标">
-            <span>🎯</span><span class="nav-label">目标</span>
+            <span class="nav-icon">🎯</span><span class="nav-label">目标</span>
           </a>
           <a href="#/review" data-nav="review" title="回顾">
-            <span>📖</span><span class="nav-label">回顾</span>
+            <span class="nav-icon">📖</span><span class="nav-label">回顾</span>
           </a>
           <a href="#/settings" data-nav="settings" title="设置">
-            <span>⚙️</span><span class="nav-label">设置</span>
+            <span class="nav-icon">⚙️</span><span class="nav-label">设置</span>
           </a>
         </nav>
 
@@ -59,6 +59,19 @@
           <div class="chat-layout">
             <aside class="conv-list">
               <div class="conv-head">
+                <!--
+                  手机上的返回按钮：从「历史会话」栏回到消息栏。
+                  桌面下隐藏（两栏并排，不需要返回）。
+                -->
+                <button
+                  type="button"
+                  id="btn-mobile-back-to-chat"
+                  class="btn small icon-only mobile-only"
+                  aria-label="返回对话"
+                  title="返回对话"
+                >
+                  ‹
+                </button>
                 <span class="dim">历史会话</span>
                 <button id="btn-new-chat" class="btn small">+ 新会话</button>
               </div>
@@ -66,6 +79,32 @@
             </aside>
 
             <div class="chat-main">
+              <!--
+                手机上的会话标题栏：让用户知道自己在哪条会话里，
+                并提供返回列表的入口。桌面下隐藏。
+              -->
+              <div class="mobile-bar mobile-only">
+                <button
+                  type="button"
+                  id="btn-mobile-conv-list"
+                  class="btn small icon-only"
+                  aria-label="历史会话"
+                  title="历史会话"
+                >
+                  ☰
+                </button>
+                <span id="mobile-chat-title" class="mobile-bar-title">LifeMate</span>
+                <button
+                  type="button"
+                  id="btn-mobile-memories"
+                  class="btn small icon-only"
+                  aria-label="这段对话记住了什么"
+                  title="这段对话记住了什么"
+                >
+                  🧠
+                </button>
+              </div>
+
               <div id="messages" class="messages">
                 <div class="empty">
                   <p>聊点什么吧。</p>

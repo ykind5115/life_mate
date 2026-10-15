@@ -307,6 +307,19 @@ const ELEMENT_IDS = [
   'review-out',
   'btn-review',
   'settings-out',
+  /**
+   * 手机专用控件（2026-10-13 加，docs/18 §移动端）。
+   *
+   * ⚠️ 桩里必须登记它们：app.js 的 bindChrome 会
+   *    `document.getElementById('btn-mobile-conv-list').onclick = ...`，
+   *    未登记的 id 会走 buildDom 的兜底分支造一个新节点 ——
+   *    那样测试就在给一个**不在真实页面树里**的节点绑事件，
+   *    于是「点了没反应」这类问题测不出来。
+   */
+  'btn-mobile-conv-list',
+  'btn-mobile-back-to-chat',
+  'btn-mobile-memories',
+  'mobile-chat-title',
 ] as const;
 
 const VIEW_NAMES = ['chat', 'memories', 'timeline', 'graph', 'relations', 'goals', 'review', 'settings'] as const;
@@ -315,6 +328,8 @@ const NAV_NAMES = ['chat', 'memories', 'timeline', 'graph', 'relations', 'goals'
 
 interface Dom {
   root: StubNode;
+  /** 手机两栏切换的容器（见 buildDom） */
+  chatLayout: StubNode;
   get: (id: string) => StubNode;
   view: (name: string) => StubNode;
   nav: (name: string) => StubNode;
@@ -353,8 +368,22 @@ function buildDom(): Dom {
     root.appendChild(n);
   }
 
+  /**
+   * .chat-layout 容器。
+   *
+   * ⚠️ app.js 的 renderMobilePane 会
+   *    `document.querySelector('.chat-layout')` 并在它身上切
+   *    `is-mobile-list` 类。真实 index.html 里它包着「历史会话 + 消息」
+   *    两块；桩里只要有这个带类的节点，媒体查询之外的逻辑就能被测到。
+   *    （CSS 本身在媒体查询下的表现这里测不了 —— 见文件末尾的说明。）
+   */
+  const chatLayout = new StubNode('div');
+  chatLayout.className = 'chat-layout';
+  root.appendChild(chatLayout);
+
   return {
     root,
+    chatLayout,
     get(id: string): StubNode {
       const found = byId.get(id);
       if (found) return found;
@@ -392,8 +421,32 @@ interface Harness {
 /**
  * 每个用例全新 import —— app.js 有模块级状态（store、抽屉、当前视图），
  * 复用会让用例互相干扰。
+ *
+ * ⚠️ **routes 的 key 必须带方法前缀**，形如 `'GET /conversations/c1'`。
+ *
+ *    实测（2026-10-13，写手机布局用例时踩到）：
+ *    桩是这么查表的 ——
+ *        const key = `${init?.method ?? 'GET'} ${url.replace('/api/v1','')}`
+ *    而我一开始按 `'/conversations/c1'` 传，于是**一次都没命中**，
+ *    拿到的全是 `data: {}`。
+ *
+ *    更麻烦的是它**不报错**：现有用例大多只断言「不抛错」「渲染出提示」，
+ *    空数据也满足，所以这个不一致一直没暴露出来。
+ *    我是因为新用例断言了**会话标题**（必须有真数据）才发现。
+ *
+ *    教训：桩的查表命中失败要能看见 —— 现在带 DSH_DOM_DEBUG=1 跑会打印
+ *    「命中= true/false」。写需要真数据的新用例时先打开它。
+ *
+ * @param routes  假的 API 响应，key 形如 'GET /conversations/c1'
+ * @param failures 需要模拟失败的 key（同样带方法前缀）
+ * @param hash    启动时的 location.hash（默认 '#/chat'）。
+ *                手机首屏靠它决定显示会话列表还是消息（见 app.js 的 boot）。
  */
-async function bootApp(routes: Record<string, unknown> = {}, failures: string[] = []): Promise<Harness> {
+async function bootApp(
+  routes: Record<string, unknown> = {},
+  failures: string[] = [],
+  hash = '#/chat'
+): Promise<Harness> {
   const dom = buildDom();
 
   const globals = globalThis as Record<string, unknown>;
@@ -413,12 +466,12 @@ async function bootApp(routes: Record<string, unknown> = {}, failures: string[] 
     addEventListener: (): void => {},
   };
 
-  globals['location'] = { hash: '#/chat' };
+  globals['location'] = { hash };
 
   globals['window'] = {
     addEventListener: (): void => {},
     removeEventListener: (): void => {},
-    location: { hash: '#/chat' },
+    location: { hash },
     devicePixelRatio: 1,
     setInterval: () => 0,
     clearInterval: (): void => {},
@@ -464,6 +517,14 @@ async function bootApp(routes: Record<string, unknown> = {}, failures: string[] 
 
   globals['fetch'] = async (url: string, init?: RequestInit) => {
     const key = `${init?.method ?? 'GET'} ${String(url).replace('/api/v1', '')}`;
+
+    /**
+     * 查表命中失败时**默认无声** —— 返回的是 `data: {}`，
+     * 而「渲染出空数据」在多数断言下看起来完全正常。
+     * 实测踩到过（见 bootApp 的注释）。写需要真数据的新用例时，
+     * 先用 DSH_DOM_DEBUG=1 跑一次确认命中。
+     */
+    if (process.env['DSH_DOM_DEBUG']) console.log('[fetch]', key, '| 命中=', key in routes);
 
     if (failures.includes(key)) {
       return {
@@ -1027,4 +1088,139 @@ test('DOM 桩的 text() 递归收集子树文本（断言用）', () => {
   root.appendChild(b);
 
   assert.equal(root.text(), '你好 世界');
+});
+
+// ============================================================
+// 手机端布局（2026-10-13，docs/18）
+//
+// 【这些测试能测什么、不能测什么】
+//   能测：JS 那一半 —— 两栏切换的状态与类名、标题栏文字、
+//         按钮点击后的行为、深链进来落在哪一栏。
+//   不能测：CSS 那一半 —— 媒体查询在真实视口下的表现。
+//          getComputedStyle 在这个桩环境里不存在，
+//          「底部标签栏真的在屏幕底部」这种事只能靠真机/设备模拟确认。
+//          所以这里守的是「点了会发生正确的事」，不是「看起来对」。
+// ============================================================
+
+test('手机首屏：#/chat 时显示会话列表（还没选会话，没有消息可看）', async () => {
+  const { dom } = await bootApp({}, [], '#/chat');
+
+  assert.ok(
+    dom.chatLayout.className.includes('is-mobile-list'),
+    '没选会话时应落在列表栏 —— 否则手机上首屏是一片空白'
+  );
+});
+
+test('🔴 手机深链：#/chat/<id> 时直接显示消息，不停在列表', async () => {
+  /**
+   * 场景：手机上刷新页面、或从书签进来，URL 里带着会话 id。
+   * 如果这时还停在列表栏，用户会以为「我明明点进来了怎么是列表」。
+   */
+  const { dom } = await bootApp(
+    {
+      'GET /conversations/c1': {
+        id: 'c1',
+        title: '深夜问候',
+        messages: [{ id: 'm1', role: 'user', content: '晚上好', created_at: '2026-10-13T15:10:24.184Z' }],
+      },
+      'GET /conversations/c1/memories': { items: [] },
+    },
+    [],
+    '#/chat/c1'
+  );
+
+  assert.ok(
+    !dom.chatLayout.className.includes('is-mobile-list'),
+    '#/chat/<id> 首帧就该显示消息栏，而不是等网络返回后才切'
+  );
+});
+
+test('手机上选中会话后自动切到消息栏', async () => {
+  const { dom, app } = await bootApp({
+    'GET /conversations/c1': { id: 'c1', title: '深夜问候', messages: [] },
+    'GET /conversations/c1/memories': { items: [] },
+  });
+
+  const openConversation = app['openConversation'] as (id: string) => Promise<void>;
+  await openConversation('c1');
+
+  assert.ok(
+    !dom.chatLayout.className.includes('is-mobile-list'),
+    '选中会话应当切到消息栏 —— 否则用户点了没反应'
+  );
+});
+
+test('「新会话」把手机界面切回列表栏（新会话没有内容可看）', async () => {
+  const { dom, app } = await bootApp({
+    'GET /conversations/c1': { id: 'c1', title: '旧的', messages: [] },
+    'GET /conversations/c1/memories': { items: [] },
+  });
+
+  await (app['openConversation'] as (id: string) => Promise<void>)('c1');
+  assert.ok(!dom.chatLayout.className.includes('is-mobile-list'), '前置条件：先在消息栏');
+
+  (app['newChat'] as () => void)();
+  assert.ok(
+    dom.chatLayout.className.includes('is-mobile-list'),
+    '新会话应当回到列表栏 —— 否则用户面对一个空白输入框，不知道自己在哪'
+  );
+});
+
+test('标题栏显示当前会话名，让用户知道自己在哪条会话里', async () => {
+  const { dom, app } = await bootApp({
+    'GET /conversations/c1': { id: 'c1', title: '深夜问候', messages: [] },
+    'GET /conversations/c1/memories': { items: [] },
+  });
+
+  await (app['openConversation'] as (id: string) => Promise<void>)('c1');
+
+  const title = dom.get('mobile-chat-title');
+  assert.match(title.textContent ?? '', /深夜问候/, '手机标题栏要显示会话名');
+});
+
+test('手机两栏切换按钮：来回都能切，且类名同步', async () => {
+  const { dom } = await bootApp({
+    'GET /conversations/c1': { id: 'c1', title: '深夜问候', messages: [] },
+    'GET /conversations/c1/memories': { items: [] },
+  });
+
+  // 从列表栏点「返回对话」→ 应在消息栏
+  dom.get('btn-mobile-back-to-chat').onclick?.({});
+  assert.ok(!dom.chatLayout.className.includes('is-mobile-list'), '点返回对话应切到消息栏');
+
+  // 再点「历史会话」→ 应回列表栏
+  dom.get('btn-mobile-conv-list').onclick?.({});
+  assert.ok(dom.chatLayout.className.includes('is-mobile-list'), '点历史会话应切回列表栏');
+});
+
+test('桌面宽度不受影响：切换类名在，但桌面 CSS 不理会它', async () => {
+  /**
+   * ⚠️ 这条是**约定测试**，不是行为测试。
+   *
+   * 手机两栏切换靠 .chat-layout 上的 is-mobile-list 类，
+   * 而那个类的所有效果都写在 @media (max-width: 640px) 里。
+   * 也就是说桌面下这个类会一直存在、但没有任何视觉效果。
+   *
+   * 这条测试的作用是**把这个约定钉住**：如果将来有人把
+   * .is-mobile-list 的规则挪出媒体查询（比如为了图省事），
+   * 桌面上就会莫名其妙地少一栏 —— 而那是一种很难查的回归。
+   * 这里读 app.css 原文来确认它仍在媒体查询块内。
+   */
+  const { readFileSync } = await import('node:fs');
+  const { join } = await import('node:path');
+  const css = readFileSync(join(process.cwd(), 'public', 'app.css'), 'utf8');
+
+  const mobileBlockStart = css.lastIndexOf('@media (max-width: 640px)');
+  assert.ok(mobileBlockStart > 0, '应当存在 640px 断点');
+
+  const mobileBlock = css.slice(mobileBlockStart);
+  assert.match(mobileBlock, /\.is-mobile-list/, 'is-mobile-list 的规则必须在 640px 断点内');
+
+  // 反向确认：640px 断点之前不应出现这条选择器
+  const beforeMobile = css.slice(0, mobileBlockStart);
+  assert.doesNotMatch(
+    beforeMobile,
+    /\.is-mobile-list/,
+    'is-mobile-list 不能在媒体查询之外 —— 那会让桌面版也少一栏'
+  );
 });
