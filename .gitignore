@@ -29,3 +29,9 @@ logs/
 .idea/
 .DS_Store
 Thumbs.db
+
+# 提交信息草稿（用 `git commit -F` 时写的临时文件）
+# 🔴 2026-10-13：它被 `git add -A` 误提交了两次（7c0d3cf、e0f0b2d）。
+#    以后写提交信息用这个文件名，并靠这一行挡住。
+commit-msg.txt
+tmp-*.txt
